@@ -45,8 +45,14 @@ jobs:
       # yet, so this can't produce a real device / TestFlight / App Store
       # .ipa. Once that account + certs/profiles exist, switch the -sdk to
       # iphoneos and add code-signing secrets.
+      # Workspace/scheme names are discovered at runtime rather than hardcoded —
+      # expo prebuild sanitizes the app name (strips hyphens) when naming the
+      # Xcode project, so "mobile-app" becomes "mobileapp".
       - run: |
-          xcodebuild -workspace ios/mobile-app.xcworkspace -scheme mobile-app \
+          WORKSPACE=$(ls ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          echo "Building workspace=$WORKSPACE scheme=$SCHEME"
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
             -configuration Release -sdk iphonesimulator \
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO
       - uses: actions/upload-artifact@v4
@@ -82,7 +88,13 @@ jobs:
           node-version: 20
       - run: npm ci
       # windows-latest runners ship VS2022 Build Tools with the C++ desktop
-      # workload preinstalled, and pwsh is present by default.
+      # workload preinstalled, and pwsh is present by default. The Windows App
+      # SDK 10.0.22621.0 that @react-native-async-storage/async-storage's
+      # Windows project hardcodes isn't preinstalled on the runner though, so
+      # it's installed explicitly here (MSB8036 otherwise).
+      - uses: GuillaumeFalourd/setup-windows10-sdk-action@v2
+        with:
+          sdk-version: 22621
       - run: npx react-native run-windows --release --arch x64 --no-launch --no-deploy
       - uses: actions/upload-artifact@v4
         with:
