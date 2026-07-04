@@ -4,6 +4,13 @@ import * as Sharing from 'expo-sharing';
 
 export async function exportHtmlReport(html: string, fileName: string, showAlert: (opts: any) => void) {
   try {
+    if (Platform.OS === 'windows' || Platform.OS === 'macos') {
+      // Expo has no official Windows support and only experimental macOS support —
+      // expo-print/expo-sharing aren't available on these platforms.
+      showAlert('PDF export is currently available on mobile and web only. Support for this platform is planned.');
+      return;
+    }
+
     if (Platform.OS === 'web') {
       // expo-print can't silently write a file to disk in a browser, and expo-sharing
       // can't share a local file URI on web — the browser's own print dialog is the

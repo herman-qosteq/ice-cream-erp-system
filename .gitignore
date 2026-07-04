@@ -36,6 +36,30 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders
-/ios
-/android
+# Native project source (android/, ios/, windows/, macos/) is committed —
+# this repo is bare, not managed/CNG, so only build OUTPUT is ignored below.
+
+# Android build output
+/android/app/build/
+/android/.gradle/
+/android/build/
+
+# iOS/macOS build output + CocoaPods local state
+/ios/build/
+/ios/Pods/
+/macos/build/
+/macos/Pods/
+*.xcworkspace
+
+# Windows build output
+/windows/*/Debug/
+/windows/*/Release/
+/windows/*/ARM64/
+/windows/*/x64/
+/windows/*/x86/
+/windows/*/AppPackages/
+/windows/*/BundleArtifacts/
+/windows/target/
+/windows/packages/
+/windows/*.opendb
+/windows/*.db

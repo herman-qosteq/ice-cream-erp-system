@@ -1,0 +1,104 @@
+name: build-all
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch: {}
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: npm ci
+      # Unsigned debug build for now — no Android keystore exists yet.
+      # Once one does, switch to `assembleRelease` with signing config
+      # populated from repo secrets.
+      - run: cd android && ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      # ios/ can't be generated on the Windows dev machine this project was
+      # scaffolded on (expo prebuild skips iOS entirely outside macOS/Linux),
+      # so this job generates it fresh every run instead of relying on a
+      # committed folder.
+      - run: npx expo prebuild --platform ios
+      - run: cd ios && pod install
+      # Unsigned Simulator build — no Apple Developer account configured
+      # yet, so this can't produce a real device / TestFlight / App Store
+      # .ipa. Once that account + certs/profiles exist, switch the -sdk to
+      # iphoneos and add code-signing secrets.
+      - run: |
+          xcodebuild -workspace ios/mobile-app.xcworkspace -scheme mobile-app \
+            -configuration Release -sdk iphonesimulator \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-build
+          path: build/Build/Products/Release-iphonesimulator
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: pod install --project-directory=macos
+      # Unsigned .app — no Apple Developer ID cert configured yet, so
+      # Gatekeeper will block this on other machines until it's notarized.
+      - run: |
+          xcodebuild -workspace macos/mobile-app.xcworkspace -scheme mobile-app-macOS \
+            -configuration Release CODE_SIGNING_ALLOWED=NO
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: macos/build/Release/*.app
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      # windows-latest runners ship VS2022 Build Tools with the C++ desktop
+      # workload preinstalled, and pwsh is present by default.
+      - run: npx react-native run-windows --release --arch x64 --no-launch --no-deploy
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-appx
+          path: windows/**/AppPackages/**/*.msix
+
+  release:
+    needs: [android, ios, macos, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            android-apk/*
+            ios-simulator-build/*
+            macos-app/*
+            windows-appx/*
