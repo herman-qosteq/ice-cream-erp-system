@@ -44,6 +44,12 @@ yarn-error.*
 /android/.gradle/
 /android/build/
 
+# Stray local Android SDK components (accidentally installed into the repo's
+# android/ dir instead of the real SDK root at C:/Android) — not project source.
+/android/build-tools/
+/android/licenses/
+/android/platforms/
+
 # iOS/macOS build output + CocoaPods local state
 /ios/build/
 /ios/Pods/

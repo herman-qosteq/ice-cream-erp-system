@@ -4,6 +4,7 @@ import { Search, Plus, Edit, DollarSign, History, CheckCircle, Calendar, Trash2,
 import { ERPData, logAudit, resolveActor } from '../../storage';
 import { Product, AppNotification } from '../../types';
 import ConfirmModal from '../../components/common/ConfirmModal';
+import { pickImageAsDataUri } from '../../utils/imagePicker';
 
 const UNIT_OPTIONS: Product['unit_type'][] = ['ml', 'L', 'g', 'kg', 'pcs'];
 
@@ -203,10 +204,12 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     setDeleteProductConfirmId(null);
   };
 
-  const handleSimulateImagePick = () => {
-    const randomIndex = Math.floor(Math.random() * STOCK_PRODUCT_IMAGES.length);
-    setProductForm({ ...productForm, image_url: STOCK_PRODUCT_IMAGES[randomIndex] });
-    showAlert('Simulated gallery photo selected successfully!');
+  const handlePickProductImage = async () => {
+    const uri = await pickImageAsDataUri(showAlert);
+    if (uri) {
+      setProductForm(prev => ({ ...prev, image_url: uri }));
+      showAlert('Photo selected successfully.');
+    }
   };
 
   const handleOpenPriceUpdate = (p: Product) => {
@@ -345,10 +348,10 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             <View className="flex-row items-center gap-3">
               <Image source={{ uri: productForm.image_url }} className="w-16 h-16 rounded-xl bg-slate-100" />
               <View>
-                <Pressable onPress={handleSimulateImagePick} className="py-1.5 px-2.5 bg-slate-100 rounded-lg active:bg-slate-200">
-                  <Text className="text-slate-700 font-bold text-xs">Launch Gallery Picker</Text>
+                <Pressable onPress={handlePickProductImage} className="py-1.5 px-2.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                  <Text className="text-slate-700 font-bold text-xs">Choose Photo from Gallery</Text>
                 </Pressable>
-                <Text className="text-[9px] text-slate-400 mt-1">Mock image picker integration</Text>
+                <Text className="text-[9px] text-slate-400 mt-1">JPG/PNG, cropped to a square</Text>
               </View>
             </View>
 
@@ -615,9 +618,9 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                       <Pressable onPress={() => handleStartEditCategory(cat.id, cat.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
                         <Edit size={14} color="#475569" />
                       </Pressable>
-                      <Pressable onPress={() => setDeleteCategoryConfirmId(cat.id)} className="p-1.5 bg-rose-50 rounded-lg active:bg-rose-100">
+                      {/* <Pressable onPress={() => setDeleteCategoryConfirmId(cat.id)} className="p-1.5 bg-rose-50 rounded-lg active:bg-rose-100">
                         <Trash2 size={14} color="#e11d48" />
-                      </Pressable>
+                      </Pressable> */}
                     </>
                   )}
                 </View>

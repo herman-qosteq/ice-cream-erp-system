@@ -49,7 +49,7 @@ jobs:
       # expo prebuild sanitizes the app name (strips hyphens) when naming the
       # Xcode project, so "mobile-app" becomes "mobileapp".
       - run: |
-          WORKSPACE=$(ls ios/*.xcworkspace | head -1)
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -1)
           SCHEME=$(basename "$WORKSPACE" .xcworkspace)
           echo "Building workspace=$WORKSPACE scheme=$SCHEME"
           xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \

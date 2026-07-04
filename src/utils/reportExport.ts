@@ -12,11 +12,20 @@ export async function exportHtmlReport(html: string, fileName: string, showAlert
     }
 
     if (Platform.OS === 'web') {
-      // expo-print can't silently write a file to disk in a browser, and expo-sharing
-      // can't share a local file URI on web — the browser's own print dialog is the
-      // only reliable cross-browser way to turn this HTML into a saved PDF.
-      await Print.printAsync({ html });
-      showAlert('Your browser\'s print dialog has opened. Choose "Save as PDF" as the destination to download this report.');
+      // expo-print's web implementation ignores the `html` option entirely and just
+      // calls window.print() on whatever's currently on screen (the live app UI) —
+      // not the report we built. So on web we bypass expo-print completely: open
+      // the report HTML in its own window and print that window instead.
+      const printWindow = window.open('', '_blank');
+      if (!printWindow) {
+        showAlert('Your browser blocked the report window. Please allow pop-ups for this site and try again.');
+        return;
+      }
+      printWindow.document.write(html);
+      printWindow.document.close();
+      printWindow.focus();
+      setTimeout(() => printWindow.print(), 250);
+      showAlert('Your browser\'s print dialog has opened for the report. Choose "Save as PDF" as the destination to download it.');
       return;
     }
 

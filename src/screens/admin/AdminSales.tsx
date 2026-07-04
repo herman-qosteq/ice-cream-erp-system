@@ -7,6 +7,7 @@ import { calculateStoreHealthScore } from '../../data';
 import SelectField from '../../components/common/SelectField';
 import ConfirmModal from '../../components/common/ConfirmModal';
 import { exportHtmlReport } from '../../utils/reportExport';
+import { pickImageAsDataUri } from '../../utils/imagePicker';
 
 interface AdminSalesProps {
   data: ERPData;
@@ -491,11 +492,13 @@ export default function AdminSales({ data, setData, addNotification, currentUser
   };
 
   const [qrSettings, setQrSettings] = useState(data.qrCodeSettings);
-  const handleSimulateQRUpload = () => {
-    showAlert('Simulated gallery upload: Custom QR Code receipt file uploaded!');
-    const updatedSettings = { ...qrSettings, image_url: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=300&auto=format&fit=crop' };
+  const handleUploadQRImage = async () => {
+    const uri = await pickImageAsDataUri(showAlert);
+    if (!uri) return;
+    const updatedSettings = { ...qrSettings, image_url: uri };
     setQrSettings(updatedSettings);
     setData(prev => ({ ...prev, qrCodeSettings: updatedSettings }));
+    showAlert('Custom QR code image uploaded successfully.');
   };
 
   const handleToggleQR = () => {
@@ -1106,7 +1109,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   <View className="mt-3 flex-row items-center gap-3">
                     <Image source={{ uri: qrSettings.image_url }} className="w-12 h-12 rounded border border-slate-200" />
                     <View>
-                      <Pressable onPress={handleSimulateQRUpload} className="py-1 px-2.5 bg-white border border-slate-200 rounded active:bg-slate-50"><Text className="text-[9px] font-bold text-slate-700">Upload QR Code Image</Text></Pressable>
+                      <Pressable onPress={handleUploadQRImage} className="py-1 px-2.5 bg-white border border-slate-200 rounded active:bg-slate-50"><Text className="text-[9px] font-bold text-slate-700">Upload QR Code Image</Text></Pressable>
                     </View>
                   </View>
                 )}
