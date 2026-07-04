@@ -15,6 +15,11 @@ export interface ScheduledPrice {
   applied: boolean;
 }
 
+export interface Category {
+  id: string;
+  name: string;
+}
+
 export interface Product {
   id: string;
   name: string;
@@ -27,6 +32,8 @@ export interface Product {
   selling_price: number;
   tax_pct: number;
   status: 'Active' | 'Inactive';
+  unit_value: number;
+  unit_type: 'ml' | 'L' | 'g' | 'kg' | 'pcs';
   expiry_date?: string; // for expiry alerts simulation
   scheduled_prices?: ScheduledPrice[];
 }

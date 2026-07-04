@@ -1,4 +1,13 @@
-import { User, Product, Supplier, Store, Truck, WarehouseInventory, TruckInventory, Payment, Order, Invoice, AppNotification, Purchase } from './types';
+import { User, Product, Supplier, Store, Truck, WarehouseInventory, TruckInventory, Payment, Order, Invoice, AppNotification, Purchase, Category } from './types';
+
+// Initial Product Categories
+export const INITIAL_CATEGORIES: Category[] = [
+  { id: 'cat1', name: 'Cups' },
+  { id: 'cat2', name: 'Sticks' },
+  { id: 'cat3', name: 'Tubs' },
+  { id: 'cat4', name: 'Bars' },
+  { id: 'cat5', name: 'Popsicles' }
+];
 
 // Initial Users List
 export const INITIAL_USERS: User[] = [
@@ -49,7 +58,9 @@ export const INITIAL_PRODUCTS: Product[] = [
     purchase_price: 0.80,
     selling_price: 1.50,
     tax_pct: 12,
-    status: 'Active'
+    status: 'Active',
+    unit_value: 100,
+    unit_type: 'ml'
   },
   {
     id: 'p2',
@@ -62,7 +73,9 @@ export const INITIAL_PRODUCTS: Product[] = [
     purchase_price: 1.10,
     selling_price: 2.20,
     tax_pct: 12,
-    status: 'Active'
+    status: 'Active',
+    unit_value: 1,
+    unit_type: 'pcs'
   },
   {
     id: 'p3',
@@ -75,7 +88,9 @@ export const INITIAL_PRODUCTS: Product[] = [
     purchase_price: 3.50,
     selling_price: 6.99,
     tax_pct: 18,
-    status: 'Active'
+    status: 'Active',
+    unit_value: 1,
+    unit_type: 'L'
   },
   {
     id: 'p4',
@@ -88,7 +103,9 @@ export const INITIAL_PRODUCTS: Product[] = [
     purchase_price: 1.20,
     selling_price: 2.50,
     tax_pct: 12,
-    status: 'Active'
+    status: 'Active',
+    unit_value: 1,
+    unit_type: 'pcs'
   },
   {
     id: 'p5',
@@ -101,7 +118,9 @@ export const INITIAL_PRODUCTS: Product[] = [
     purchase_price: 0.60,
     selling_price: 1.25,
     tax_pct: 5,
-    status: 'Active'
+    status: 'Active',
+    unit_value: 1,
+    unit_type: 'pcs'
   },
   {
     id: 'p6',
@@ -114,7 +133,9 @@ export const INITIAL_PRODUCTS: Product[] = [
     purchase_price: 3.75,
     selling_price: 7.50,
     tax_pct: 18,
-    status: 'Active'
+    status: 'Active',
+    unit_value: 1,
+    unit_type: 'L'
   },
   {
     id: 'p7',
@@ -127,7 +148,9 @@ export const INITIAL_PRODUCTS: Product[] = [
     purchase_price: 1.40,
     selling_price: 3.00,
     tax_pct: 12,
-    status: 'Active'
+    status: 'Active',
+    unit_value: 1,
+    unit_type: 'pcs'
   }
 ];
 

@@ -1,12 +1,12 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   User, Product, Supplier, Store, Truck, WarehouseInventory, TruckInventory,
-  Order, Invoice, Payment, AppNotification, SyncQueueItem, CreditLedger, Purchase, PreBookingOrder
+  Order, Invoice, Payment, AppNotification, SyncQueueItem, CreditLedger, Purchase, PreBookingOrder, Category
 } from './types';
 import {
   INITIAL_USERS, INITIAL_PRODUCTS, INITIAL_SUPPLIERS, INITIAL_STORES,
   INITIAL_TRUCKS, INITIAL_WAREHOUSE_INVENTORY, INITIAL_TRUCK_INVENTORIES,
-  INITIAL_ORDERS, INITIAL_INVOICES, INITIAL_PAYMENTS, INITIAL_NOTIFICATIONS
+  INITIAL_ORDERS, INITIAL_INVOICES, INITIAL_PAYMENTS, INITIAL_NOTIFICATIONS, INITIAL_CATEGORIES
 } from './data';
 
 export interface ERPAuditLog {
@@ -34,6 +34,7 @@ export function resolveActor(users: User[], userId: string): { name: string; rol
 export interface ERPData {
   users: User[];
   products: Product[];
+  categories: Category[];
   suppliers: Supplier[];
   stores: Store[];
   trucks: Truck[];
@@ -117,12 +118,13 @@ export async function loadAllData(): Promise<ERPData> {
   ];
 
   const [
-    users, products, suppliers, stores, trucks, warehouse_inventory,
+    users, products, categories, suppliers, stores, trucks, warehouse_inventory,
     truck_inventory, orders, invoices, payments, notifications,
     purchases, visits, preBookingOrders, syncQueue, qrCodeSettings, auditLogs
   ] = await Promise.all([
     getOrSeed<User[]>('erp_users', INITIAL_USERS),
     getOrSeed<Product[]>('erp_products', INITIAL_PRODUCTS),
+    getOrSeed<Category[]>('erp_categories', INITIAL_CATEGORIES),
     getOrSeed<Supplier[]>('erp_suppliers', INITIAL_SUPPLIERS),
     getOrSeed<Store[]>('erp_stores', INITIAL_STORES),
     getOrSeed<Truck[]>('erp_trucks', INITIAL_TRUCKS),
@@ -141,7 +143,7 @@ export async function loadAllData(): Promise<ERPData> {
   ]);
 
   return {
-    users, products, suppliers, stores, trucks, warehouse_inventory,
+    users, products, categories, suppliers, stores, trucks, warehouse_inventory,
     truck_inventory, orders, invoices, payments, notifications,
     purchases, visits, preBookingOrders, syncQueue,
     isOffline: isOfflineVal, qrCodeSettings, auditLogs
@@ -156,6 +158,7 @@ export async function saveAllDataToLocalStorage(erpData: ERPData) {
   await Promise.all([
     saveData('erp_users', erpData.users),
     saveData('erp_products', erpData.products),
+    saveData('erp_categories', erpData.categories),
     saveData('erp_suppliers', erpData.suppliers),
     saveData('erp_stores', erpData.stores),
     saveData('erp_trucks', erpData.trucks),

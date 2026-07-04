@@ -1,8 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, TextInput, Pressable, Image, ScrollView } from 'react-native';
-import { Search, Plus, Edit, DollarSign, History, CheckCircle, Calendar, Trash2, Clock } from 'lucide-react-native';
+import { Search, Plus, Edit, DollarSign, History, CheckCircle, Calendar, Trash2, Clock, AlertTriangle, Tag, Check, X } from 'lucide-react-native';
 import { ERPData, logAudit, resolveActor } from '../../storage';
 import { Product, AppNotification } from '../../types';
+import ConfirmModal from '../../components/common/ConfirmModal';
+
+const UNIT_OPTIONS: Product['unit_type'][] = ['ml', 'L', 'g', 'kg', 'pcs'];
 
 interface AdminProductsProps {
   data: ERPData;
@@ -19,13 +22,17 @@ const STOCK_PRODUCT_IMAGES = [
   'https://images.unsplash.com/photo-1563805042-7684c019e1cb?w=200&auto=format&fit=crop'
 ];
 
-const CATEGORY_OPTIONS = ['Cups', 'Sticks', 'Tubs', 'Bars', 'Popsicles'];
-
 export default function AdminProducts({ data, setData, addNotification, currentUser, showAlert, activeScreen }: AdminProductsProps) {
   const [productSearch, setProductSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All');
-  const [activeForm, setActiveForm] = useState<'list' | 'add_product' | 'edit_product' | 'price_history'>('list');
+  const [activeForm, setActiveForm] = useState<'list' | 'add_product' | 'edit_product' | 'price_history' | 'manage_categories'>('list');
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [deleteProductConfirmId, setDeleteProductConfirmId] = useState<string | null>(null);
+
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
+  const [editingCategoryName, setEditingCategoryName] = useState('');
+  const [deleteCategoryConfirmId, setDeleteCategoryConfirmId] = useState<string | null>(null);
 
   useEffect(() => {
     setActiveForm('list');
@@ -34,13 +41,14 @@ export default function AdminProducts({ data, setData, addNotification, currentU
   const [productForm, setProductForm] = useState({
     name: '', code: '', category: 'Cups', brand: 'Gelato Peaks', description: '',
     purchase_price: 1.0, selling_price: 2.0, tax_pct: 12, status: 'Active' as 'Active' | 'Inactive',
+    unit_value: 1, unit_type: 'pcs' as Product['unit_type'],
     image_url: STOCK_PRODUCT_IMAGES[0]
   });
 
   const [priceUpdateForm, setPriceUpdateForm] = useState({ purchase_price: 0, selling_price: 0 });
   const [scheduleForm, setScheduleForm] = useState({ purchase_price: 0, selling_price: 0, effective_date: '2026-07-15' });
 
-  const categories = ['All', ...Array.from(new Set(data.products.map(p => p.category)))];
+  const categories = ['All', ...data.categories.map(c => c.name)];
 
   const filteredProducts = data.products.filter(p => {
     const matchesSearch = p.name.toLowerCase().includes(productSearch.toLowerCase()) || p.code.toLowerCase().includes(productSearch.toLowerCase());
@@ -50,8 +58,9 @@ export default function AdminProducts({ data, setData, addNotification, currentU
 
   const handleOpenAddProduct = () => {
     setProductForm({
-      name: '', code: 'IC-NEW-' + Math.floor(Math.random() * 900 + 100), category: 'Cups', brand: 'Gelato Peaks', description: '',
+      name: '', code: 'IC-NEW-' + Math.floor(Math.random() * 900 + 100), category: data.categories[0]?.name || '', brand: 'Gelato Peaks', description: '',
       purchase_price: 1.00, selling_price: 2.00, tax_pct: 12, status: 'Active',
+      unit_value: 1, unit_type: 'pcs',
       image_url: STOCK_PRODUCT_IMAGES[0]
     });
     setActiveForm('add_product');
@@ -62,9 +71,81 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     setProductForm({
       name: p.name, code: p.code, category: p.category, brand: p.brand, description: p.description,
       purchase_price: p.purchase_price, selling_price: p.selling_price, tax_pct: p.tax_pct, status: p.status,
+      unit_value: p.unit_value, unit_type: p.unit_type,
       image_url: p.image_url
     });
     setActiveForm('edit_product');
+  };
+
+  const handleOpenManageCategories = () => {
+    setNewCategoryName('');
+    setEditingCategoryId(null);
+    setActiveForm('manage_categories');
+  };
+
+  const handleAddCategory = () => {
+    const name = newCategoryName.trim();
+    if (!name) {
+      showAlert('Please enter a category name.');
+      return;
+    }
+    if (data.categories.some(c => c.name.toLowerCase() === name.toLowerCase())) {
+      showAlert(`A category named "${name}" already exists.`);
+      return;
+    }
+    const newCategory = { id: 'cat_' + Date.now(), name };
+    let tempState = { ...data, categories: [...data.categories, newCategory] };
+    tempState = logAudit(tempState, 'CATEGORY_CREATE', 'Category', newCategory.id, currentUser?.id || 'admin', `Created product category ${name}`);
+    setData(tempState);
+    addNotification('product_update', `New product category added: ${name}.`);
+    setNewCategoryName('');
+  };
+
+  const handleStartEditCategory = (categoryId: string, currentName: string) => {
+    setEditingCategoryId(categoryId);
+    setEditingCategoryName(currentName);
+  };
+
+  const handleSaveEditCategory = () => {
+    const newName = editingCategoryName.trim();
+    const category = data.categories.find(c => c.id === editingCategoryId);
+    if (!category) { setEditingCategoryId(null); return; }
+    if (!newName) {
+      showAlert('Category name cannot be empty.');
+      return;
+    }
+    if (data.categories.some(c => c.id !== category.id && c.name.toLowerCase() === newName.toLowerCase())) {
+      showAlert(`A category named "${newName}" already exists.`);
+      return;
+    }
+    const oldName = category.name;
+    const updatedCategories = data.categories.map(c => (c.id === category.id ? { ...c, name: newName } : c));
+    const updatedProducts = data.products.map(p => (p.category === oldName ? { ...p, category: newName } : p));
+    let tempState = { ...data, categories: updatedCategories, products: updatedProducts };
+    tempState = logAudit(tempState, 'CATEGORY_UPDATE', 'Category', category.id, currentUser?.id || 'admin', `Renamed product category "${oldName}" to "${newName}"`);
+    setData(tempState);
+    addNotification('product_update', `Category "${oldName}" renamed to "${newName}".`);
+    setEditingCategoryId(null);
+  };
+
+  const handleConfirmDeleteCategory = () => {
+    const categoryId = deleteCategoryConfirmId;
+    const category = data.categories.find(c => c.id === categoryId);
+    if (!category) { setDeleteCategoryConfirmId(null); return; }
+
+    const productsInCategory = data.products.filter(p => p.category === category.name).length;
+    if (productsInCategory > 0) {
+      setDeleteCategoryConfirmId(null);
+      showAlert(`Cannot delete "${category.name}": ${productsInCategory} product(s) still use this category. Move or delete those products first.`);
+      return;
+    }
+
+    const updatedCategories = data.categories.filter(c => c.id !== category.id);
+    let tempState = { ...data, categories: updatedCategories };
+    tempState = logAudit(tempState, 'CATEGORY_DELETE', 'Category', category.id, currentUser?.id || 'admin', `Deleted product category ${category.name}`);
+    setData(tempState);
+    addNotification('product_update', `Category "${category.name}" was deleted.`);
+    setDeleteCategoryConfirmId(null);
   };
 
   const handleSaveProduct = () => {
@@ -96,6 +177,30 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     }
 
     setActiveForm('list');
+  };
+
+  const handleConfirmDeleteProduct = () => {
+    const productId = deleteProductConfirmId;
+    const product = data.products.find(p => p.id === productId);
+    if (!product) { setDeleteProductConfirmId(null); return; }
+
+    const wh = data.warehouse_inventory.find(inv => inv.product_id === productId);
+    const warehouseUnits = wh ? wh.available_qty + wh.reserved_qty + wh.damaged_qty + wh.expired_qty : 0;
+    const truckUnits = data.truck_inventory.filter(ti => ti.product_id === productId).reduce((sum, ti) => sum + ti.quantity, 0);
+    if (warehouseUnits + truckUnits > 0) {
+      setDeleteProductConfirmId(null);
+      showAlert(`Cannot delete ${product.name}: it still has ${warehouseUnits} unit(s) in the warehouse and ${truckUnits} unit(s) on trucks. Clear or transfer that stock first so it isn't lost from your inventory reports.`);
+      return;
+    }
+
+    const updatedProducts = data.products.filter(p => p.id !== productId);
+    const updatedWarehouse = data.warehouse_inventory.filter(inv => inv.product_id !== productId);
+    let tempState = { ...data, products: updatedProducts, warehouse_inventory: updatedWarehouse };
+    tempState = logAudit(tempState, 'PRODUCT_DELETE', 'Product', product.id, currentUser?.id || 'admin', `Deleted product ${product.name} from the catalog.`);
+    setData(tempState);
+    addNotification('product_update', `Product "${product.name}" was deleted from the catalog.`);
+    showAlert(`${product.name} has been deleted.`);
+    setDeleteProductConfirmId(null);
   };
 
   const handleSimulateImagePick = () => {
@@ -198,9 +303,14 @@ export default function AdminProducts({ data, setData, addNotification, currentU
               />
             </View>
             {activeScreen !== 'Pricing' && (
-              <Pressable onPress={handleOpenAddProduct} className="bg-rose-500 p-2.5 rounded-xl active:bg-rose-600">
-                <Plus size={20} color="#fff" />
-              </Pressable>
+              <>
+                <Pressable onPress={handleOpenManageCategories} className="bg-slate-800 p-2.5 rounded-xl active:bg-slate-900">
+                  <Tag size={20} color="#fff" />
+                </Pressable>
+                <Pressable onPress={handleOpenAddProduct} className="bg-rose-500 p-2.5 rounded-xl active:bg-rose-600">
+                  <Plus size={20} color="#fff" />
+                </Pressable>
+              </>
             )}
           </View>
 
@@ -254,11 +364,19 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             </View>
 
             <View>
-              <Text className="font-bold text-slate-500 mb-1 text-xs">Category</Text>
+              <View className="flex-row items-center justify-between mb-1">
+                <Text className="font-bold text-slate-500 text-xs">Category</Text>
+                <Pressable onPress={handleOpenManageCategories}>
+                  <Text className="text-[10px] font-bold text-indigo-600">Manage Categories</Text>
+                </Pressable>
+              </View>
               <View className="flex-row flex-wrap gap-1.5">
-                {CATEGORY_OPTIONS.map(cat => (
-                  <Pressable key={cat} onPress={() => setProductForm({ ...productForm, category: cat })} className={`py-1.5 px-3 rounded-lg ${productForm.category === cat ? 'bg-slate-800' : 'bg-slate-50 border border-slate-200'}`}>
-                    <Text className={`text-[10px] font-bold ${productForm.category === cat ? 'text-white' : 'text-slate-600'}`}>{cat}</Text>
+                {data.categories.length === 0 && (
+                  <Text className="text-[10px] text-slate-400 italic">No categories yet — tap "Manage Categories" to add one.</Text>
+                )}
+                {data.categories.map(cat => (
+                  <Pressable key={cat.id} onPress={() => setProductForm({ ...productForm, category: cat.name })} className={`py-1.5 px-3 rounded-lg ${productForm.category === cat.name ? 'bg-slate-800' : 'bg-slate-50 border border-slate-200'}`}>
+                    <Text className={`text-[10px] font-bold ${productForm.category === cat.name ? 'text-white' : 'text-slate-600'}`}>{cat.name}</Text>
                   </Pressable>
                 ))}
               </View>
@@ -275,6 +393,27 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                   {(['Active', 'Inactive'] as const).map(st => (
                     <Pressable key={st} onPress={() => setProductForm({ ...productForm, status: st })} className={`flex-1 py-2 rounded-lg items-center ${productForm.status === st ? 'bg-slate-800' : 'bg-slate-50 border border-slate-200'}`}>
                       <Text className={`text-[10px] font-bold ${productForm.status === st ? 'text-white' : 'text-slate-600'}`}>{st}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </View>
+            </View>
+
+            <View>
+              <Text className="font-bold text-slate-500 mb-1 text-xs">Unit Size</Text>
+              <View className="flex-row gap-2">
+                <TextInput
+                  keyboardType="decimal-pad"
+                  value={String(productForm.unit_value)}
+                  onChangeText={v => setProductForm({ ...productForm, unit_value: Number(v) || 0 })}
+                  className={inputClass + ' flex-1'}
+                  placeholder="e.g. 100"
+                  placeholderTextColor="#94a3b8"
+                />
+                <View className="flex-row gap-1 flex-[2]">
+                  {UNIT_OPTIONS.map(u => (
+                    <Pressable key={u} onPress={() => setProductForm({ ...productForm, unit_type: u })} className={`flex-1 py-2 rounded-lg items-center ${productForm.unit_type === u ? 'bg-slate-800' : 'bg-slate-50 border border-slate-200'}`}>
+                      <Text className={`text-[10px] font-bold ${productForm.unit_type === u ? 'text-white' : 'text-slate-600'}`}>{u}</Text>
                     </Pressable>
                   ))}
                 </View>
@@ -424,6 +563,71 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             )}
           </View>
         </View>
+      ) : activeForm === 'manage_categories' ? (
+        <View className="bg-white p-4 rounded-2xl border border-slate-200 gap-4">
+          <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+            <Text className="font-extrabold text-slate-800 text-sm">Manage Categories</Text>
+            <Pressable onPress={() => setActiveForm('list')} className="bg-slate-100 px-2.5 py-1 rounded-lg active:bg-slate-200">
+              <Text className="text-slate-500 font-bold text-xs">Back to Catalog</Text>
+            </Pressable>
+          </View>
+
+          <View className="flex-row gap-2">
+            <TextInput
+              value={newCategoryName}
+              onChangeText={setNewCategoryName}
+              placeholder="New category name..."
+              placeholderTextColor="#94a3b8"
+              className={inputClass + ' flex-1'}
+            />
+            <Pressable onPress={handleAddCategory} className="bg-rose-500 px-4 rounded-lg items-center justify-center active:bg-rose-600">
+              <Text className="text-white font-bold text-xs">Add</Text>
+            </Pressable>
+          </View>
+
+          <View className="gap-2">
+            {data.categories.map(cat => {
+              const productCount = data.products.filter(p => p.category === cat.name).length;
+              const isEditing = editingCategoryId === cat.id;
+              return (
+                <View key={cat.id} className="flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+                  {isEditing ? (
+                    <>
+                      <TextInput
+                        value={editingCategoryName}
+                        onChangeText={setEditingCategoryName}
+                        autoFocus
+                        className="flex-1 bg-white border border-indigo-200 rounded-lg p-1.5 text-xs text-slate-800"
+                      />
+                      <Pressable onPress={handleSaveEditCategory} className="p-1.5 bg-emerald-50 rounded-lg active:bg-emerald-100">
+                        <Check size={16} color="#059669" />
+                      </Pressable>
+                      <Pressable onPress={() => setEditingCategoryId(null)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                        <X size={16} color="#64748b" />
+                      </Pressable>
+                    </>
+                  ) : (
+                    <>
+                      <View className="flex-1">
+                        <Text className="font-bold text-slate-800 text-xs">{cat.name}</Text>
+                        <Text className="text-[9px] text-slate-400">{productCount} product{productCount === 1 ? '' : 's'}</Text>
+                      </View>
+                      <Pressable onPress={() => handleStartEditCategory(cat.id, cat.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                        <Edit size={14} color="#475569" />
+                      </Pressable>
+                      <Pressable onPress={() => setDeleteCategoryConfirmId(cat.id)} className="p-1.5 bg-rose-50 rounded-lg active:bg-rose-100">
+                        <Trash2 size={14} color="#e11d48" />
+                      </Pressable>
+                    </>
+                  )}
+                </View>
+              );
+            })}
+            {data.categories.length === 0 && (
+              <Text className="text-[10px] text-slate-400 italic py-2 text-center">No categories yet. Add one above.</Text>
+            )}
+          </View>
+        </View>
       ) : (
         <View className="gap-3">
           {filteredProducts.map(p => {
@@ -440,7 +644,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                     <Text className="font-bold text-slate-800 text-xs flex-1" numberOfLines={1}>{p.name}</Text>
                     <Text className="text-[9px] bg-slate-100 font-bold px-1.5 py-0.5 rounded text-slate-400 uppercase">{p.code}</Text>
                   </View>
-                  <Text className="text-[10px] text-slate-400 mt-0.5">{p.brand} - {p.category}</Text>
+                  <Text className="text-[10px] text-slate-400 mt-0.5">{p.brand} - {p.category} - {p.unit_value}{p.unit_type}</Text>
                   <View className="flex-row items-center justify-between mt-2 pt-1.5 border-t border-slate-50">
                     <View className="flex-row gap-3">
                       <View>
@@ -464,9 +668,14 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                         <DollarSign size={14} color="#4f46e5" />
                       </Pressable>
                       {activeScreen !== 'Pricing' && (
-                        <Pressable onPress={() => handleOpenEditProduct(p)} className="p-1.5 bg-slate-50 rounded-lg active:bg-slate-100">
-                          <Edit size={14} color="#475569" />
-                        </Pressable>
+                        <>
+                          <Pressable onPress={() => handleOpenEditProduct(p)} className="p-1.5 bg-slate-50 rounded-lg active:bg-slate-100">
+                            <Edit size={14} color="#475569" />
+                          </Pressable>
+                          <Pressable onPress={() => setDeleteProductConfirmId(p.id)} className="p-1.5 bg-rose-50 rounded-lg active:bg-rose-100">
+                            <Trash2 size={14} color="#e11d48" />
+                          </Pressable>
+                        </>
                       )}
                     </View>
                   </View>
@@ -482,6 +691,28 @@ export default function AdminProducts({ data, setData, addNotification, currentU
           )}
         </View>
       )}
+
+      <ConfirmModal
+        visible={!!deleteProductConfirmId}
+        onClose={() => setDeleteProductConfirmId(null)}
+        icon={AlertTriangle}
+        title="Confirm Product Deletion"
+        message={`Are you sure you want to delete "${data.products.find(p => p.id === deleteProductConfirmId)?.name || 'this product'}" from the catalog? This cannot be undone.`}
+        confirmLabel="Yes, Delete"
+        cancelLabel="No, Keep"
+        onConfirm={handleConfirmDeleteProduct}
+      />
+
+      <ConfirmModal
+        visible={!!deleteCategoryConfirmId}
+        onClose={() => setDeleteCategoryConfirmId(null)}
+        icon={AlertTriangle}
+        title="Confirm Category Deletion"
+        message={`Are you sure you want to delete "${data.categories.find(c => c.id === deleteCategoryConfirmId)?.name || 'this category'}"? This cannot be undone.`}
+        confirmLabel="Yes, Delete"
+        cancelLabel="No, Keep"
+        onConfirm={handleConfirmDeleteCategory}
+      />
     </View>
   );
 }
