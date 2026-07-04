@@ -1,0 +1,258 @@
+import React, { useState } from 'react';
+import { View, Text, Pressable, ScrollView } from 'react-native';
+import {
+  Menu, Bell, LogOut, ChevronRight, LayoutDashboard, ShoppingBag, Database, Award, FileSpreadsheet,
+} from 'lucide-react-native';
+import { ERPData } from '../../storage';
+import { AppNotification } from '../../types';
+
+import AdminDashboard from './AdminDashboard';
+import AdminProducts from './AdminProducts';
+import AdminWarehouse from './AdminWarehouse';
+import AdminSales from './AdminSales';
+import AdminUsers from './AdminUsers';
+
+interface AdminFlowProps {
+  data: ERPData;
+  setData: (updater: ERPData | ((prev: ERPData) => ERPData)) => void;
+  addNotification: (type: AppNotification['type'], message: string) => void;
+  currentUser: any;
+  setCurrentUser: (user: any) => void;
+  showAlert: (opts: any) => void;
+}
+
+type AdminScreen =
+  | 'Dashboard' | 'Products' | 'Pricing' | 'Suppliers' | 'Purchases'
+  | 'Warehouse' | 'Trucks' | 'TruckInventory' | 'MovementAudit'
+  | 'Stores' | 'Orders' | 'Deliveries' | 'Invoices' | 'Payments' | 'QRCodePayment' | 'Credit' | 'Refill' | 'Inactive'
+  | 'Users' | 'Notifications';
+
+const screenTitles: Record<string, string> = {
+  Dashboard: 'Executive Panel',
+  Products: 'Ice Cream Catalog',
+  Pricing: 'Price & Cost Manager',
+  Warehouse: 'Cold-Chain Warehouse',
+  Trucks: 'Truck Fleet Load & Transfers',
+  MovementAudit: 'Logistics Movement Audit Trail',
+  Stores: 'Partner Outlets',
+  Orders: 'Order Logistics',
+  Payments: 'Settlements & UPI',
+  Users: 'Operator Management',
+};
+
+export default function AdminFlow({ data, setData, addNotification, currentUser, setCurrentUser, showAlert }: AdminFlowProps) {
+  const [activeScreen, setActiveScreen] = useState<AdminScreen>('Dashboard');
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+
+  const unreadNotifsCount = data.notifications.filter(n => !n.is_read).length;
+
+  const handleScreenSelect = (screen: AdminScreen) => {
+    setActiveScreen(screen);
+    setIsDrawerOpen(false);
+  };
+
+  const handleLogOut = () => {
+    setCurrentUser(null);
+  };
+
+  const drawerGroups = [
+    {
+      title: 'Business & Reporting',
+      icon: <LayoutDashboard size={14} color="#6366f1" />,
+      items: [
+        { label: 'Executive Dashboard', screen: 'Dashboard' as AdminScreen },
+        { label: 'System Alert Hub', screen: 'Notifications' as AdminScreen },
+      ],
+    },
+    {
+      title: 'Cargo & Catalog',
+      icon: <Award size={14} color="#f43f5e" />,
+      items: [{ label: 'Ice Cream Catalog', screen: 'Products' as AdminScreen }],
+    },
+    {
+      title: 'Warehouse & Fleet',
+      icon: <Database size={14} color="#3b82f6" />,
+      items: [
+        { label: 'Warehouse Inventory', screen: 'Warehouse' as AdminScreen },
+        { label: 'Truck Fleet Load', screen: 'Trucks' as AdminScreen },
+        { label: 'Logistics Audit Trail', screen: 'MovementAudit' as AdminScreen },
+      ],
+    },
+    {
+      title: 'Partners & Sales',
+      icon: <ShoppingBag size={14} color="#10b981" />,
+      items: [
+        { label: 'Partner Stores', screen: 'Stores' as AdminScreen },
+        { label: 'Supply Partners', screen: 'Suppliers' as AdminScreen },
+        { label: 'Order Dispatches', screen: 'Orders' as AdminScreen },
+        { label: 'Payments & UPI QR', screen: 'Payments' as AdminScreen },
+      ],
+    },
+    {
+      title: 'System & Security',
+      icon: <FileSpreadsheet size={14} color="#a855f7" />,
+      items: [{ label: 'Operator Accounts', screen: 'Users' as AdminScreen }],
+    },
+  ];
+
+  return (
+    <View className="flex-1 bg-sky-50 relative">
+      {/* APP HEADER */}
+      <View className="h-14 shrink-0 bg-white/80 border-b border-white/30 px-4 flex-row items-center justify-between z-30">
+        <View className="flex-row items-center gap-3">
+          <Pressable onPress={() => setIsDrawerOpen(true)} className="p-1.5 rounded-lg active:bg-slate-100">
+            <Menu size={20} color="#334155" />
+          </Pressable>
+          <View className="flex-col">
+            <Text className="text-[10px] font-extrabold uppercase tracking-widest text-blue-600">FrostyFlow ERP</Text>
+            <Text className="text-xs font-bold text-slate-800 leading-tight">
+              {screenTitles[activeScreen] ?? activeScreen}
+            </Text>
+          </View>
+        </View>
+
+        <View className="flex-row items-center gap-2">
+          <Pressable onPress={() => setActiveScreen('Notifications')} className="p-2 rounded-xl relative active:bg-slate-100">
+            <Bell size={18} color="#334155" />
+            {unreadNotifsCount > 0 && (
+              <View className="absolute top-1 right-1 w-4 h-4 bg-rose-500 rounded-full items-center justify-center">
+                <Text className="text-white font-extrabold text-[8px]">{unreadNotifsCount}</Text>
+              </View>
+            )}
+          </Pressable>
+          <Pressable onPress={handleLogOut} className="p-2 rounded-xl active:bg-rose-50">
+            <LogOut size={18} color="#334155" />
+          </Pressable>
+        </View>
+      </View>
+
+      {/* CORE SCREEN CANVAS */}
+      <ScrollView className="flex-1" contentContainerStyle={{ padding: 16 }}>
+        {activeScreen === 'Dashboard' && (
+          <AdminDashboard data={data} setActiveScreen={(scr) => handleScreenSelect(scr as any)} showAlert={showAlert} />
+        )}
+        {(activeScreen === 'Products' || activeScreen === 'Pricing') && (
+          <AdminProducts
+            data={data}
+            setData={setData}
+            addNotification={addNotification}
+            currentUser={currentUser}
+            activeScreen={activeScreen}
+            showAlert={showAlert}
+          />
+        )}
+        {(activeScreen === 'Warehouse' || activeScreen === 'Trucks' || activeScreen === 'TruckInventory' || activeScreen === 'MovementAudit') && (
+          <AdminWarehouse
+            data={data}
+            setData={setData}
+            addNotification={addNotification}
+            currentUser={currentUser}
+            activeScreen={activeScreen}
+            setActiveScreen={(scr) => handleScreenSelect(scr as any)}
+            showAlert={showAlert}
+          />
+        )}
+        {(activeScreen === 'Stores' || activeScreen === 'Suppliers' || activeScreen === 'Purchases' || activeScreen === 'Orders' || activeScreen === 'Deliveries' || activeScreen === 'Invoices' || activeScreen === 'Payments' || activeScreen === 'QRCodePayment' || activeScreen === 'Credit' || activeScreen === 'Refill' || activeScreen === 'Inactive') && (
+          <AdminSales
+            data={data}
+            setData={setData}
+            addNotification={addNotification}
+            currentUser={currentUser}
+            activeScreen={activeScreen}
+            showAlert={showAlert}
+          />
+        )}
+        {(activeScreen === 'Users' || activeScreen === 'Notifications') && (
+          <AdminUsers
+            data={data}
+            setData={setData}
+            addNotification={addNotification}
+            currentUser={currentUser}
+            activeScreen={activeScreen}
+            showAlert={showAlert}
+          />
+        )}
+      </ScrollView>
+
+      {/* BOTTOM TAB BAR */}
+      <View className="h-16 shrink-0 bg-white/90 border-t border-white/30 flex-row items-stretch z-30">
+        {[
+          { screen: 'Dashboard' as AdminScreen, icon: LayoutDashboard, label: 'Stats' },
+          { screen: 'Products' as AdminScreen, icon: Award, label: 'Catalog' },
+          { screen: 'Warehouse' as AdminScreen, icon: Database, label: 'Stock', group: ['Warehouse', 'Trucks', 'TruckInventory', 'MovementAudit'] },
+          { screen: 'Stores' as AdminScreen, icon: ShoppingBag, label: 'Partners' },
+          { screen: 'Users' as AdminScreen, icon: LayoutDashboard, label: 'Accounts' },
+        ].map((tab, idx) => {
+          const isActive = tab.group ? tab.group.includes(activeScreen) : activeScreen === tab.screen;
+          const Icon = tab.icon;
+          return (
+            <Pressable
+              key={idx}
+              onPress={() => handleScreenSelect(tab.screen)}
+              className="flex-1 items-center justify-center gap-1"
+            >
+              <Icon size={20} color={isActive ? '#2563eb' : '#94a3b8'} />
+              <Text className={`text-[9px] font-bold ${isActive ? 'text-blue-600' : 'text-slate-400'}`}>{tab.label}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {/* DRAWER OVERLAY */}
+      {isDrawerOpen && (
+        <View className="absolute inset-0 bg-black/30 z-50 flex-row">
+          <View className="w-[280px] h-full bg-white border-r border-white/50 p-4 justify-between">
+            <View className="flex-1">
+              <View className="flex-row items-center gap-3 pb-4 border-b border-slate-200/50 mb-6">
+                <View className="w-10 h-10 bg-blue-500/10 border border-blue-500/30 rounded-xl items-center justify-center">
+                  <Text className="text-xl">🍦</Text>
+                </View>
+                <View>
+                  <Text className="font-extrabold text-sm tracking-tight text-slate-800">{currentUser?.name}</Text>
+                  <Text className="text-[10px] text-blue-600 font-bold uppercase tracking-wider">Administrator</Text>
+                </View>
+              </View>
+
+              <ScrollView className="flex-1">
+                {drawerGroups.map((group, gIdx) => (
+                  <View key={gIdx} className="mb-4 gap-1">
+                    <View className="flex-row items-center gap-1.5 px-2 mb-1.5">
+                      {group.icon}
+                      <Text className="text-[9px] uppercase font-bold tracking-widest text-slate-400">{group.title}</Text>
+                    </View>
+                    {group.items.map((item, iIdx) => {
+                      const isActive = activeScreen === item.screen;
+                      return (
+                        <Pressable
+                          key={iIdx}
+                          onPress={() => handleScreenSelect(item.screen)}
+                          className={`w-full py-2 px-3 rounded-lg flex-row items-center justify-between mb-1 ${
+                            isActive ? 'bg-blue-500/15 border border-blue-200/50' : ''
+                          }`}
+                        >
+                          <Text className={`text-xs font-semibold ${isActive ? 'text-blue-700 font-extrabold' : 'text-slate-600'}`}>
+                            {item.label}
+                          </Text>
+                          <ChevronRight size={14} color="#cbd5e1" />
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                ))}
+              </ScrollView>
+            </View>
+
+            <Pressable
+              onPress={() => setIsDrawerOpen(false)}
+              className="w-full py-2 bg-slate-100 rounded-xl items-center border border-slate-200"
+            >
+              <Text className="text-slate-700 font-bold text-xs">Close Navigation Panel</Text>
+            </Pressable>
+          </View>
+
+          <Pressable className="flex-1" onPress={() => setIsDrawerOpen(false)} />
+        </View>
+      )}
+    </View>
+  );
+}
