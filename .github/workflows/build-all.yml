@@ -8,6 +8,9 @@ on:
 jobs:
   android:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,10 +28,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: frontend/android/app/build/outputs/apk/debug/*.apk
 
   ios:
     runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,10 +64,49 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ios-simulator-build
-          path: build/Build/Products/Release-iphonesimulator
+          path: frontend/build/Build/Products/Release-iphonesimulator
+
+  ios-device:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npx expo prebuild --platform ios
+      - run: cd ios && pod install
+      # Real-device (arm64) build, deliberately left unsigned since there's
+      # no Apple Developer account/certs in this repo. Sign it afterwards
+      # with a free Apple ID via Sideloadly or AltServer (both run on
+      # Windows/Linux, no Mac needed) to install on a physical iPhone —
+      # the app expires after 7 days and needs re-signing, same limitation
+      # Xcode's own free "personal team" signing has.
+      - run: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          echo "Building workspace=$WORKSPACE scheme=$SCHEME"
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+      - run: |
+          cd build/Build/Products/Release-iphoneos
+          mkdir Payload
+          mv *.app Payload/
+          zip -r ../../../../unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: frontend/unsigned.ipa
 
   macos:
     runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -77,10 +122,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-app
-          path: macos/build/Release/*.app
+          path: frontend/macos/build/Release/*.app
 
   windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -99,7 +147,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-appx
-          path: windows/**/AppPackages/**/*.msix
+          path: frontend/windows/**/AppPackages/**/*.msix
 
   release:
     needs: [android, ios, macos, windows]
