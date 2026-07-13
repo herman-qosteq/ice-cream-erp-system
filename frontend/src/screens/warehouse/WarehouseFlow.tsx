@@ -1,9 +1,10 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { View, Text, Pressable, ScrollView } from 'react-native';
 import { LogOut } from 'lucide-react-native';
 import { ERPData } from '../../storage';
 import { AppNotification } from '../../types';
 import AdminWarehouse from '../admin/AdminWarehouse';
+import AdminSales from '../admin/AdminSales';
 
 interface WarehouseFlowProps {
   data: ERPData;
@@ -15,6 +16,14 @@ interface WarehouseFlowProps {
 }
 
 export default function WarehouseFlow({ data, setData, addNotification, currentUser, setCurrentUser, showAlert }: WarehouseFlowProps) {
+  const [activeSection, setActiveSection] = useState<'stock' | 'prebookings'>('stock');
+  const [pendingPreBookingTodayFilter, setPendingPreBookingTodayFilter] = useState(false);
+
+  const handleViewTodayPreBookings = () => {
+    setPendingPreBookingTodayFilter(true);
+    setActiveSection('prebookings');
+  };
+
   return (
     <View className="flex-1 bg-sky-50">
       <View className="h-14 shrink-0 bg-white/80 border-b border-white/30 px-4 flex-row items-center justify-between">
@@ -32,15 +41,47 @@ export default function WarehouseFlow({ data, setData, addNotification, currentU
       </View>
 
       <ScrollView className="flex-1" contentContainerStyle={{ flexGrow: 1 }}>
-        <View className="p-4 md:p-6 lg:p-8 w-full md:max-w-[1400px] md:self-center">
-          <AdminWarehouse
-            data={data}
-            setData={setData}
-            addNotification={addNotification}
-            currentUser={currentUser}
-            showAlert={showAlert}
-            hideAdminControls
-          />
+        <View className="p-4 md:p-6 lg:p-8 w-full md:max-w-[1400px] md:self-center gap-4">
+          <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
+            {([
+              { key: 'stock' as const, label: 'Warehouse & Fleet' },
+              { key: 'prebookings' as const, label: 'Pre-Bookings' },
+            ]).map(section => (
+              <Pressable
+                key={section.key}
+                onPress={() => setActiveSection(section.key)}
+                className={`flex-1 min-w-[45%] py-1.5 rounded-lg items-center ${activeSection === section.key ? 'bg-white' : ''}`}
+              >
+                <Text className={`text-[10px] font-extrabold ${activeSection === section.key ? 'text-slate-800' : 'text-slate-500'}`}>
+                  {section.label}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+
+          {activeSection === 'stock' ? (
+            <AdminWarehouse
+              data={data}
+              setData={setData}
+              addNotification={addNotification}
+              currentUser={currentUser}
+              showAlert={showAlert}
+              hideAdminControls
+              onViewTodayPreBookings={handleViewTodayPreBookings}
+            />
+          ) : (
+            <AdminSales
+              data={data}
+              setData={setData}
+              addNotification={addNotification}
+              currentUser={currentUser}
+              activeScreen="Deliveries"
+              showAlert={showAlert}
+              hideAdminControls
+              initialPreBookingTodayFilter={pendingPreBookingTodayFilter}
+              onConsumeInitialPreBookingTodayFilter={() => setPendingPreBookingTodayFilter(false)}
+            />
+          )}
         </View>
       </ScrollView>
     </View>

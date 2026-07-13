@@ -18,11 +18,17 @@ interface AdminWarehouseProps {
   setActiveScreen?: (screen: any) => void;
   showAlert: (opts: any) => void;
   hideAdminControls?: boolean;
+  onViewTodayPreBookings?: () => void;
 }
 
-export default function AdminWarehouse({ data, setData, addNotification, currentUser, activeScreen, setActiveScreen, showAlert, hideAdminControls = false }: AdminWarehouseProps) {
+export default function AdminWarehouse({ data, setData, addNotification, currentUser, activeScreen, setActiveScreen, showAlert, hideAdminControls = false, onViewTodayPreBookings }: AdminWarehouseProps) {
   const { refreshData } = useAppContext();
   const [activeTab, setActiveTab] = useState<'warehouse' | 'trucks' | 'transfers' | 'audits'>('warehouse');
+
+  const todayIso = new Date().toISOString().split('T')[0];
+  const todaysPreBookingsCount = (data.preBookingOrders || []).filter(
+    pb => pb.scheduled_delivery_date === todayIso && pb.status === 'Booked'
+  ).length;
 
   useEffect(() => {
     if (activeScreen === 'Warehouse') setActiveTab('warehouse');
@@ -473,8 +479,8 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
   if (warehouseForm === 'receive_stock') {
     return (
-      <View className="gap-4">
-        <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-4 w-full lg:max-w-4xl lg:self-center">
+      <View className="gap-3">
+        <View className="bg-white p-3 lg:p-4 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-6xl lg:self-center">
           <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
             <Text className="font-extrabold text-slate-800 text-sm">Receiving Stock (Supplier Inward)</Text>
             <Pressable onPress={() => setWarehouseForm('list')}><Text className="text-slate-400 text-xs">Cancel</Text></Pressable>
@@ -491,65 +497,81 @@ export default function AdminWarehouse({ data, setData, addNotification, current
             </View>
           </View>
 
-          <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-3">
-            <View className="flex-row items-center justify-between">
-              <Text className="font-bold text-slate-600 uppercase tracking-wider text-[10px]">Cargos Manifest</Text>
-              <Pressable onPress={handleAddPurchaseItem}><Text className="text-rose-500 font-extrabold text-[10px]">+ Add Another Product</Text></Pressable>
+          <View className="border border-slate-100 rounded-xl p-2.5 bg-slate-50 gap-2">
+            <View className="flex-row items-center justify-between px-0.5">
+              <Text className="font-bold text-slate-600 uppercase tracking-wider text-[10px]">
+                Cargo Manifest ({purchaseForm.items.length} item{purchaseForm.items.length === 1 ? '' : 's'})
+              </Text>
+              <Pressable onPress={handleAddPurchaseItem} className="flex-row items-center gap-1">
+                <Plus size={12} color="#e11d48" />
+                <Text className="text-rose-500 font-extrabold text-[10px]">Add Product</Text>
+              </Pressable>
             </View>
 
-            {purchaseForm.items.map((item, index) => (
-              <View key={index} className="bg-white border border-slate-200 p-3 rounded-xl gap-3 relative">
-                {purchaseForm.items.length > 1 && (
-                  <Pressable onPress={() => handleRemovePurchaseItem(index)} className="absolute top-2.5 right-2.5 z-10">
-                    <Text className="text-slate-400 font-extrabold text-[11px]">Remove</Text>
-                  </Pressable>
-                )}
-                <View>
-                  <Text className="font-bold text-slate-400 text-[9px] mb-1">Ice Cream Item</Text>
-                  <SelectField
-                    value={item.product_id}
-                    onValueChange={v => {
-                      const newItems = [...purchaseForm.items];
-                      newItems[index] = { ...newItems[index], product_id: v, purchase_price: data.products.find(p => p.id === v)?.purchase_price || 1.0 };
-                      setPurchaseForm({ ...purchaseForm, items: newItems });
-                    }}
-                    options={productOptions}
-                    title="Select Product"
-                    className="bg-slate-50 border border-slate-200 rounded p-1.5 flex-row items-center justify-between"
-                  />
-                </View>
-                <View className="flex-row gap-2">
-                  <View className="flex-1">
-                    <Text className="font-bold text-slate-400 text-[9px] mb-1">Inward Qty</Text>
-                    <TextInput
-                      keyboardType="number-pad"
-                      value={String(item.quantity)}
-                      onChangeText={v => { const newItems = [...purchaseForm.items]; newItems[index].quantity = Number(v) || 0; setPurchaseForm({ ...purchaseForm, items: newItems }); }}
-                      className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs text-center"
+            <View className="hidden lg:flex lg:flex-row lg:items-center gap-2 px-2">
+              <Text className="lg:flex-[2] font-bold text-slate-400 text-[9px] uppercase">Ice Cream Item</Text>
+              <Text className="lg:flex-1 font-bold text-slate-400 text-[9px] uppercase text-center">Qty</Text>
+              <Text className="lg:flex-1 font-bold text-slate-400 text-[9px] uppercase text-center">Price (Rs)</Text>
+              <Text className="lg:flex-1 font-bold text-slate-400 text-[9px] uppercase text-center">Mfg Date</Text>
+              <Text className="lg:flex-1 font-bold text-slate-400 text-[9px] uppercase text-center">Expiry Date</Text>
+              <View className="w-6" />
+            </View>
+
+            <View className="gap-2">
+              {purchaseForm.items.map((item, index) => (
+                <View key={index} className="bg-white border border-slate-200 p-2.5 lg:py-2 lg:px-2.5 rounded-xl gap-2 lg:flex-row lg:items-center relative">
+                  <View className="w-full lg:flex-[2]">
+                    <Text className="font-bold text-slate-400 text-[9px] mb-1 lg:hidden">Ice Cream Item</Text>
+                    <SelectField
+                      value={item.product_id}
+                      onValueChange={v => {
+                        const newItems = [...purchaseForm.items];
+                        newItems[index] = { ...newItems[index], product_id: v, purchase_price: data.products.find(p => p.id === v)?.purchase_price || 1.0 };
+                        setPurchaseForm({ ...purchaseForm, items: newItems });
+                      }}
+                      options={productOptions}
+                      title="Select Product"
+                      className="bg-slate-50 border border-slate-200 rounded p-1.5 flex-row items-center justify-between"
                     />
                   </View>
-                  <View className="flex-1">
-                    <Text className="font-bold text-slate-400 text-[9px] mb-1">Price (Rs)</Text>
-                    <TextInput
-                      keyboardType="decimal-pad"
-                      value={String(item.purchase_price)}
-                      onChangeText={v => { const newItems = [...purchaseForm.items]; newItems[index].purchase_price = Number(v) || 0; setPurchaseForm({ ...purchaseForm, items: newItems }); }}
-                      className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs text-center"
-                    />
+                  <View className="flex-row gap-2 lg:flex-1">
+                    <View className="flex-1">
+                      <Text className="font-bold text-slate-400 text-[9px] mb-1 lg:hidden">Inward Qty</Text>
+                      <TextInput
+                        keyboardType="number-pad"
+                        value={String(item.quantity)}
+                        onChangeText={v => { const newItems = [...purchaseForm.items]; newItems[index].quantity = Number(v) || 0; setPurchaseForm({ ...purchaseForm, items: newItems }); }}
+                        className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs text-center"
+                      />
+                    </View>
+                    <View className="flex-1">
+                      <Text className="font-bold text-slate-400 text-[9px] mb-1 lg:hidden">Price (Rs)</Text>
+                      <TextInput
+                        keyboardType="decimal-pad"
+                        value={String(item.purchase_price)}
+                        onChangeText={v => { const newItems = [...purchaseForm.items]; newItems[index].purchase_price = Number(v) || 0; setPurchaseForm({ ...purchaseForm, items: newItems }); }}
+                        className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs text-center"
+                      />
+                    </View>
                   </View>
+                  <View className="flex-row gap-2 pt-1 border-t border-slate-100 lg:border-t-0 lg:pt-0 lg:flex-1">
+                    <View className="flex-1">
+                      <Text className="font-bold text-slate-400 text-[9px] mb-1 lg:hidden">Mfg Date</Text>
+                      <DateField value={item.mfg_date || ''} onValueChange={v => { const newItems = [...purchaseForm.items]; newItems[index].mfg_date = v; setPurchaseForm({ ...purchaseForm, items: newItems }); }} title="Select Manufacturing Date" className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 flex-row items-center justify-between" textClassName="text-[11px] text-slate-800 flex-1" />
+                    </View>
+                    <View className="flex-1">
+                      <Text className="font-bold text-slate-400 text-[9px] mb-1 lg:hidden">Expiry Date</Text>
+                      <DateField value={item.expiry_date || ''} onValueChange={v => { const newItems = [...purchaseForm.items]; newItems[index].expiry_date = v; setPurchaseForm({ ...purchaseForm, items: newItems }); }} title="Select Expiry Date" className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 flex-row items-center justify-between" textClassName="text-[11px] text-slate-800 flex-1" />
+                    </View>
+                  </View>
+                  {purchaseForm.items.length > 1 && (
+                    <Pressable onPress={() => handleRemovePurchaseItem(index)} hitSlop={8} className="absolute top-2 right-2 lg:static lg:ml-1 lg:w-6 lg:items-center">
+                      <Trash2 size={14} color="#94a3b8" />
+                    </Pressable>
+                  )}
                 </View>
-                <View className="flex-row gap-2 pt-1 border-t border-slate-100">
-                  <View className="flex-1">
-                    <Text className="font-bold text-slate-400 text-[9px] mb-1">Mfg Date</Text>
-                    <DateField value={item.mfg_date || ''} onValueChange={v => { const newItems = [...purchaseForm.items]; newItems[index].mfg_date = v; setPurchaseForm({ ...purchaseForm, items: newItems }); }} title="Select Manufacturing Date" className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 flex-row items-center justify-between" textClassName="text-xs text-slate-800 flex-1" />
-                  </View>
-                  <View className="flex-1">
-                    <Text className="font-bold text-slate-400 text-[9px] mb-1">Expiry Date</Text>
-                    <DateField value={item.expiry_date || ''} onValueChange={v => { const newItems = [...purchaseForm.items]; newItems[index].expiry_date = v; setPurchaseForm({ ...purchaseForm, items: newItems }); }} title="Select Expiry Date" className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 flex-row items-center justify-between" textClassName="text-xs text-slate-800 flex-1" />
-                  </View>
-                </View>
-              </View>
-            ))}
+              ))}
+            </View>
           </View>
 
           <Pressable onPress={handleSavePurchase} className="w-full py-2.5 bg-emerald-500 rounded-xl items-center active:bg-emerald-600">
@@ -561,10 +583,10 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   }
 
   return (
-    <View className="gap-4">
+    <View className="gap-3">
       <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
-        {(['warehouse', 'trucks', 'transfers', 'audits'] as const).map(t => (
-          <Pressable key={t} onPress={() => setActiveTab(t)} className={`flex-1 min-w-[45%] py-1.5 rounded-lg items-center ${activeTab === t ? 'bg-white' : ''}`}>
+        {(['warehouse', 'transfers', 'trucks', 'audits'] as const).map(t => (
+          <Pressable key={t} onPress={() => setActiveTab(t)} className={`flex-1 min-w-[45%] py-1 rounded-lg items-center ${activeTab === t ? 'bg-white' : ''}`}>
             <Text className={`text-[10px] font-extrabold capitalize ${activeTab === t ? 'text-slate-800' : 'text-slate-500'}`}>
               {t === 'transfers' ? 'Load & Transfer' : t === 'audits' ? 'Movement Logs' : t}
             </Text>
@@ -573,8 +595,8 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       </View>
 
       {activeTab === 'warehouse' ? (
-        <View className="gap-4">
-          <View className="flex-row items-center justify-between bg-slate-100 p-2.5 rounded-xl border border-slate-200">
+        <View className="gap-3">
+          <View className="flex-row items-center justify-between bg-slate-100 p-2 rounded-xl border border-slate-200">
             <Text className="text-[10px] font-bold text-slate-600 flex-1 mr-2">{hideAdminControls ? 'Log new cold supply chain deliveries:' : 'Manage cold supply chain partners:'}</Text>
             <View className="flex-row gap-1.5">
               {!hideAdminControls && (
@@ -589,7 +611,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
           </View>
 
           {!hideAdminControls && (
-            <View className="bg-amber-50 p-2.5 rounded-xl border border-amber-200 flex-row items-center justify-between">
+            <View className="bg-amber-50 p-2 rounded-xl border border-amber-200 flex-row items-center justify-between">
               <View className="flex-row items-center gap-1.5">
                 <RefreshCw size={14} color="#92400e" />
                 <Text className="text-[10px] font-bold text-amber-800">[TEMPORARY DEV ACTION]</Text>
@@ -602,58 +624,72 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
           <View className="gap-1.5">
             {data.warehouse_inventory.some(i => i.available_qty === 0) && (
-              <View className="bg-red-50 px-3 py-2 rounded-xl border border-red-100 flex-row items-center gap-2">
+              <View className="bg-red-50 px-3 py-1.5 rounded-xl border border-red-100 flex-row items-center gap-2">
                 <AlertTriangle size={16} color="#ef4444" />
                 <Text className="font-bold text-red-700 text-xs flex-1">Ice cream flavors are currently empty in our silos.</Text>
               </View>
             )}
             {data.warehouse_inventory.some(i => i.available_qty > 0 && i.available_qty <= 100) && (
-              <View className="bg-amber-50 px-3 py-2 rounded-xl border border-amber-100 flex-row items-center gap-2">
+              <View className="bg-amber-50 px-3 py-1.5 rounded-xl border border-amber-100 flex-row items-center gap-2">
                 <Shield size={16} color="#f59e0b" />
                 <Text className="font-bold text-amber-700 text-xs flex-1">Ice cream quantities are below healthy safety levels.</Text>
               </View>
             )}
           </View>
 
-          <View className="bg-white rounded-2xl border border-slate-200 p-3">
-            <View className="flex-row items-center justify-between mb-2">
+          <View className="bg-white rounded-2xl border border-slate-200 p-2.5">
+            <View className="flex-row items-center justify-between mb-1.5 px-0.5">
               <Text className="font-bold text-slate-800 text-xs">Warehouse Silos Stock Levels</Text>
               <Text className="text-[10px] text-slate-400">Total flavors: {data.products.length}</Text>
             </View>
-            <View className="gap-2 md:flex-row md:flex-wrap">
+
+            <View className="hidden lg:flex lg:flex-row lg:items-center gap-2 px-2 pb-1">
+              <Text className="lg:flex-[2.5] font-bold text-slate-400 text-[9px] uppercase">Product</Text>
+              <View className="lg:flex-[4] flex-row gap-2">
+                <Text className="flex-1 text-center font-bold text-slate-400 text-[9px] uppercase">Avail</Text>
+                <Text className="flex-1 text-center font-bold text-slate-400 text-[9px] uppercase">Reserved</Text>
+                <Text className="flex-1 text-center font-bold text-slate-400 text-[9px] uppercase">Damaged</Text>
+                <Text className="flex-1 text-center font-bold text-slate-400 text-[9px] uppercase">Expired</Text>
+              </View>
+              <Text className="lg:w-14 text-center font-bold text-slate-400 text-[9px] uppercase">Status</Text>
+            </View>
+
+            <View className="gap-1.5">
               {data.warehouse_inventory.map(inv => {
                 const prodName = data.products.find(p => p.id === inv.product_id)?.name || 'Unknown';
                 const isOOS = inv.available_qty === 0;
                 const isLow = inv.available_qty > 0 && inv.available_qty <= 100;
                 return (
-                  <View key={inv.product_id} className={`w-full md:w-[48%] xl:w-[32%] p-3 rounded-xl border ${isOOS ? 'bg-red-50 border-red-200' : isLow ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-100'}`}>
-                    <View className="flex-row justify-between items-start">
-                      <View>
-                        <Text className="font-bold text-slate-800 text-[11px]">{prodName}</Text>
-                        <Text className="text-[9px] text-slate-400 uppercase font-mono">{inv.product_id}</Text>
-                      </View>
-                      <View className="flex-row gap-1">
+                  <View key={inv.product_id} className={`w-full rounded-lg border px-2.5 py-1.5 gap-1.5 lg:gap-2 lg:flex-row lg:items-center ${isOOS ? 'bg-red-50 border-red-200' : isLow ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-100'}`}>
+                    <View className="lg:flex-[2.5] flex-row items-center justify-between lg:justify-start gap-2">
+                      <Text numberOfLines={1} className="font-bold text-slate-800 text-[11px] flex-shrink">{prodName}</Text>
+                      <View className="flex-row gap-1 lg:hidden">
                         {isOOS && <Text className="text-[8px] bg-red-100 text-red-700 px-1 rounded font-extrabold uppercase">OOS</Text>}
                         {isLow && <Text className="text-[8px] bg-amber-100 text-amber-700 px-1 rounded font-extrabold uppercase">Low</Text>}
                       </View>
                     </View>
-                    <View className="flex-row gap-1.5 mt-2.5 pt-2 border-t border-slate-100">
-                      <View className="flex-1 bg-white p-1.5 rounded-lg border border-slate-100 items-center">
-                        <Text className="text-[8px] text-slate-400 font-bold uppercase">Avail</Text>
+                    <View className="lg:flex-[4] flex-row gap-1.5">
+                      <View className="flex-1 items-center">
+                        <Text className="text-[7px] text-slate-400 font-bold uppercase lg:hidden">Avail</Text>
                         <Text className={`text-[11px] font-black ${isOOS ? 'text-red-500' : isLow ? 'text-amber-500' : 'text-slate-800'}`}>{inv.available_qty}</Text>
                       </View>
-                      <View className="flex-1 bg-white p-1.5 rounded-lg border border-slate-100 items-center">
-                        <Text className="text-[8px] text-slate-400 font-bold uppercase">Res</Text>
+                      <View className="flex-1 items-center">
+                        <Text className="text-[7px] text-slate-400 font-bold uppercase lg:hidden">Res</Text>
                         <Text className="text-slate-600 text-[11px] font-black">{inv.reserved_qty}</Text>
                       </View>
-                      <View className="flex-1 bg-white p-1.5 rounded-lg border border-slate-100 items-center">
-                        <Text className="text-[8px] text-slate-400 font-bold uppercase">Dmg</Text>
+                      <View className="flex-1 items-center">
+                        <Text className="text-[7px] text-slate-400 font-bold uppercase lg:hidden">Dmg</Text>
                         <Text className="text-red-500 text-[11px] font-black">{inv.damaged_qty}</Text>
                       </View>
-                      <View className="flex-1 bg-white p-1.5 rounded-lg border border-slate-100 items-center">
-                        <Text className="text-[8px] text-slate-400 font-bold uppercase">Exp</Text>
+                      <View className="flex-1 items-center">
+                        <Text className="text-[7px] text-slate-400 font-bold uppercase lg:hidden">Exp</Text>
                         <Text className="text-purple-500 text-[11px] font-black">{inv.expired_qty}</Text>
                       </View>
+                    </View>
+                    <View className="hidden lg:flex lg:w-14 items-center">
+                      {isOOS && <Text className="text-[8px] bg-red-100 text-red-700 px-1 rounded font-extrabold uppercase">OOS</Text>}
+                      {isLow && <Text className="text-[8px] bg-amber-100 text-amber-700 px-1 rounded font-extrabold uppercase">Low</Text>}
+                      {!isOOS && !isLow && <Text className="text-[8px] bg-emerald-100 text-emerald-700 px-1 rounded font-extrabold uppercase">OK</Text>}
                     </View>
                   </View>
                 );
@@ -661,7 +697,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
             </View>
           </View>
 
-          <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
+          <View className="bg-white p-3 lg:p-4 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
             <Text className="font-bold text-slate-800 text-xs">Manual Warehouse Correction Panel</Text>
             <View>
               <Text className="font-bold text-slate-500 mb-1 text-xs">Product</Text>
@@ -807,6 +843,19 @@ export default function AdminWarehouse({ data, setData, addNotification, current
         </View>
       ) : activeTab === 'transfers' ? (
         <View className="gap-4">
+          {todaysPreBookingsCount > 0 && (
+            <Pressable
+              onPress={() => onViewTodayPreBookings?.()}
+              className="bg-indigo-50 px-3 py-2 rounded-xl border border-indigo-100 flex-row items-center gap-2 active:bg-indigo-100"
+            >
+              <ClipboardList size={16} color="#4f46e5" />
+              <Text className="font-bold text-indigo-700 text-xs flex-1">Today's Pre-Booking Orders awaiting truck load-out</Text>
+              <View className="bg-indigo-600 rounded-full min-w-[20px] h-5 items-center justify-center px-1.5">
+                <Text className="text-white text-[10px] font-extrabold">{todaysPreBookingsCount}</Text>
+              </View>
+            </Pressable>
+          )}
+
           <View className={`bg-white p-4 rounded-2xl border border-slate-200 gap-3 ${truckFormMode !== 'list' ? 'w-full lg:max-w-2xl lg:self-center lg:p-6' : ''}`}>
             {truckFormMode === 'list' ? (
               <>

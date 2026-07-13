@@ -49,6 +49,7 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
   const [activeScreen, setActiveScreen] = useState<AdminScreen>('Dashboard');
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [pendingPaymentStoreId, setPendingPaymentStoreId] = useState<string | null>(null);
+  const [pendingPreBookingTodayFilter, setPendingPreBookingTodayFilter] = useState(false);
 
   const unreadNotifsCount = data.notifications.filter(n => !n.is_read).length;
 
@@ -60,6 +61,11 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
   const handleSettleOrder = (storeId: string) => {
     setPendingPaymentStoreId(storeId);
     handleScreenSelect('Credit');
+  };
+
+  const handleViewTodayPreBookings = () => {
+    setPendingPreBookingTodayFilter(true);
+    handleScreenSelect('Deliveries');
   };
 
   const handleLogOut = () => {
@@ -221,6 +227,7 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
                 activeScreen={activeScreen}
                 setActiveScreen={(scr) => handleScreenSelect(scr as any)}
                 showAlert={showAlert}
+                onViewTodayPreBookings={handleViewTodayPreBookings}
               />
             )}
             {(activeScreen === 'Stores' || activeScreen === 'Suppliers' || activeScreen === 'Purchases' || activeScreen === 'Orders' || activeScreen === 'Deliveries' || activeScreen === 'Invoices' || activeScreen === 'Payments' || activeScreen === 'QRCodePayment' || activeScreen === 'Credit' || activeScreen === 'Refill' || activeScreen === 'Inactive') && (
@@ -233,6 +240,8 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
                 showAlert={showAlert}
                 initialPaymentStoreId={pendingPaymentStoreId}
                 onConsumeInitialPaymentStore={() => setPendingPaymentStoreId(null)}
+                initialPreBookingTodayFilter={pendingPreBookingTodayFilter}
+                onConsumeInitialPreBookingTodayFilter={() => setPendingPreBookingTodayFilter(false)}
               />
             )}
             {(activeScreen === 'Users' || activeScreen === 'Notifications') && (
