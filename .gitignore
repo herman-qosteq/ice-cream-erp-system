@@ -36,36 +36,37 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# Native project source (android/, ios/, windows/, macos/) is committed —
-# this repo is bare, not managed/CNG, so only build OUTPUT is ignored below.
+# Native project source (frontend/android/, frontend/ios/, frontend/windows/,
+# frontend/macos/) is committed — this repo is bare, not managed/CNG, so only
+# build OUTPUT is ignored below.
 
 # Android build output
-/android/app/build/
-/android/.gradle/
-/android/build/
+/frontend/android/app/build/
+/frontend/android/.gradle/
+/frontend/android/build/
 
 # Stray local Android SDK components (accidentally installed into the repo's
 # android/ dir instead of the real SDK root at C:/Android) — not project source.
-/android/build-tools/
-/android/licenses/
-/android/platforms/
+/frontend/android/build-tools/
+/frontend/android/licenses/
+/frontend/android/platforms/
 
 # iOS/macOS build output + CocoaPods local state
-/ios/build/
-/ios/Pods/
-/macos/build/
-/macos/Pods/
+/frontend/ios/build/
+/frontend/ios/Pods/
+/frontend/macos/build/
+/frontend/macos/Pods/
 *.xcworkspace
 
 # Windows build output
-/windows/*/Debug/
-/windows/*/Release/
-/windows/*/ARM64/
-/windows/*/x64/
-/windows/*/x86/
-/windows/*/AppPackages/
-/windows/*/BundleArtifacts/
-/windows/target/
-/windows/packages/
-/windows/*.opendb
-/windows/*.db
+/frontend/windows/*/Debug/
+/frontend/windows/*/Release/
+/frontend/windows/*/ARM64/
+/frontend/windows/*/x64/
+/frontend/windows/*/x86/
+/frontend/windows/*/AppPackages/
+/frontend/windows/*/BundleArtifacts/
+/frontend/windows/target/
+/frontend/windows/packages/
+/frontend/windows/*.opendb
+/frontend/windows/*.db

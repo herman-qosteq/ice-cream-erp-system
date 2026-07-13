@@ -1,0 +1,56 @@
+{
+  "name": "Mayben traders",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "dependencies": {
+    "@expo/metro-runtime": "~6.1.2",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "babel-preset-expo": "~54.0.10",
+    "expo": "~54.0.35",
+    "expo-file-system": "~19.0.23",
+    "expo-image-picker": "~17.0.11",
+    "expo-print": "~15.0.8",
+    "expo-sharing": "~14.0.8",
+    "lucide-react-native": "^1.23.0",
+    "nativewind": "^4.2.6",
+    "react": "19.1.4",
+    "react-dom": "19.1.4",
+    "react-native": "0.81.6",
+    "react-native-gesture-handler": "2.28.0",
+    "react-native-macos": "0.81.8",
+    "react-native-reanimated": "4.3.2",
+    "react-native-safe-area-context": "5.6.1",
+    "react-native-svg": "15.12.1",
+    "react-native-web": "^0.21.2",
+    "react-native-windows": "0.81.29",
+    "react-native-worklets": "0.8.3",
+    "socket.io-client": "^4.8.1",
+    "tailwindcss": "^3.4.19"
+  },
+  "devDependencies": {
+    "@rnx-kit/jest-preset": "^0.1.17",
+    "@types/react": "~19.1.4",
+    "babel-plugin-module-resolver": "^5.0.3",
+    "typescript": "~5.9.2"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "windows": "npx @react-native-community/cli run-windows",
+    "macos": "react-native run-macos",
+    "test:windows": "jest --config jest.config.windows.js"
+  },
+  "private": true,
+  "overrides": {
+    "@react-native/metro-config": "0.81.6"
+  },
+  "react-native-windows": {
+    "init-windows": {
+      "name": "IceCreamErp",
+      "namespace": "IceCreamErp",
+      "template": "cpp-app"
+    }
+  }
+}

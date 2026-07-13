@@ -1,0 +1,502 @@
+// FrostyFlow ERP — MySQL schema
+//
+// Field names are kept snake_case and 1:1 with src/types.ts wherever a direct
+// analog exists (store_id, salesperson_id, truck_id, ...) so the future API
+// layer can serialize responses with minimal field translation.
+//
+// Two enum-like fields are intentionally left as plain String instead of a
+// Prisma/MySQL enum, because their values contain spaces and aren't valid
+// enum identifiers: Store.refill_frequency ('15 Days') and
+// Payment.method / Invoice.payment_method ('Google Pay', 'Bank Transfer').
+// Allowed values are documented above each field; validation happens at the
+// API layer.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  Admin
+  Salesperson
+  Warehouse
+}
+
+enum Status {
+  Active
+  Inactive
+}
+
+enum UnitType {
+  ml
+  L
+  g
+  kg
+  pcs
+}
+
+enum Ranking {
+  Platinum
+  Gold
+  Silver
+  Bronze
+}
+
+enum OrderStatus {
+  Draft
+  Confirmed
+  Delivered
+  Cancelled
+}
+
+enum PreBookingStatus {
+  Booked
+  Delivered
+  Cancelled
+}
+
+enum InvoicePaymentStatus {
+  Paid
+  Partial
+  Unpaid
+  Credit
+}
+
+enum CreditType {
+  credit
+  debit
+}
+
+enum NotificationType {
+  low_stock
+  out_of_stock
+  expiry
+  refill
+  payment_due
+  payment_received
+  credit_exceeded
+  new_order
+  order_update
+  delivery
+  partner_update
+  product_update
+  user_update
+  stock_update
+  system
+}
+
+// ---------------------------------------------------------------------------
+// Users, roles & fleet
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(uuid())
+  name          String
+  phone         String   @unique
+  role          Role
+  password_hash String
+  status        Status   @default(Active)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  trucks             Truck[]
+  orders             Order[]
+  pre_booking_orders PreBookingOrder[]
+  payments_collected Payment[]
+  store_visits       StoreVisit[]
+
+  @@map("users")
+}
+
+model Truck {
+  id             String   @id @default(uuid())
+  vehicle_number String   @unique
+  driver_user_id String
+  driver         User     @relation(fields: [driver_user_id], references: [id])
+  route          String
+  area           String
+  status         Status   @default(Active)
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  truck_inventory TruckInventory[]
+  orders          Order[]
+
+  @@map("trucks")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Category {
+  id   String @id @default(uuid())
+  name String @unique
+
+  products Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id              String    @id @default(uuid())
+  name            String
+  code            String    @unique
+  category_id     String
+  category        Category  @relation(fields: [category_id], references: [id])
+  brand           String
+  description     String    @db.Text
+  image_url       String?   @db.LongText
+  purchase_price  Decimal   @db.Decimal(10, 2)
+  wholesale_price Decimal   @db.Decimal(10, 2)
+  selling_price   Decimal   @db.Decimal(10, 2)
+  tax_pct         Decimal   @db.Decimal(5, 2)
+  status          Status    @default(Active)
+  unit_value      Decimal   @db.Decimal(10, 2)
+  unit_type       UnitType
+  expiry_date     DateTime? @db.Date
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  scheduled_prices             ScheduledPrice[]
+  warehouse_inventory          WarehouseInventory?
+  truck_inventory              TruckInventory[]
+  purchase_items               PurchaseItem[]
+  order_items                  OrderItem[]
+  pre_booking_items            PreBookingItem[]
+  pre_booking_dispatched_items PreBookingDispatchedItem[]
+
+  @@map("products")
+}
+
+model ScheduledPrice {
+  id             String   @id @default(uuid())
+  product_id     String
+  product        Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  purchase_price Decimal  @db.Decimal(10, 2)
+  selling_price  Decimal  @db.Decimal(10, 2)
+  effective_date DateTime @db.Date
+  applied        Boolean  @default(false)
+
+  @@map("scheduled_prices")
+}
+
+// ---------------------------------------------------------------------------
+// Suppliers & purchasing (stock coming IN)
+// ---------------------------------------------------------------------------
+
+model Supplier {
+  id             String   @id @default(uuid())
+  name           String
+  contact_person String
+  phone          String
+  email          String
+  address        String   @db.Text
+  status         Status   @default(Active)
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  purchases Purchase[]
+
+  @@map("suppliers")
+}
+
+model Purchase {
+  id             String   @id @default(uuid())
+  supplier_id    String
+  supplier       Supplier @relation(fields: [supplier_id], references: [id])
+  invoice_number String
+  date           DateTime @db.Date
+  created_at     DateTime @default(now())
+
+  items PurchaseItem[]
+
+  @@map("purchases")
+}
+
+model PurchaseItem {
+  id             String    @id @default(uuid())
+  purchase_id    String
+  purchase       Purchase  @relation(fields: [purchase_id], references: [id], onDelete: Cascade)
+  product_id     String
+  product        Product   @relation(fields: [product_id], references: [id])
+  quantity       Int
+  purchase_price Decimal   @db.Decimal(10, 2)
+  mfg_date       DateTime? @db.Date
+  expiry_date    DateTime? @db.Date
+
+  @@map("purchase_items")
+}
+
+// ---------------------------------------------------------------------------
+// Inventory (warehouse & trucks)
+// ---------------------------------------------------------------------------
+
+model WarehouseInventory {
+  product_id    String   @id
+  product       Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  available_qty Int      @default(0)
+  reserved_qty  Int      @default(0)
+  damaged_qty   Int      @default(0)
+  expired_qty   Int      @default(0)
+  updated_at    DateTime @updatedAt
+
+  @@map("warehouse_inventory")
+}
+
+model TruckInventory {
+  truck_id   String
+  truck      Truck   @relation(fields: [truck_id], references: [id], onDelete: Cascade)
+  product_id String
+  product    Product @relation(fields: [product_id], references: [id])
+  quantity   Int     @default(0)
+
+  @@id([truck_id, product_id])
+  @@map("truck_inventory")
+}
+
+// ---------------------------------------------------------------------------
+// Partner stores
+// ---------------------------------------------------------------------------
+
+model Store {
+  id                  String    @id @default(uuid())
+  name                String
+  owner_name          String
+  phone               String
+  alt_phone           String?
+  address             String    @db.Text
+  area                String
+  city                String
+  state               String
+  pincode             String
+  gst_number          String?
+  credit_limit        Decimal   @db.Decimal(10, 2)
+  outstanding_balance Decimal   @default(0) @db.Decimal(10, 2)
+  /// Allowed values: 'Weekly' | '15 Days' | 'Monthly' | 'Custom'
+  refill_frequency    String
+  custom_days         Int?
+  last_purchase_date  DateTime? @db.Date
+  next_refill_date    DateTime? @db.Date
+  ranking             Ranking   @default(Bronze)
+  status              Status    @default(Active)
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+
+  orders             Order[]
+  pre_booking_orders PreBookingOrder[]
+  payments           Payment[]
+  credit_ledger      CreditLedger[]
+  visits             StoreVisit[]
+
+  @@map("stores")
+}
+
+model StoreVisit {
+  id             String    @id @default(uuid())
+  store_id       String
+  store          Store     @relation(fields: [store_id], references: [id], onDelete: Cascade)
+  salesperson_id String
+  salesperson    User      @relation(fields: [salesperson_id], references: [id])
+  date           DateTime  @default(now())
+  notes          String    @db.Text
+  follow_up_date DateTime? @db.Date
+  completed      Boolean   @default(true)
+
+  @@map("store_visits")
+}
+
+// ---------------------------------------------------------------------------
+// Orders (immediate truck-stock sales) & invoicing
+// ---------------------------------------------------------------------------
+
+model Order {
+  id             String      @id @default(uuid())
+  store_id       String
+  store          Store       @relation(fields: [store_id], references: [id])
+  salesperson_id String
+  salesperson    User        @relation(fields: [salesperson_id], references: [id])
+  truck_id       String?
+  truck          Truck?      @relation(fields: [truck_id], references: [id])
+  status         OrderStatus @default(Draft)
+  created_at     DateTime    @default(now())
+
+  items    OrderItem[]
+  invoice  Invoice?
+  payments Payment[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id         String  @id @default(uuid())
+  order_id   String
+  order      Order   @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  product_id String
+  product    Product @relation(fields: [product_id], references: [id])
+  quantity   Int
+  unit_price Decimal @db.Decimal(10, 2)
+  tax_pct    Decimal @db.Decimal(5, 2)
+
+  @@map("order_items")
+}
+
+model Invoice {
+  id             String                @id @default(uuid())
+  order_id       String                @unique
+  order          Order                 @relation(fields: [order_id], references: [id])
+  invoice_number String                @unique
+  total          Decimal               @db.Decimal(10, 2)
+  tax            Decimal               @db.Decimal(10, 2)
+  grand_total    Decimal               @db.Decimal(10, 2)
+  created_at     DateTime              @default(now())
+  paid_amount    Decimal?              @db.Decimal(10, 2)
+  payment_status InvoicePaymentStatus?
+  /// Allowed values: 'Cash' | 'UPI' | 'Google Pay' | 'PhonePe' | 'Paytm' | 'Bank Transfer' | 'Credit'
+  payment_method String?
+
+  @@map("invoices")
+}
+
+// ---------------------------------------------------------------------------
+// Pre-bookings (reserve now, deliver later)
+// ---------------------------------------------------------------------------
+
+model PreBookingOrder {
+  id                      String           @id @default(uuid())
+  store_id                String
+  store                   Store            @relation(fields: [store_id], references: [id])
+  salesperson_id          String
+  salesperson             User             @relation(fields: [salesperson_id], references: [id])
+  created_at              DateTime         @default(now())
+  scheduled_delivery_date DateTime         @db.Date
+  status                  PreBookingStatus @default(Booked)
+  notes                   String?          @db.Text
+
+  items            PreBookingItem[]
+  dispatched_items PreBookingDispatchedItem[]
+
+  @@map("pre_booking_orders")
+}
+
+model PreBookingItem {
+  id             String          @id @default(uuid())
+  pre_booking_id String
+  pre_booking    PreBookingOrder @relation(fields: [pre_booking_id], references: [id], onDelete: Cascade)
+  product_id     String
+  product        Product         @relation(fields: [product_id], references: [id])
+  quantity       Int
+  unit_price     Decimal         @db.Decimal(10, 2)
+  tax_pct        Decimal         @db.Decimal(5, 2)
+
+  @@map("pre_booking_items")
+}
+
+/// Tracks cargo already physically loaded onto a truck ahead of the
+/// scheduled delivery date, so the delivery-confirmation step doesn't
+/// deduct warehouse stock twice for the same units.
+model PreBookingDispatchedItem {
+  id             String          @id @default(uuid())
+  pre_booking_id String
+  pre_booking    PreBookingOrder @relation(fields: [pre_booking_id], references: [id], onDelete: Cascade)
+  product_id     String
+  product        Product         @relation(fields: [product_id], references: [id])
+  quantity       Int
+
+  @@map("pre_booking_dispatched_items")
+}
+
+// ---------------------------------------------------------------------------
+// Payments & credit
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id                String   @id @default(uuid())
+  store_id          String
+  store             Store    @relation(fields: [store_id], references: [id])
+  order_id          String?
+  order             Order?   @relation(fields: [order_id], references: [id])
+  amount            Decimal  @db.Decimal(10, 2)
+  /// Allowed values: 'Cash' | 'UPI' | 'Google Pay' | 'PhonePe' | 'Paytm' | 'Bank Transfer' | 'Credit'
+  method            String
+  date              DateTime @default(now())
+  collected_by      String
+  collected_by_user User     @relation(fields: [collected_by], references: [id])
+
+  @@map("payments")
+}
+
+model CreditLedger {
+  id        String     @id @default(uuid())
+  store_id  String
+  store     Store      @relation(fields: [store_id], references: [id])
+  amount    Decimal    @db.Decimal(10, 2)
+  type      CreditType
+  date      DateTime   @default(now())
+  reference String
+
+  @@map("credit_ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications, audit trail & misc settings
+// ---------------------------------------------------------------------------
+
+model AppNotification {
+  id         String           @id @default(uuid())
+  type       NotificationType
+  message    String           @db.Text
+  is_read    Boolean          @default(false)
+  created_at DateTime         @default(now())
+
+  @@map("notifications")
+}
+
+/// user_id is an intentional soft reference, NOT a hard foreign key: the app
+/// uses the literal value 'system' for automated actions, and audit rows must
+/// still display correctly if the underlying user is later removed. user_name
+/// / user_role are snapshotted at write time for exactly this reason (mirrors
+/// resolveActor() in the current frontend's storage.ts).
+model AuditLog {
+  id          String   @id @default(uuid())
+  action      String
+  entity_type String
+  entity_id   String
+  user_id     String
+  user_name   String?
+  user_role   String?
+  timestamp   DateTime @default(now())
+  details     String   @db.Text
+
+  @@map("audit_logs")
+}
+
+/// Singleton row (id is always 1) holding the admin-configurable UPI QR code
+/// shown to stores at checkout.
+model QrCodeSettings {
+  id         Int     @id @default(1)
+  image_url  String  @db.LongText
+  is_enabled Boolean @default(true)
+
+  @@map("qr_code_settings")
+}
+
+/// Server-side mirror of the client's offline write queue, kept only if the
+/// offline-first UX is preserved against the real API (see open question in
+/// the migration analysis). Safe to drop this model if that flow is retired.
+model SyncQueueItem {
+  id        String   @id @default(uuid())
+  action    String
+  payload   Json
+  timestamp DateTime @default(now())
+
+  @@map("sync_queue")
+}

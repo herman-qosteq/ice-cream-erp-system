@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "Mayben traders",
+    "slug": "Mayben traders",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.frostyflow.erp",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.frostyflow.erp",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "FrostyFlow ERP uses your photo gallery to set product photos and the UPI QR code image."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "546378ef-a0df-41f3-898c-a29775464da6"
+      }
+    }
+  }
+}
