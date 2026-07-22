@@ -5,6 +5,7 @@ import { ERPData } from '../../storage';
 import { AppNotification } from '../../types';
 import AdminWarehouse from '../admin/AdminWarehouse';
 import AdminSales from '../admin/AdminSales';
+import { useScrollReset, useResetScrollOnChange } from '../../context/ScrollResetContext';
 
 interface WarehouseFlowProps {
   data: ERPData;
@@ -16,8 +17,10 @@ interface WarehouseFlowProps {
 }
 
 export default function WarehouseFlow({ data, setData, addNotification, currentUser, setCurrentUser, showAlert }: WarehouseFlowProps) {
-  const [activeSection, setActiveSection] = useState<'stock' | 'prebookings'>('stock');
+  const [activeSection, setActiveSection] = useState<'stock' | 'prebookings' | 'orders'>('stock');
   const [pendingPreBookingTodayFilter, setPendingPreBookingTodayFilter] = useState(false);
+  const { scrollRef } = useScrollReset();
+  useResetScrollOnChange(activeSection);
 
   const handleViewTodayPreBookings = () => {
     setPendingPreBookingTodayFilter(true);
@@ -40,19 +43,20 @@ export default function WarehouseFlow({ data, setData, addNotification, currentU
         </Pressable>
       </View>
 
-      <ScrollView className="flex-1" contentContainerStyle={{ flexGrow: 1 }}>
+      <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ flexGrow: 1 }}>
         <View className="p-4 md:p-6 lg:p-8 w-full md:max-w-[1400px] md:self-center gap-4">
           <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
             {([
               { key: 'stock' as const, label: 'Warehouse & Fleet' },
               { key: 'prebookings' as const, label: 'Pre-Bookings' },
+              { key: 'orders' as const, label: 'Orders' },
             ]).map(section => (
               <Pressable
                 key={section.key}
                 onPress={() => setActiveSection(section.key)}
-                className={`flex-1 min-w-[45%] py-1.5 rounded-lg items-center ${activeSection === section.key ? 'bg-white' : ''}`}
+                className={`flex-1 min-w-[30%] py-1.5 rounded-lg items-center ${activeSection === section.key ? 'bg-indigo-600' : ''}`}
               >
-                <Text className={`text-[10px] font-extrabold ${activeSection === section.key ? 'text-slate-800' : 'text-slate-500'}`}>
+                <Text className={`text-[10px] font-extrabold ${activeSection === section.key ? 'text-white' : 'text-slate-500'}`}>
                   {section.label}
                 </Text>
               </Pressable>
@@ -69,7 +73,7 @@ export default function WarehouseFlow({ data, setData, addNotification, currentU
               hideAdminControls
               onViewTodayPreBookings={handleViewTodayPreBookings}
             />
-          ) : (
+          ) : activeSection === 'prebookings' ? (
             <AdminSales
               data={data}
               setData={setData}
@@ -80,6 +84,16 @@ export default function WarehouseFlow({ data, setData, addNotification, currentU
               hideAdminControls
               initialPreBookingTodayFilter={pendingPreBookingTodayFilter}
               onConsumeInitialPreBookingTodayFilter={() => setPendingPreBookingTodayFilter(false)}
+            />
+          ) : (
+            <AdminSales
+              data={data}
+              setData={setData}
+              addNotification={addNotification}
+              currentUser={currentUser}
+              activeScreen="Orders"
+              showAlert={showAlert}
+              hideAdminControls
             />
           )}
         </View>

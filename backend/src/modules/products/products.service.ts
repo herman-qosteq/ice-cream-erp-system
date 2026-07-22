@@ -7,10 +7,22 @@ import { ApiError } from '../../utils/ApiError';
 const productInclude = { category: true, scheduled_prices: true } satisfies Prisma.ProductInclude;
 type ProductWithCategory = Prisma.ProductGetPayload<{ include: typeof productInclude }>;
 
+// Percentage-based pricing: MRP is the single stored price, and
+// purchase/wholesale/selling prices are always derived from it plus their
+// discount % rather than being independently stored. Rounded to cents so the
+// derived prices behave exactly like the fixed prices they replaced.
+function priceFromDiscount(mrp: number, discountPct: number): number {
+  return parseFloat((mrp * (1 - discountPct / 100)).toFixed(2));
+}
+
 // Maps the normalized DB row back to the exact shape src/types.ts's Product
 // expects: `category` is the category NAME (a plain string), not an id -
 // the frontend never sees that this is backed by a real foreign key now.
 function serializeProduct(p: ProductWithCategory) {
+  const mrp = num(p.mrp);
+  const purchase_discount_pct = num(p.purchase_discount_pct);
+  const wholesale_discount_pct = num(p.wholesale_discount_pct);
+  const retail_discount_pct = num(p.retail_discount_pct);
   return {
     id: p.id,
     name: p.name,
@@ -19,9 +31,13 @@ function serializeProduct(p: ProductWithCategory) {
     brand: p.brand,
     description: p.description,
     image_url: p.image_url ?? '',
-    purchase_price: num(p.purchase_price),
-    wholesale_price: num(p.wholesale_price),
-    selling_price: num(p.selling_price),
+    mrp,
+    purchase_discount_pct,
+    wholesale_discount_pct,
+    retail_discount_pct,
+    purchase_price: priceFromDiscount(mrp, purchase_discount_pct),
+    wholesale_price: priceFromDiscount(mrp, wholesale_discount_pct),
+    selling_price: priceFromDiscount(mrp, retail_discount_pct),
     tax_pct: num(p.tax_pct),
     status: p.status,
     unit_value: num(p.unit_value),
@@ -55,9 +71,10 @@ interface ProductInput {
   brand: string;
   description: string;
   image_url: string;
-  purchase_price: number;
-  wholesale_price: number;
-  selling_price: number;
+  mrp: number;
+  purchase_discount_pct: number;
+  wholesale_discount_pct: number;
+  retail_discount_pct: number;
   tax_pct: number;
   status: 'Active' | 'Inactive';
   unit_value: number;
@@ -67,6 +84,9 @@ interface ProductInput {
 export async function createProduct(input: ProductInput, actorId: string) {
   const category_id = await resolveCategoryId(input.category);
   const { category, ...rest } = input;
+
+  const existing = await prisma.product.findFirst({ where: { name: { equals: input.name.trim() } } });
+  if (existing) throw ApiError.conflict(`A product named "${input.name.trim()}" already exists.`);
 
   const product = await prisma.$transaction(async tx => {
     const created = await tx.product.create({ data: { ...rest, category_id } });
@@ -82,17 +102,26 @@ export async function updateProduct(id: string, input: ProductInput, actorId: st
   const category_id = await resolveCategoryId(input.category);
   const { category, ...rest } = input;
 
+  const existing = await prisma.product.findFirst({ where: { name: { equals: input.name.trim() }, NOT: { id } } });
+  if (existing) throw ApiError.conflict(`A product named "${input.name.trim()}" already exists.`);
+
   const product = await prisma.product.update({ where: { id }, data: { ...rest, category_id }, include: productInclude });
   await logAudit({ action: 'PRODUCT_EDIT', entity_type: 'Product', entity_id: id, user_id: actorId, details: `Modified product details for ${product.name}` });
   return serializeProduct(product);
 }
 
-export async function updatePrice(id: string, prices: { purchase_price: number; wholesale_price: number; selling_price: number }, actorId: string) {
+export async function updatePrice(id: string, pricing: { mrp: number; purchase_discount_pct: number; wholesale_discount_pct: number; retail_discount_pct: number }, actorId: string) {
   const existing = await prisma.product.findUnique({ where: { id } });
   if (!existing) throw ApiError.notFound('Product not found');
 
-  const product = await prisma.product.update({ where: { id }, data: prices, include: productInclude });
-  const details = `Immediate Price Update: Purchase Price changed from Rs${existing.purchase_price} to Rs${prices.purchase_price}, Wholesale Price from Rs${existing.wholesale_price} to Rs${prices.wholesale_price}, Selling Price from Rs${existing.selling_price} to Rs${prices.selling_price}`;
+  const product = await prisma.product.update({ where: { id }, data: pricing, include: productInclude });
+  const oldPurchase = priceFromDiscount(num(existing.mrp), num(existing.purchase_discount_pct));
+  const oldWholesale = priceFromDiscount(num(existing.mrp), num(existing.wholesale_discount_pct));
+  const oldSelling = priceFromDiscount(num(existing.mrp), num(existing.retail_discount_pct));
+  const newPurchase = priceFromDiscount(pricing.mrp, pricing.purchase_discount_pct);
+  const newWholesale = priceFromDiscount(pricing.mrp, pricing.wholesale_discount_pct);
+  const newSelling = priceFromDiscount(pricing.mrp, pricing.retail_discount_pct);
+  const details = `Immediate Price Update: MRP changed from Rs${existing.mrp} to Rs${pricing.mrp}. Purchase Price changed from Rs${oldPurchase} to Rs${newPurchase}, Wholesale Price from Rs${oldWholesale} to Rs${newWholesale}, Selling Price from Rs${oldSelling} to Rs${newSelling}`;
   await logAudit({ action: 'PRICE_UPDATE', entity_type: 'Product', entity_id: id, user_id: actorId, details });
   return serializeProduct(product);
 }

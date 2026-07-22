@@ -27,3 +27,13 @@ export async function renameCategory(id: string, name: string, actorId: string) 
   await logAudit({ action: 'CATEGORY_EDIT', entity_type: 'Category', entity_id: id, user_id: actorId, details: `Renamed product category to ${trimmed}` });
   return category;
 }
+
+export async function toggleCategoryStatus(id: string, actorId: string) {
+  const existing = await prisma.category.findUnique({ where: { id } });
+  if (!existing) throw ApiError.notFound('Category not found.');
+
+  const nextStatus = existing.status === 'Active' ? 'Inactive' : 'Active';
+  const category = await prisma.category.update({ where: { id }, data: { status: nextStatus } });
+  await logAudit({ action: 'CATEGORY_TOGGLE', entity_type: 'Category', entity_id: id, user_id: actorId, details: `Toggled status of category ${category.name} to ${nextStatus}` });
+  return category;
+}

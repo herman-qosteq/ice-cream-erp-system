@@ -14,3 +14,8 @@ preBookingsRouter.post('/', requireAuth, requireRole('Admin', 'Salesperson', 'Wa
 preBookingsRouter.patch('/:id', requireAuth, requireRole('Admin', 'Salesperson'), asyncHandler(preBookingsController.update));
 preBookingsRouter.post('/:id/deliver', requireAuth, requireRole('Admin', 'Salesperson'), asyncHandler(preBookingsController.deliver));
 preBookingsRouter.patch('/:id/cancel', requireAuth, requireRole('Admin', 'Salesperson', 'Warehouse'), asyncHandler(preBookingsController.cancel));
+// Admin-only: editing/deleting a Delivered booking operates on the real
+// order it produced, same restriction as orders.routes.ts's edit/:id and
+// delete/:id.
+preBookingsRouter.patch('/:id/edit-delivered', requireAuth, requireRole('Admin'), asyncHandler(preBookingsController.editDelivered));
+preBookingsRouter.delete('/:id', requireAuth, requireRole('Admin'), asyncHandler(preBookingsController.deleteDelivered));

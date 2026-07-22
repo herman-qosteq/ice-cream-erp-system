@@ -27,6 +27,10 @@ export async function factoryReset(actorId: string) {
     await tx.invoice.deleteMany();
     await tx.order.deleteMany();
     await tx.preBookingOrder.deleteMany();
+    // Must go before purchase/supplier deletion below - PurchaseOrderRequest
+    // has RESTRICT foreign keys to both (fulfilled_purchase_id, supplier_id),
+    // so deleting either first throws a foreign-key constraint error.
+    await tx.purchaseOrderRequest.deleteMany();
     await tx.purchase.deleteMany();
     await tx.creditLedger.deleteMany();
     await tx.storeVisit.deleteMany();

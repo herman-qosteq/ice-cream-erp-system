@@ -9,13 +9,13 @@ const TOKEN_KEY = '@frostyflow_token';
 
 // const DEFAULT_BASE_URL = Platform.OS === 'android'
 //   ? 'http://10.0.2.2:4000/api'
-//   : 'http://localhost:4000/api';
+  // : 'http://localhost:4000/api';
 
 // production
-// const DEFAULT_BASE_URL = "https://api.maybentraders.in/api";
+const DEFAULT_BASE_URL = "https://api.maybentraders.in/api";
 
 // dev
-const DEFAULT_BASE_URL = "http://localhost:4000/api";
+// const DEFAULT_BASE_URL = "http://localhost:4000/api";
 // const DEFAULT_BASE_URL = "https://fool-quartet-boastful.ngrok-free.dev/api";
 
 export const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || DEFAULT_BASE_URL;
@@ -115,6 +115,7 @@ function request<T>(path: string, options: { method?: string; body?: unknown } =
 export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body }),
+  put: <T>(path: string, body?: unknown) => request<T>(path, { method: 'PUT', body }),
   patch: <T>(path: string, body?: unknown) => request<T>(path, { method: 'PATCH', body }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 };

@@ -6,19 +6,33 @@ import { calculateDeliveredOrderProfit, getAveragePurchasePrice, getLatestPurcha
 import { exportHtmlReport } from '../../utils/reportExport';
 import { renderPdfDocument, renderSummaryLine, buildPdfFileName, freshReportRef } from '../../utils/pdfTemplate';
 import DateField from '../../components/common/DateField';
+import { isRetailPricingEnabled } from '../../utils/pricing';
+import { computeInvoiceTotals } from '../../utils/billing';
 
 interface AdminDashboardProps {
   data: ERPData;
   setActiveScreen: (screen: string) => void;
   showAlert: (opts: any) => void;
-  onSettleOrder: (storeId: string) => void;
 }
 
-const inr = (n: number) => `Rs ${n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+// Dashboard KPI/stock-value tiles show the nearest whole rupee (same
+// round-half-up rule as invoice Round Off) rather than paise precision -
+// these are summary figures, not bills, so decimals just add noise.
+const inr = (n: number) => `Rs ${Math.round(n).toLocaleString('en-IN')}`;
 
-export default function AdminDashboard({ data, setActiveScreen, showAlert, onSettleOrder }: AdminDashboardProps) {
+export default function AdminDashboard({ data, setActiveScreen, showAlert }: AdminDashboardProps) {
   const [activeReportTab, setActiveReportTab] = useState<'Daily' | 'Weekly' | 'Monthly' | 'Custom'>('Weekly');
-  const [dateRange, setDateRange] = useState({ start: '2026-06-20', end: '2026-06-27' });
+  // Defaults to the last 7 days ending today (not a fixed literal date) so the
+  // Custom tab starts out showing a range that actually contains recent data
+  // instead of whatever window happened to be "today" when this was written.
+  const [dateRange, setDateRange] = useState(() => {
+    const now = new Date();
+    const weekAgo = new Date(now);
+    weekAgo.setDate(weekAgo.getDate() - 6);
+    const toIsoDate = (d: Date) => d.toISOString().split('T')[0];
+    return { start: toIsoDate(weekAgo), end: toIsoDate(now) };
+  });
+  const retailEnabled = isRetailPricingEnabled(data.rolePermissions);
 
   // Single source of truth for "how much revenue did this order generate" (tax
   // inclusive, matching the invoice actually billed to the store) — every KPI
@@ -27,7 +41,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
   // reconciled against each other.
   const getOrderRevenue = (o: (typeof data.orders)[number]) => {
     const inv = data.invoices.find(i => i.order_id === o.id);
-    return inv ? inv.grand_total : o.items.reduce((sum, item) => sum + (item.unit_price * item.quantity * (1 + item.tax_pct / 100)), 0);
+    return inv ? inv.grand_total : computeInvoiceTotals(o.items).grand_total;
   };
 
   const totalRevenue = data.orders
@@ -71,9 +85,15 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
     })
     .sort((a, b) => b.value - a.value);
 
+  // Only counts the portion of each delivered order's margin backed by money
+  // actually collected so far (see calculateDeliveredOrderProfit) - unpaid
+  // and pending balances contribute nothing until they're settled.
   const totalProfit = data.orders
     .filter(o => o.status === 'Delivered')
-    .reduce((sum, order) => sum + calculateDeliveredOrderProfit(order, data.purchases), 0);
+    .reduce((sum, order) => {
+      const invoice = data.invoices.find(i => i.order_id === order.id);
+      return sum + calculateDeliveredOrderProfit(order, data.purchases, invoice);
+    }, 0);
 
   const today = new Date('2026-06-27');
   const sevenDaysLater = new Date('2026-07-04');
@@ -95,14 +115,22 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
   }).sort((a, b) => b.qty - a.qty).slice(0, 5);
 
   const handleExport = async (reportName: string) => {
-    const startStr = activeReportTab === 'Daily' ? '2026-06-27'
-      : activeReportTab === 'Weekly' ? '2026-06-20'
-      : activeReportTab === 'Monthly' ? '2026-05-27'
+    // Report period must be computed relative to the actual current date, not
+    // a fixed literal - a hardcoded window stops matching any order created
+    // after that literal date, which is what made this report export empty.
+    const now = new Date();
+    const toIsoDate = (d: Date) => d.toISOString().split('T')[0];
+    const daysAgo = (n: number) => {
+      const d = new Date(now);
+      d.setDate(d.getDate() - n);
+      return d;
+    };
+
+    const startStr = activeReportTab === 'Daily' ? toIsoDate(now)
+      : activeReportTab === 'Weekly' ? toIsoDate(daysAgo(6))
+      : activeReportTab === 'Monthly' ? toIsoDate(daysAgo(30))
       : dateRange.start;
-    const endStr = activeReportTab === 'Daily' ? '2026-06-27'
-      : activeReportTab === 'Weekly' ? '2026-06-27'
-      : activeReportTab === 'Monthly' ? '2026-06-27'
-      : dateRange.end;
+    const endStr = activeReportTab === 'Custom' ? dateRange.end : toIsoDate(now);
 
     const startDate = new Date(startStr);
     const endDate = new Date(endStr);
@@ -130,11 +158,15 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
             // Costed the same way as the dashboard's Total Profit card
             // (latest actual purchase price, not the product's current
             // catalog price) so the two never disagree after a price update.
-            const itemRevExclTax = item.unit_price * item.quantity;
             const itemCost = getLatestPurchasePrice(item.product_id, data.purchases) * item.quantity;
             periodCOGS += itemCost;
-            periodProfit += (itemRevExclTax - itemCost);
           });
+          // Profit is recognized on a cash basis (see calculateDeliveredOrderProfit)
+          // - only the portion of this order's margin actually collected so
+          // far counts, so periodProfit intentionally does not equal
+          // periodRevenue - periodCOGS whenever orders are unpaid/partial.
+          const invoice = data.invoices.find(i => i.order_id === o.id);
+          periodProfit += calculateDeliveredOrderProfit(o, data.purchases, invoice);
         }
       });
       const totalPaymentsCollected = periodPayments.reduce((sum, p) => sum + p.amount, 0);
@@ -142,13 +174,13 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
       const tableRows = periodOrders.map(o => {
         const store = data.stores.find(s => s.id === o.store_id);
         const totalQty = o.items.reduce((s, i) => s + i.quantity, 0);
-        let revExclTax = 0, cost = 0;
+        let cost = 0;
         o.items.forEach(i => {
-          revExclTax += i.unit_price * i.quantity;
           cost += getLatestPurchasePrice(i.product_id, data.purchases) * i.quantity;
         });
         const rev = getOrderRevenue(o);
-        const profit = revExclTax - cost;
+        const invoice = data.invoices.find(i => i.order_id === o.id);
+        const profit = o.status === 'Delivered' ? calculateDeliveredOrderProfit(o, data.purchases, invoice) : 0;
         return `<tr>
             <td>${o.id}</td>
             <td>${new Date(o.created_at).toLocaleDateString('en-IN')}</td>
@@ -168,11 +200,11 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
           ${renderSummaryLine([
             { label: 'Delivered Revenue', value: `Rs ${periodRevenue.toFixed(2)}`, accent: true },
             { label: 'Cost of Sales (COGS)', value: `Rs ${periodCOGS.toFixed(2)}` },
-            { label: 'Gross Profit', value: `Rs ${periodProfit.toFixed(2)}`, accent: true },
+            { label: 'Profit (Collected Only)', value: `Rs ${periodProfit.toFixed(2)}`, accent: true },
             { label: 'Collected Payments', value: `Rs ${totalPaymentsCollected.toFixed(2)}` },
           ])}
           <div class="section-title">Logged Sales Orders in Period (${periodOrders.length})</div>
-          <table><thead><tr><th>Order ID</th><th>Date</th><th>Store Partner</th><th style="text-align:center">Qty</th><th style="text-align:right">Revenue</th><th style="text-align:right">Cost</th><th style="text-align:right">Profit</th><th style="text-align:center">Status</th></tr></thead>
+          <table><thead><tr><th>Order ID</th><th>Date</th><th>Store Partner</th><th style="text-align:center">Qty</th><th style="text-align:right">Revenue</th><th style="text-align:right">Cost</th><th style="text-align:right">Profit (Collected)</th><th style="text-align:center">Status</th></tr></thead>
           <tbody>${tableRows || '<tr><td colspan="8" style="text-align:center;padding:20px;color:#94a3b8">No orders logged in this period.</td></tr>'}</tbody></table>`,
         footerNote: 'This is a computer-generated executive report and requires no physical signature.',
       });
@@ -235,10 +267,10 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
             <td>${p.category}</td>
             <td style="text-align:center"><strong>${qty}</strong></td>
             <td style="text-align:right">Rs ${p.purchase_price.toFixed(2)}</td>
-            <td style="text-align:right">Rs ${p.selling_price.toFixed(2)}</td>
+            ${retailEnabled ? `<td style="text-align:right">Rs ${p.selling_price.toFixed(2)}</td>` : ''}
             <td style="text-align:right">Rs ${purchaseVal.toFixed(2)}</td>
-            <td style="text-align:right">Rs ${salesVal.toFixed(2)}</td>
-            <td style="text-align:right"><strong>Rs ${expectedProfit.toFixed(2)}</strong></td>
+            ${retailEnabled ? `<td style="text-align:right">Rs ${salesVal.toFixed(2)}</td>
+            <td style="text-align:right"><strong>Rs ${expectedProfit.toFixed(2)}</strong></td>` : ''}
           </tr>`;
       }).join('');
 
@@ -250,11 +282,11 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
             { label: 'Unique SKUs', value: String(data.products.length) },
             { label: 'Total Items On-Hand', value: totalStockItems.toLocaleString('en-IN') },
             { label: 'Wholesale Assets Cost', value: `Rs ${totalPurchaseValuation.toFixed(2)}`, accent: true },
-            { label: 'Retail Potential Value', value: `Rs ${totalPotentialSalesValuation.toFixed(2)}`, accent: true },
+            ...(retailEnabled ? [{ label: 'Retail Potential Value', value: `Rs ${totalPotentialSalesValuation.toFixed(2)}`, accent: true }] : []),
           ])}
           <div class="section-title">Valuation Breakdown by Product</div>
-          <table><thead><tr><th>SKU</th><th>Product</th><th>Category</th><th style="text-align:center">Qty</th><th style="text-align:right">Wholesale</th><th style="text-align:right">Selling</th><th style="text-align:right">Wholesale Val</th><th style="text-align:right">Retail Val</th><th style="text-align:right">Margin</th></tr></thead>
-          <tbody>${productRows || '<tr><td colspan="9" style="text-align:center;padding:20px;color:#94a3b8">No products registered.</td></tr>'}</tbody></table>`,
+          <table><thead><tr><th>SKU</th><th>Product</th><th>Category</th><th style="text-align:center">Qty</th><th style="text-align:right">Wholesale</th>${retailEnabled ? '<th style="text-align:right">Selling</th>' : ''}<th style="text-align:right">Wholesale Val</th>${retailEnabled ? '<th style="text-align:right">Retail Val</th><th style="text-align:right">Margin</th>' : ''}</tr></thead>
+          <tbody>${productRows || `<tr><td colspan="${retailEnabled ? 9 : 6}" style="text-align:center;padding:20px;color:#94a3b8">No products registered.</td></tr>`}</tbody></table>`,
         footerNote: 'This is a computer-generated stock valuation report and requires no physical signature.',
       });
       fileName = buildPdfFileName('Warehouse_Report', freshReportRef('WH'));
@@ -287,8 +319,8 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
             <td>${item.skuCode}</td>
             <td>${item.prodName}</td>
             <td style="text-align:center"><strong>${item.qty} units</strong></td>
-            <td style="text-align:right">Rs ${item.costPrice.toFixed(2)} / Rs ${item.sellingPrice.toFixed(2)}</td>
-            <td style="text-align:right">Rs ${item.costVal.toFixed(2)} (Cost)<br/>Rs ${item.retailVal.toFixed(2)} (Retail)</td>
+            <td style="text-align:right">Rs ${item.costPrice.toFixed(2)}${retailEnabled ? ` / Rs ${item.sellingPrice.toFixed(2)}` : ''}</td>
+            <td style="text-align:right">Rs ${item.costVal.toFixed(2)}${retailEnabled ? ` (Cost)<br/>Rs ${item.retailVal.toFixed(2)} (Retail)` : ''}</td>
           </tr>`).join('');
 
       html = renderPdfDocument({
@@ -299,7 +331,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
             { label: 'Fleet Size', value: `${data.trucks.length} Vehicles` },
             { label: 'Total Cargo Units', value: `${totalQtyLoaded.toLocaleString('en-IN')} Units`, accent: true },
             { label: 'Cargo Asset Cost', value: `Rs ${totalTruckValuation.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, accent: true },
-            { label: 'Retail Sales Potential', value: `Rs ${totalTruckRetailValuation.toLocaleString('en-IN', { minimumFractionDigits: 2 })}` },
+            ...(retailEnabled ? [{ label: 'Retail Sales Potential', value: `Rs ${totalTruckRetailValuation.toLocaleString('en-IN', { minimumFractionDigits: 2 })}` }] : []),
           ])}
           <div class="section-title">Loaded Transit Stock Breakdown by Vehicle</div>
           <table><thead><tr><th>Vehicle</th><th>Driver</th><th>Route</th><th>SKU</th><th>Product</th><th style="text-align:center">Qty</th><th style="text-align:right">Price</th><th style="text-align:right">Value</th></tr></thead>
@@ -327,7 +359,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
         <View className="flex-1 min-w-[45%] lg:min-w-[22%] bg-white/70 border border-white/50 p-4 rounded-2xl border-l-4 border-l-emerald-400">
           <Text className="text-[10px] uppercase font-bold tracking-wider text-slate-400">Total Profit</Text>
           <Text className="text-xl font-black mt-1 text-slate-800">{inr(totalProfit)}</Text>
-          <Text className="text-[9px] text-slate-500 font-medium">After purchase deductions</Text>
+          <Text className="text-[9px] text-slate-500 font-medium">From collected payments only</Text>
         </View>
 
         <View className="flex-1 min-w-[45%] lg:min-w-[22%] bg-white/70 border border-white/50 p-4 rounded-2xl border-l-4 border-l-violet-400">
@@ -373,7 +405,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
               <Text className="text-lg font-bold text-slate-800">{inr(totalFleetStockValue)}</Text>
             </View>
           </View>
-          <Pressable onPress={() => setActiveScreen('Warehouse')} className="bg-emerald-500/10 py-1.5 px-3 rounded-lg border border-emerald-200/50 active:bg-emerald-500/20">
+          <Pressable onPress={() => setActiveScreen('Trucks')} className="bg-emerald-500/10 py-1.5 px-3 rounded-lg border border-emerald-200/50 active:bg-emerald-500/20">
             <Text className="text-xs font-bold text-emerald-700">View Routes</Text>
           </Pressable>
         </View>
@@ -450,7 +482,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
         {upcomingRefills.length === 0 ? (
           <Text className="text-xs text-slate-400 text-center py-4 font-medium italic">No refills due in the next 7 days.</Text>
         ) : (
-          <View className="gap-2">
+          <View className="gap-2 md:flex-row md:flex-wrap">
             {upcomingRefills.map(s => {
               const daysDiff = Math.ceil((new Date(s.next_refill_date).getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
               let badgeClass = 'bg-white text-slate-700 border border-slate-200';
@@ -460,7 +492,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
               const isColored = daysDiff <= 1;
 
               return (
-                <View key={s.id} className="p-2.5 rounded-xl bg-white/80 border border-white/60 flex-row items-center justify-between gap-2">
+                <View key={s.id} className="w-full md:w-[48%] p-2.5 rounded-xl bg-white/80 border border-white/60 flex-row items-center justify-between gap-2">
                   <View className="flex-1">
                     <Text className="font-bold text-slate-800 text-xs">{s.name}</Text>
                     <Text className="text-slate-400 text-[10px] font-medium">Area: {s.area} - Last Order: {s.last_purchase_date || 'N/A'}</Text>
@@ -468,8 +500,8 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
                   <Text className={`text-[10px] font-bold px-2 py-1 rounded-lg ${badgeClass} ${isColored ? 'text-white' : ''}`}>
                     {label}
                   </Text>
-                  <Pressable onPress={() => onSettleOrder(s.id)} className="py-1 px-3 bg-blue-600 rounded-lg active:bg-blue-700">
-                    <Text className="text-white font-extrabold text-[10px]">Settle Order</Text>
+                  <Pressable onPress={() => setActiveScreen('Refill')} className="py-1 px-3 bg-blue-600 rounded-lg active:bg-blue-700">
+                    <Text className="text-white font-extrabold text-[10px]">View Refill</Text>
                   </Pressable>
                 </View>
               );
@@ -495,7 +527,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
                     <Text className="text-[10px] font-extrabold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded self-start">{st.ranking} Partner</Text>
                   </View>
                 </View>
-                <Text className="font-bold text-slate-700 text-xs">Rs {st.revenue.toFixed(2)}</Text>
+                <Text className="font-bold text-slate-700 text-xs">{inr(st.revenue)}</Text>
               </View>
             ))}
           </View>
@@ -550,7 +582,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
               <View className="flex-1">
                 <Text className="font-bold text-slate-800 text-xs">{t.vehicle_number}</Text>
                 <Text className="text-[9px] text-slate-500 font-medium">{driver?.name || 'Unassigned'}</Text>
-                <Text className="text-emerald-600 font-bold text-[10px]">Rs {totalVal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</Text>
+                <Text className="text-emerald-600 font-bold text-[10px]">{inr(totalVal)}</Text>
               </View>
               <Text className="w-20 text-slate-600 font-medium text-center text-xs">{t.area}</Text>
               <Text className="w-14 font-semibold text-slate-700 text-right text-xs">{totalQty}</Text>
@@ -577,8 +609,8 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
             <View key={u.id} className="flex-row items-center justify-between py-2.5 border-b border-slate-50 last:border-0">
               <Text className="font-bold text-slate-800 text-xs">{u.name.split(' ')[0]}</Text>
               <Text className="text-slate-600 font-medium text-xs">{count} orders</Text>
-              <Text className="font-semibold text-slate-700 text-xs">Rs {revenue.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</Text>
-              <Text className="text-emerald-600 font-bold text-xs">Rs {collections.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</Text>
+              <Text className="font-semibold text-slate-700 text-xs">{inr(revenue)}</Text>
+              <Text className="text-emerald-600 font-bold text-xs">{inr(collections)}</Text>
             </View>
           );
         })}
@@ -598,9 +630,9 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert, onSet
             <Pressable
               key={tab}
               onPress={() => setActiveReportTab(tab)}
-              className={`px-2 py-1 rounded ${activeReportTab === tab ? 'bg-white' : ''}`}
+              className={`px-2 py-1 rounded ${activeReportTab === tab ? 'bg-indigo-600' : ''}`}
             >
-              <Text className={`text-[10px] font-bold ${activeReportTab === tab ? 'text-slate-800' : 'text-slate-500'}`}>{tab}</Text>
+              <Text className={`text-[10px] font-bold ${activeReportTab === tab ? 'text-white' : 'text-slate-500'}`}>{tab}</Text>
             </Pressable>
           ))}
         </View>

@@ -20,3 +20,7 @@ export async function rename(req: Request, res: Response) {
   if (!parsed.success) throw ApiError.badRequest('Category name cannot be empty.');
   res.json(await categoriesService.renameCategory(req.params.id, parsed.data.name, req.auth!.sub));
 }
+
+export async function toggleStatus(req: Request, res: Response) {
+  res.json(await categoriesService.toggleCategoryStatus(req.params.id, req.auth!.sub));
+}

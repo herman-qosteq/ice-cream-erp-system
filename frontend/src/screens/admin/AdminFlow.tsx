@@ -4,18 +4,20 @@ import {
   Menu, Bell, LogOut, ChevronRight, LayoutDashboard, ShoppingBag, Database, Award, FileSpreadsheet,
 } from 'lucide-react-native';
 import { ERPData } from '../../storage';
-import { AppNotification } from '../../types';
+import { AppNotification, NotificationEntityType } from '../../types';
 
 import AdminDashboard from './AdminDashboard';
 import AdminProducts from './AdminProducts';
 import AdminWarehouse from './AdminWarehouse';
 import AdminSales from './AdminSales';
 import AdminUsers from './AdminUsers';
+import { useScrollReset, useResetScrollOnChange } from '../../context/ScrollResetContext';
+import { formatBadgeCount } from '../../utils/format';
 
 interface AdminFlowProps {
   data: ERPData;
   setData: (updater: ERPData | ((prev: ERPData) => ERPData)) => void;
-  addNotification: (type: AppNotification['type'], message: string) => void;
+  addNotification: (type: AppNotification['type'], message: string, entityType?: NotificationEntityType, entityId?: string) => void;
   currentUser: any;
   setCurrentUser: (user: any) => void;
   showAlert: (opts: any) => void;
@@ -26,6 +28,20 @@ type AdminScreen =
   | 'Warehouse' | 'Trucks' | 'TruckInventory' | 'MovementAudit'
   | 'Stores' | 'Orders' | 'Deliveries' | 'Invoices' | 'Payments' | 'QRCodePayment' | 'Credit' | 'Refill' | 'Inactive'
   | 'Users' | 'Notifications';
+
+// Which top-level screen owns each notification entity type - tapping a
+// notification switches here first, then the mounted screen below picks the
+// specific record up via pendingNotificationTarget once it's on-screen.
+const notificationEntityScreen: Record<NotificationEntityType, AdminScreen> = {
+  order: 'Orders',
+  prebooking: 'Deliveries',
+  purchase: 'Purchases',
+  store: 'Stores',
+  supplier: 'Suppliers',
+  product: 'Products',
+  user: 'Users',
+  truck: 'TruckInventory',
+};
 
 const screenTitles: Record<string, string> = {
   Dashboard: 'Executive Panel',
@@ -48,8 +64,13 @@ const screenTitles: Record<string, string> = {
 export default function AdminFlow({ data, setData, addNotification, currentUser, setCurrentUser, showAlert }: AdminFlowProps) {
   const [activeScreen, setActiveScreen] = useState<AdminScreen>('Dashboard');
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
-  const [pendingPaymentStoreId, setPendingPaymentStoreId] = useState<string | null>(null);
   const [pendingPreBookingTodayFilter, setPendingPreBookingTodayFilter] = useState(false);
+  // Set when a notification is tapped and consumed by whichever screen below
+  // owns that entity type, so the target record's own detail view opens
+  // without every other screen needing to know about notifications at all.
+  const [pendingNotificationTarget, setPendingNotificationTarget] = useState<{ entityType: NotificationEntityType; entityId: string } | null>(null);
+  const { scrollRef } = useScrollReset();
+  useResetScrollOnChange(activeScreen);
 
   const unreadNotifsCount = data.notifications.filter(n => !n.is_read).length;
 
@@ -58,14 +79,23 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
     setIsDrawerOpen(false);
   };
 
-  const handleSettleOrder = (storeId: string) => {
-    setPendingPaymentStoreId(storeId);
-    handleScreenSelect('Credit');
-  };
-
   const handleViewTodayPreBookings = () => {
     setPendingPreBookingTodayFilter(true);
     handleScreenSelect('Deliveries');
+  };
+
+  // Lower-level primitive behind notification-tap navigation: "open entity X
+  // on whichever screen owns it." Reused directly by any row-click-to-detail
+  // UI (e.g. Movement Logs rows) that already has a raw entityType/entityId
+  // pair rather than a full AppNotification.
+  const navigateToEntity = (entityType: NotificationEntityType, entityId: string) => {
+    setPendingNotificationTarget({ entityType, entityId });
+    handleScreenSelect(notificationEntityScreen[entityType]);
+  };
+
+  const handleNotificationNavigate = (n: AppNotification) => {
+    if (!n.entity_type || !n.entity_id) return;
+    navigateToEntity(n.entity_type, n.entity_id);
   };
 
   const handleLogOut = () => {
@@ -191,8 +221,8 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
             <Pressable onPress={() => setActiveScreen('Notifications')} className="p-2 rounded-xl relative active:bg-slate-100">
               <Bell size={18} color="#334155" />
               {unreadNotifsCount > 0 && (
-                <View className="absolute top-1 right-1 w-4 h-4 bg-rose-500 rounded-full items-center justify-center">
-                  <Text className="text-white font-extrabold text-[8px]">{unreadNotifsCount}</Text>
+                <View className="absolute top-1 right-1 min-w-[16px] h-4 px-1 bg-rose-500 rounded-full items-center justify-center">
+                  <Text className="text-white font-extrabold text-[8px]">{formatBadgeCount(unreadNotifsCount)}</Text>
                 </View>
               )}
             </Pressable>
@@ -203,10 +233,10 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
         </View>
 
         {/* CORE SCREEN CANVAS */}
-        <ScrollView className="flex-1" contentContainerStyle={{ flexGrow: 1 }}>
-          <View className="p-4 md:p-6 lg:p-8 w-full md:max-w-[1400px] md:self-center gap-4">
+        <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ flexGrow: 1 }}>
+          <View className="p-4 md:p-4 lg:p-4 w-full md:max-w-[1400px] md:self-center gap-4">
             {activeScreen === 'Dashboard' && (
-              <AdminDashboard data={data} setActiveScreen={(scr) => handleScreenSelect(scr as any)} showAlert={showAlert} onSettleOrder={handleSettleOrder} />
+              <AdminDashboard data={data} setActiveScreen={(scr) => handleScreenSelect(scr as any)} showAlert={showAlert} />
             )}
             {(activeScreen === 'Products' || activeScreen === 'Pricing') && (
               <AdminProducts
@@ -216,6 +246,8 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
                 currentUser={currentUser}
                 activeScreen={activeScreen}
                 showAlert={showAlert}
+                pendingNotificationTarget={pendingNotificationTarget}
+                onConsumePendingNotificationTarget={() => setPendingNotificationTarget(null)}
               />
             )}
             {(activeScreen === 'Warehouse' || activeScreen === 'Trucks' || activeScreen === 'TruckInventory' || activeScreen === 'MovementAudit') && (
@@ -228,6 +260,9 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
                 setActiveScreen={(scr) => handleScreenSelect(scr as any)}
                 showAlert={showAlert}
                 onViewTodayPreBookings={handleViewTodayPreBookings}
+                pendingNotificationTarget={pendingNotificationTarget}
+                onConsumePendingNotificationTarget={() => setPendingNotificationTarget(null)}
+                onNavigateToEntity={navigateToEntity}
               />
             )}
             {(activeScreen === 'Stores' || activeScreen === 'Suppliers' || activeScreen === 'Purchases' || activeScreen === 'Orders' || activeScreen === 'Deliveries' || activeScreen === 'Invoices' || activeScreen === 'Payments' || activeScreen === 'QRCodePayment' || activeScreen === 'Credit' || activeScreen === 'Refill' || activeScreen === 'Inactive') && (
@@ -238,10 +273,10 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
                 currentUser={currentUser}
                 activeScreen={activeScreen}
                 showAlert={showAlert}
-                initialPaymentStoreId={pendingPaymentStoreId}
-                onConsumeInitialPaymentStore={() => setPendingPaymentStoreId(null)}
                 initialPreBookingTodayFilter={pendingPreBookingTodayFilter}
                 onConsumeInitialPreBookingTodayFilter={() => setPendingPreBookingTodayFilter(false)}
+                pendingNotificationTarget={pendingNotificationTarget}
+                onConsumePendingNotificationTarget={() => setPendingNotificationTarget(null)}
               />
             )}
             {(activeScreen === 'Users' || activeScreen === 'Notifications') && (
@@ -252,6 +287,9 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
                 currentUser={currentUser}
                 activeScreen={activeScreen}
                 showAlert={showAlert}
+                pendingNotificationTarget={pendingNotificationTarget}
+                onConsumePendingNotificationTarget={() => setPendingNotificationTarget(null)}
+                onNotificationNavigate={handleNotificationNavigate}
               />
             )}
           </View>

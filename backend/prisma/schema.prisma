@@ -138,8 +138,9 @@ model Truck {
 // ---------------------------------------------------------------------------
 
 model Category {
-  id   String @id @default(uuid())
-  name String @unique
+  id     String @id @default(uuid())
+  name   String @unique
+  status Status @default(Active)
 
   products Product[]
 
@@ -147,32 +148,35 @@ model Category {
 }
 
 model Product {
-  id              String    @id @default(uuid())
-  name            String
-  code            String    @unique
-  category_id     String
-  category        Category  @relation(fields: [category_id], references: [id])
-  brand           String
-  description     String    @db.Text
-  image_url       String?   @db.LongText
-  purchase_price  Decimal   @db.Decimal(10, 2)
-  wholesale_price Decimal   @db.Decimal(10, 2)
-  selling_price   Decimal   @db.Decimal(10, 2)
-  tax_pct         Decimal   @db.Decimal(5, 2)
-  status          Status    @default(Active)
-  unit_value      Decimal   @db.Decimal(10, 2)
-  unit_type       UnitType
-  expiry_date     DateTime? @db.Date
-  created_at      DateTime  @default(now())
-  updated_at      DateTime  @updatedAt
+  id                     String    @id @default(uuid())
+  name                   String
+  code                   String    @unique
+  category_id            String
+  category               Category  @relation(fields: [category_id], references: [id])
+  brand                  String
+  description            String    @db.Text
+  image_url              String?   @db.LongText
+  mrp                    Decimal   @db.Decimal(10, 2)
+  purchase_discount_pct  Decimal   @db.Decimal(5, 2)
+  wholesale_discount_pct Decimal   @db.Decimal(5, 2)
+  retail_discount_pct    Decimal   @db.Decimal(5, 2)
+  tax_pct                Decimal   @db.Decimal(5, 2)
+  status                 Status    @default(Active)
+  unit_value             Decimal   @db.Decimal(10, 2)
+  unit_type              UnitType
+  expiry_date            DateTime? @db.Date
+  created_at             DateTime  @default(now())
+  updated_at             DateTime  @updatedAt
 
   scheduled_prices             ScheduledPrice[]
   warehouse_inventory          WarehouseInventory?
   truck_inventory              TruckInventory[]
   purchase_items               PurchaseItem[]
+  purchase_order_request_items PurchaseOrderRequestItem[]
   order_items                  OrderItem[]
   pre_booking_items            PreBookingItem[]
   pre_booking_dispatched_items PreBookingDispatchedItem[]
+  store_pricing_overrides      StorePricing[]
 
   @@map("products")
 }
@@ -204,7 +208,8 @@ model Supplier {
   created_at     DateTime @default(now())
   updated_at     DateTime @updatedAt
 
-  purchases Purchase[]
+  purchases              Purchase[]
+  purchase_order_requests PurchaseOrderRequest[]
 
   @@map("suppliers")
 }
@@ -217,8 +222,19 @@ model Purchase {
   date           DateTime @db.Date
   created_at     DateTime @default(now())
 
-  items PurchaseItem[]
+  /// The supplier's own bill/price-list sent back after packing the order -
+  /// stored as a base64 data URI (like Product.image_url) since there's no
+  /// object storage backend. Can be a photo, PDF, or spreadsheet; bill_file_type
+  /// (a MIME type) tells the UI how to preview/open it.
+  bill_file_url  String? @db.LongText
+  bill_file_name String?
+  bill_file_type String?
 
+  items            PurchaseItem[]
+  fulfilled_request PurchaseOrderRequest?
+
+  @@index([date])
+  @@index([invoice_number])
   @@map("purchases")
 }
 
@@ -234,6 +250,45 @@ model PurchaseItem {
   expiry_date    DateTime? @db.Date
 
   @@map("purchase_items")
+}
+
+enum PurchaseOrderRequestStatus {
+  Pending
+  Fulfilled
+  Cancelled
+}
+
+/// A Purchase Order Excel generated from the Warehouse page (product list,
+/// no rates) and sent to a supplier. Kept as its own record so the admin
+/// doesn't have to retype the same product/quantity list into Receive Stock
+/// once the supplier packs the order and sends prices back - they instead
+/// pick this request and it pre-fills the manifest.
+model PurchaseOrderRequest {
+  id          String                     @id @default(uuid())
+  order_ref   String                     @unique
+  supplier_id String
+  supplier    Supplier                   @relation(fields: [supplier_id], references: [id])
+  status      PurchaseOrderRequestStatus @default(Pending)
+  created_at  DateTime                   @default(now())
+
+  /// Set once Receive Stock is confirmed against this request.
+  fulfilled_purchase_id String?   @unique
+  fulfilled_purchase    Purchase? @relation(fields: [fulfilled_purchase_id], references: [id])
+
+  items PurchaseOrderRequestItem[]
+
+  @@map("purchase_order_requests")
+}
+
+model PurchaseOrderRequestItem {
+  id         String               @id @default(uuid())
+  request_id String
+  request    PurchaseOrderRequest @relation(fields: [request_id], references: [id], onDelete: Cascade)
+  product_id String
+  product    Product              @relation(fields: [product_id], references: [id])
+  order_case Int
+
+  @@map("purchase_order_request_items")
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +322,18 @@ model TruckInventory {
 // Partner stores
 // ---------------------------------------------------------------------------
 
+// Manageable list of district areas offered on the Store form's "District
+// Area" dropdown. Store.area itself stays a plain string (matched by name,
+// not a foreign key) so renaming/removing an area here never touches
+// existing store rows directly - deletion is blocked instead while any
+// store still references the name (see areas.service.ts).
+model Area {
+  id   String @id @default(uuid())
+  name String @unique
+
+  @@map("areas")
+}
+
 model Store {
   id                  String    @id @default(uuid())
   name                String
@@ -296,8 +363,29 @@ model Store {
   payments           Payment[]
   credit_ledger      CreditLedger[]
   visits             StoreVisit[]
+  pricing_overrides  StorePricing[]
 
   @@map("stores")
+}
+
+// Per-store, per-product discount overrides - lets a partner outlet get its
+// own negotiated wholesale/retail rate instead of the catalog default.
+// Either field may be left null to keep tracking that side of the catalog's
+// rate live (a snapshot copy would go stale the next time the catalog
+// price changes); a row with both null is meaningless and should just be
+// deleted instead (see storePricing.service.ts).
+model StorePricing {
+  id                     String   @id @default(uuid())
+  store_id               String
+  store                  Store    @relation(fields: [store_id], references: [id], onDelete: Cascade)
+  product_id             String
+  product                Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  wholesale_discount_pct Decimal? @db.Decimal(5, 2)
+  retail_discount_pct    Decimal? @db.Decimal(5, 2)
+  updated_at             DateTime @updatedAt
+
+  @@unique([store_id, product_id])
+  @@map("store_pricing")
 }
 
 model StoreVisit {
@@ -333,6 +421,16 @@ model Order {
   invoice  Invoice?
   payments Payment[]
 
+  /// Set when this order was generated by delivering a pre-booking (see
+  /// PreBookingOrder.fulfilled_order_id) - lets an Admin edit/delete a
+  /// Delivered pre-booking by operating on the real order/invoice/stock it
+  /// actually produced, the same way editOrder/deleteOrder already do for
+  /// ordinary orders.
+  fulfilled_prebooking PreBookingOrder?
+
+  @@index([created_at])
+  @@index([status])
+  @@index([status, created_at])
   @@map("orders")
 }
 
@@ -345,6 +443,10 @@ model OrderItem {
   quantity   Int
   unit_price Decimal @db.Decimal(10, 2)
   tax_pct    Decimal @db.Decimal(5, 2)
+  /// Preserves the order items were added/edited in (bills must show this,
+  /// not a DB-default row order, which follows the random UUID primary key
+  /// rather than insertion order). Set from the submitted array index.
+  position   Int     @default(0)
 
   @@map("order_items")
 }
@@ -357,12 +459,18 @@ model Invoice {
   total          Decimal               @db.Decimal(10, 2)
   tax            Decimal               @db.Decimal(10, 2)
   grand_total    Decimal               @db.Decimal(10, 2)
+  /// Indian tax-invoice "Round Off": grand_total minus the exact (unrounded)
+  /// total+tax, e.g. -0.40 when the exact bill of 245.60 was rounded up to
+  /// Rs 246. Always present (0 when no rounding was needed).
+  round_off      Decimal               @default(0) @db.Decimal(10, 2)
   created_at     DateTime              @default(now())
   paid_amount    Decimal?              @db.Decimal(10, 2)
   payment_status InvoicePaymentStatus?
   /// Allowed values: 'Cash' | 'UPI' | 'Google Pay' | 'PhonePe' | 'Paytm' | 'Bank Transfer' | 'Credit'
   payment_method String?
 
+  @@index([created_at])
+  @@index([payment_status])
   @@map("invoices")
 }
 
@@ -384,6 +492,17 @@ model PreBookingOrder {
   items            PreBookingItem[]
   dispatched_items PreBookingDispatchedItem[]
 
+  /// Set once this booking is delivered - points at the real Order it
+  /// produced (deliverPreBooking creates a brand-new Order with no other
+  /// link back to the booking that spawned it). Lets an Admin edit/delete a
+  /// Delivered booking by operating on that real order/invoice/stock.
+  fulfilled_order_id String? @unique
+  fulfilled_order    Order?  @relation(fields: [fulfilled_order_id], references: [id])
+
+  @@index([created_at])
+  @@index([status])
+  @@index([scheduled_delivery_date])
+  @@index([status, scheduled_delivery_date])
   @@map("pre_booking_orders")
 }
 
@@ -396,6 +515,10 @@ model PreBookingItem {
   quantity       Int
   unit_price     Decimal         @db.Decimal(10, 2)
   tax_pct        Decimal         @db.Decimal(5, 2)
+  /// Preserves the order items were added/edited in (bills must show this,
+  /// not a DB-default row order, which follows the random UUID primary key
+  /// rather than insertion order). Set from the submitted array index.
+  position       Int             @default(0)
 
   @@map("pre_booking_items")
 }
@@ -431,6 +554,7 @@ model Payment {
   collected_by      String
   collected_by_user User     @relation(fields: [collected_by], references: [id])
 
+  @@index([date])
   @@map("payments")
 }
 
@@ -450,13 +574,24 @@ model CreditLedger {
 // Notifications, audit trail & misc settings
 // ---------------------------------------------------------------------------
 
+/// entity_type/entity_id are an intentional soft reference (same reasoning as
+/// AuditLog above), not a hard foreign key: not every notification is about a
+/// specific record (e.g. type 'system'), and a notification must still
+/// display correctly if the record it pointed to is later deleted. Both are
+/// nullable for that reason - only set when the notification has somewhere
+/// to navigate to.
 model AppNotification {
-  id         String           @id @default(uuid())
-  type       NotificationType
-  message    String           @db.Text
-  is_read    Boolean          @default(false)
-  created_at DateTime         @default(now())
+  id          String           @id @default(uuid())
+  type        NotificationType
+  message     String           @db.Text
+  entity_type String?
+  entity_id   String?
+  is_read     Boolean          @default(false)
+  created_at  DateTime         @default(now())
 
+  @@index([created_at])
+  @@index([is_read])
+  @@index([entity_type, entity_id])
   @@map("notifications")
 }
 
@@ -476,6 +611,8 @@ model AuditLog {
   timestamp   DateTime @default(now())
   details     String   @db.Text
 
+  @@index([timestamp, id])
+  @@index([entity_type, entity_id])
   @@map("audit_logs")
 }
 
@@ -487,6 +624,21 @@ model QrCodeSettings {
   is_enabled Boolean @default(true)
 
   @@map("qr_code_settings")
+}
+
+/// Admin-toggleable feature flags scoped to a role, e.g. letting Admin grant
+/// the Salesperson role access to the GST/non-GST order toggle. Absence of a
+/// row for a given (role, feature) pair means "disabled" — rows only need to
+/// be written when a feature is turned on, or flipped back off.
+model RolePermission {
+  id         String   @id @default(uuid())
+  role       Role
+  feature    String
+  enabled    Boolean  @default(false)
+  updated_at DateTime @updatedAt
+
+  @@unique([role, feature])
+  @@map("role_permissions")
 }
 
 /// Server-side mirror of the client's offline write queue, kept only if the

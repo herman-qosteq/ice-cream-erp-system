@@ -11,6 +11,8 @@ const FRIENDLY_UNIQUE_MESSAGES: Record<string, string> = {
   products_code_key: 'A product with this SKU code already exists.',
   categories_name_key: 'A category with this name already exists.',
   invoices_invoice_number_key: 'An invoice with this number already exists.',
+  areas_name_key: 'A district area with this name already exists.',
+  purchase_order_requests_order_ref_key: 'A purchase order with this reference already exists.',
 };
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars

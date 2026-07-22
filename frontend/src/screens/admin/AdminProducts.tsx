@@ -1,70 +1,153 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, Pressable, Image, ScrollView } from 'react-native';
+import { View, Text, TextInput, Pressable, ScrollView } from 'react-native';
 import { Search, Plus, Edit, DollarSign, History, Trash2, AlertTriangle, Tag, Check, X, RotateCcw } from 'lucide-react-native';
 import { ERPData, resolveActor } from '../../storage';
-import { Product, AppNotification } from '../../types';
+import { Product, AppNotification, NotificationEntityType } from '../../types';
 import ConfirmModal from '../../components/common/ConfirmModal';
+import ProductImage from '../../components/common/ProductImage';
+import DataTable, { DataTableColumn } from '../../components/common/DataTable';
+import FilterBar from '../../components/common/FilterBar';
 import { pickImageAsDataUri } from '../../utils/imagePicker';
 import { useAppContext } from '../../context/AppContext';
+import { useViewMode } from '../../context/ViewModeContext';
+import { useResetScrollOnChange } from '../../context/ScrollResetContext';
 import { categoriesApi, productsApi } from '../../api/endpoints';
+import { isRetailPricingEnabled, discountFromPrice } from '../../utils/pricing';
 
 const UNIT_OPTIONS: Product['unit_type'][] = ['ml', 'L', 'g', 'kg', 'pcs'];
 
 interface AdminProductsProps {
   data: ERPData;
   setData: (updater: ERPData | ((prev: ERPData) => ERPData)) => void;
-  addNotification: (type: AppNotification['type'], message: string) => void;
+  addNotification: (type: AppNotification['type'], message: string, entityType?: NotificationEntityType, entityId?: string) => void;
   currentUser: any;
   showAlert: (opts: any) => void;
   activeScreen?: string;
+  pendingNotificationTarget?: { entityType: NotificationEntityType; entityId: string } | null;
+  onConsumePendingNotificationTarget?: () => void;
 }
 
-const STOCK_PRODUCT_IMAGES = [
-  'https://images.unsplash.com/photo-1570145820259-b5b80c5c8bd6?w=200&auto=format&fit=crop',
-  'https://images.unsplash.com/photo-1497034825429-c343d7c6a68f?w=200&auto=format&fit=crop',
-  'https://images.unsplash.com/photo-1563805042-7684c019e1cb?w=200&auto=format&fit=crop'
-];
-
-export default function AdminProducts({ data, setData, addNotification, currentUser, showAlert, activeScreen }: AdminProductsProps) {
+export default function AdminProducts({ data, setData, addNotification, currentUser, showAlert, activeScreen, pendingNotificationTarget, onConsumePendingNotificationTarget }: AdminProductsProps) {
   const { refreshData } = useAppContext();
+  const { viewMode } = useViewMode();
   const [productSearch, setProductSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All');
   const [activeForm, setActiveForm] = useState<'list' | 'add_product' | 'edit_product' | 'price_history' | 'manage_categories'>('list');
+  const [catalogTab, setCatalogTab] = useState<'active' | 'deleted'>('active');
+  useResetScrollOnChange(activeForm, catalogTab);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [deleteProductConfirmId, setDeleteProductConfirmId] = useState<string | null>(null);
 
   const [newCategoryName, setNewCategoryName] = useState('');
   const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
   const [editingCategoryName, setEditingCategoryName] = useState('');
-  const [deleteCategoryConfirmId, setDeleteCategoryConfirmId] = useState<string | null>(null);
+  const [categoryListTab, setCategoryListTab] = useState<'active' | 'inactive'>('active');
 
   useEffect(() => {
     setActiveForm('list');
   }, [activeScreen]);
 
+  useEffect(() => {
+    if (!pendingNotificationTarget || pendingNotificationTarget.entityType !== 'product') return;
+    const product = data.products.find(p => p.id === pendingNotificationTarget.entityId);
+    if (product) handleOpenEditProduct(product);
+    onConsumePendingNotificationTarget?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingNotificationTarget]);
+
+  const priceFromDiscount = (mrp: number, discountPct: number) => Math.max(0, mrp * (1 - discountPct / 100));
+
   const [productForm, setProductForm] = useState({
     name: '', code: '', category: 'Cups', brand: 'Gelato Peaks', description: '',
-    purchase_price: 1.0, wholesale_price: 1.25, selling_price: 2.0, tax_pct: 12, status: 'Active' as 'Active' | 'Inactive',
+    mrp: 2.0, purchase_discount_pct: 50, wholesale_discount_pct: 37.5, retail_discount_pct: 0, tax_pct: 12, status: 'Active' as 'Active' | 'Inactive',
+    purchase_price: priceFromDiscount(2.0, 50), wholesale_price: priceFromDiscount(2.0, 37.5), retail_price: priceFromDiscount(2.0, 0),
     unit_value: 1, unit_type: 'pcs' as Product['unit_type'],
-    image_url: STOCK_PRODUCT_IMAGES[0]
+    image_url: ''
   });
 
-  const [priceUpdateForm, setPriceUpdateForm] = useState({ purchase_price: 0, wholesale_price: 0, selling_price: 0 });
+  const [priceUpdateForm, setPriceUpdateForm] = useState({ mrp: 0, purchase_discount_pct: 0, wholesale_discount_pct: 0, retail_discount_pct: 0, purchase_price: 0, wholesale_price: 0, retail_price: 0 });
 
-  const categories = ['All', ...data.categories.map(c => c.name)];
+  // Discount percentages above 100 would make priceFromDiscount go negative,
+  // so typed input is clamped to 100 and the admin is told why.
+  const parseDiscountPct = (v: string): number => {
+    const num = Number(v) || 0;
+    if (num > 100) {
+      showAlert({ type: 'warning', message: 'Discount percentage cannot be greater than 100%.' });
+      return 100;
+    }
+    return num;
+  };
+
+  // Two-way % <-> price sync for the Add/Edit Product form: editing MRP
+  // keeps the discount %'s fixed and recomputes all three prices; editing a
+  // % recomputes just that price; editing a price recomputes just that %
+  // (via discountFromPrice). Price fields hold the raw typed number (no
+  // forced rounding) so typing isn't fought by the round-trip through %.
+  const updateProductFormMrp = (mrp: number) => {
+    setProductForm(prev => ({
+      ...prev, mrp,
+      purchase_price: parseFloat(priceFromDiscount(mrp, prev.purchase_discount_pct).toFixed(2)),
+      wholesale_price: parseFloat(priceFromDiscount(mrp, prev.wholesale_discount_pct).toFixed(2)),
+      retail_price: parseFloat(priceFromDiscount(mrp, prev.retail_discount_pct).toFixed(2)),
+    }));
+  };
+  const updateProductFormPct = (field: 'purchase' | 'wholesale' | 'retail', pct: number) => {
+    setProductForm(prev => ({
+      ...prev,
+      [`${field}_discount_pct`]: pct,
+      [`${field}_price`]: parseFloat(priceFromDiscount(prev.mrp, pct).toFixed(2)),
+    }));
+  };
+  const updateProductFormPrice = (field: 'purchase' | 'wholesale' | 'retail', price: number) => {
+    setProductForm(prev => ({
+      ...prev,
+      [`${field}_price`]: price,
+      [`${field}_discount_pct`]: discountFromPrice(prev.mrp, price),
+    }));
+  };
+
+  const updatePriceUpdateFormMrp = (mrp: number) => {
+    setPriceUpdateForm(prev => ({
+      ...prev, mrp,
+      purchase_price: parseFloat(priceFromDiscount(mrp, prev.purchase_discount_pct).toFixed(2)),
+      wholesale_price: parseFloat(priceFromDiscount(mrp, prev.wholesale_discount_pct).toFixed(2)),
+      retail_price: parseFloat(priceFromDiscount(mrp, prev.retail_discount_pct).toFixed(2)),
+    }));
+  };
+  const updatePriceUpdateFormPct = (field: 'purchase' | 'wholesale' | 'retail', pct: number) => {
+    setPriceUpdateForm(prev => ({
+      ...prev,
+      [`${field}_discount_pct`]: pct,
+      [`${field}_price`]: parseFloat(priceFromDiscount(prev.mrp, pct).toFixed(2)),
+    }));
+  };
+  const updatePriceUpdateFormPrice = (field: 'purchase' | 'wholesale' | 'retail', price: number) => {
+    setPriceUpdateForm(prev => ({
+      ...prev,
+      [`${field}_price`]: price,
+      [`${field}_discount_pct`]: discountFromPrice(prev.mrp, price),
+    }));
+  };
+
+  const categories = ['All', ...data.categories.filter(c => c.status === 'Active').map(c => c.name)];
+  const deletedProductsCount = data.products.filter(p => p.status === 'Inactive').length;
+  const inactiveCategoriesCount = data.categories.filter(c => c.status === 'Inactive').length;
+  const retailEnabled = isRetailPricingEnabled(data.rolePermissions);
 
   const filteredProducts = data.products.filter(p => {
     const matchesSearch = p.name.toLowerCase().includes(productSearch.toLowerCase()) || p.code.toLowerCase().includes(productSearch.toLowerCase());
     const matchesCat = categoryFilter === 'All' || p.category === categoryFilter;
-    return matchesSearch && matchesCat;
+    const matchesTab = catalogTab === 'deleted' ? p.status === 'Inactive' : p.status === 'Active';
+    return matchesSearch && matchesCat && matchesTab;
   });
 
   const handleOpenAddProduct = () => {
     setProductForm({
-      name: '', code: 'IC-NEW-' + Math.floor(Math.random() * 900 + 100), category: data.categories[0]?.name || '', brand: 'Gelato Peaks', description: '',
-      purchase_price: 1.00, wholesale_price: 1.25, selling_price: 2.00, tax_pct: 12, status: 'Active',
+      name: '', code: 'IC-NEW-' + Math.floor(Math.random() * 900 + 100), category: data.categories.find(c => c.status === 'Active')?.name || '', brand: 'Gelato Peaks', description: '',
+      mrp: 2.00, purchase_discount_pct: 50, wholesale_discount_pct: 37.5, retail_discount_pct: 0, tax_pct: 12, status: 'Active',
+      purchase_price: priceFromDiscount(2.00, 50), wholesale_price: priceFromDiscount(2.00, 37.5), retail_price: priceFromDiscount(2.00, 0),
       unit_value: 1, unit_type: 'pcs',
-      image_url: STOCK_PRODUCT_IMAGES[0]
+      image_url: ''
     });
     setActiveForm('add_product');
   };
@@ -73,7 +156,8 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     setSelectedProduct(p);
     setProductForm({
       name: p.name, code: p.code, category: p.category, brand: p.brand, description: p.description,
-      purchase_price: p.purchase_price, wholesale_price: p.wholesale_price, selling_price: p.selling_price, tax_pct: p.tax_pct, status: p.status,
+      mrp: p.mrp, purchase_discount_pct: p.purchase_discount_pct, wholesale_discount_pct: p.wholesale_discount_pct, retail_discount_pct: p.retail_discount_pct, tax_pct: p.tax_pct, status: p.status,
+      purchase_price: p.purchase_price, wholesale_price: p.wholesale_price, retail_price: p.selling_price,
       unit_value: p.unit_value, unit_type: p.unit_type,
       image_url: p.image_url
     });
@@ -83,6 +167,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
   const handleOpenManageCategories = () => {
     setNewCategoryName('');
     setEditingCategoryId(null);
+    setCategoryListTab('active');
     setActiveForm('manage_categories');
   };
 
@@ -134,22 +219,15 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     }
   };
 
-  // Note: no UI entry point currently triggers this (the delete-category button
-  // is disabled below) and there is no backend delete endpoint for categories;
-  // kept as a local-only no-op guard for when/if that UI is re-enabled.
-  const handleConfirmDeleteCategory = () => {
-    const categoryId = deleteCategoryConfirmId;
-    const category = data.categories.find(c => c.id === categoryId);
-    if (!category) { setDeleteCategoryConfirmId(null); return; }
-
-    const productsInCategory = data.products.filter(p => p.category === category.name).length;
-    if (productsInCategory > 0) {
-      setDeleteCategoryConfirmId(null);
-      showAlert(`Cannot delete "${category.name}": ${productsInCategory} product(s) still use this category. Move or delete those products first.`);
-      return;
+  const handleToggleCategoryStatus = async (category: { id: string; name: string; status: 'Active' | 'Inactive' }) => {
+    try {
+      await categoriesApi.toggleStatus(category.id);
+      await refreshData();
+      const nextStatus = category.status === 'Active' ? 'Inactive' : 'Active';
+      addNotification('product_update', `Category "${category.name}" marked ${nextStatus}.`);
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to update category status.');
     }
-
-    setDeleteCategoryConfirmId(null);
   };
 
   const handleSaveProduct = async () => {
@@ -159,16 +237,19 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     }
 
     const isNew = activeForm === 'add_product';
+    // purchase_price/wholesale_price/retail_price are local display/editing
+    // convenience only - the API stores discount %'s, not prices.
+    const { purchase_price, wholesale_price, retail_price, ...payload } = productForm;
 
     try {
       if (isNew) {
-        await productsApi.create(productForm);
+        const created = await productsApi.create(payload);
         await refreshData();
-        addNotification('product_update', `New product added to catalog: ${productForm.name}.`);
+        addNotification('product_update', `New product added to catalog: ${productForm.name}.`, 'product', created.id);
       } else {
-        await productsApi.update(selectedProduct!.id, productForm);
+        await productsApi.update(selectedProduct!.id, payload);
         await refreshData();
-        addNotification('product_update', `Catalog details updated for ${productForm.name}.`);
+        addNotification('product_update', `Catalog details updated for ${productForm.name}.`, 'product', selectedProduct!.id);
       }
       setActiveForm('list');
     } catch (e: any) {
@@ -184,10 +265,10 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     try {
       await productsApi.setStatus(productId, 'Inactive');
       await refreshData();
-      addNotification('product_update', `Product "${product.name}" was removed from the catalog.`);
+      addNotification('product_update', `Product "${product.name}" was removed from the catalog.`, 'product', product.id);
       showAlert(`${product.name} has been removed from the catalog. It's hidden from new orders/pre-bookings but can be reactivated anytime.`);
     } catch (e: any) {
-      showAlert(e.message ?? 'Unable to remove product.');
+      showAlert({ type: 'warning', message: e.message ?? 'Unable to remove product.' });
     } finally {
       setDeleteProductConfirmId(null);
     }
@@ -199,7 +280,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     try {
       await productsApi.setStatus(productId, 'Active');
       await refreshData();
-      addNotification('product_update', `Product "${product.name}" has been reactivated.`);
+      addNotification('product_update', `Product "${product.name}" has been reactivated.`, 'product', product.id);
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to reactivate product.');
     }
@@ -215,24 +296,33 @@ export default function AdminProducts({ data, setData, addNotification, currentU
 
   const handleOpenPriceUpdate = (p: Product) => {
     setSelectedProduct(p);
-    setPriceUpdateForm({ purchase_price: p.purchase_price, wholesale_price: p.wholesale_price, selling_price: p.selling_price });
+    setPriceUpdateForm({
+      mrp: p.mrp, purchase_discount_pct: p.purchase_discount_pct, wholesale_discount_pct: p.wholesale_discount_pct, retail_discount_pct: p.retail_discount_pct,
+      purchase_price: p.purchase_price, wholesale_price: p.wholesale_price, retail_price: p.selling_price,
+    });
     setActiveForm('price_history');
   };
 
   const handleSavePriceUpdate = async () => {
     if (!selectedProduct) return;
+    const oldMrp = selectedProduct.mrp;
     const oldPurchase = selectedProduct.purchase_price;
     const oldWholesale = selectedProduct.wholesale_price;
     const oldSelling = selectedProduct.selling_price;
+    const newMrp = Number(priceUpdateForm.mrp);
+    const newPurchase = priceFromDiscount(newMrp, Number(priceUpdateForm.purchase_discount_pct));
+    const newWholesale = priceFromDiscount(newMrp, Number(priceUpdateForm.wholesale_discount_pct));
+    const newSelling = priceFromDiscount(newMrp, Number(priceUpdateForm.retail_discount_pct));
 
     try {
       await productsApi.updatePrice(selectedProduct.id, {
-        purchase_price: Number(priceUpdateForm.purchase_price),
-        wholesale_price: Number(priceUpdateForm.wholesale_price),
-        selling_price: Number(priceUpdateForm.selling_price),
+        mrp: newMrp,
+        purchase_discount_pct: Number(priceUpdateForm.purchase_discount_pct),
+        wholesale_discount_pct: Number(priceUpdateForm.wholesale_discount_pct),
+        retail_discount_pct: Number(priceUpdateForm.retail_discount_pct),
       });
       await refreshData();
-      addNotification('product_update', `${selectedProduct.name} price changed: purchase Rs${oldPurchase.toFixed(2)} to Rs${Number(priceUpdateForm.purchase_price).toFixed(2)}, wholesale Rs${oldWholesale.toFixed(2)} to Rs${Number(priceUpdateForm.wholesale_price).toFixed(2)}, selling Rs${oldSelling.toFixed(2)} to Rs${Number(priceUpdateForm.selling_price).toFixed(2)}.`);
+      addNotification('product_update', `${selectedProduct.name} price changed: MRP Rs${oldMrp.toFixed(2)} to Rs${newMrp.toFixed(2)} (purchase Rs${oldPurchase.toFixed(2)} to Rs${newPurchase.toFixed(2)}, wholesale Rs${oldWholesale.toFixed(2)} to Rs${newWholesale.toFixed(2)}, selling Rs${oldSelling.toFixed(2)} to Rs${newSelling.toFixed(2)}).`, 'product', selectedProduct.id);
       showAlert('Active prices updated successfully and logged in audit history.');
       setActiveForm('list');
     } catch (e: any) {
@@ -261,8 +351,9 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             </View>
             {activeScreen !== 'Pricing' && (
               <>
-                <Pressable onPress={handleOpenManageCategories} className="bg-slate-800 p-2.5 rounded-xl active:bg-slate-900">
-                  <Tag size={20} color="#fff" />
+                <Pressable onPress={handleOpenManageCategories} className="bg-slate-800 px-3 py-2.5 rounded-xl flex-row items-center gap-1.5 active:bg-slate-900">
+                  <Tag size={16} color="#fff" />
+                  <Text className="text-white font-bold text-xs">Categories</Text>
                 </Pressable>
                 <Pressable onPress={handleOpenAddProduct} className="bg-rose-500 p-2.5 rounded-xl active:bg-rose-600">
                   <Plus size={20} color="#fff" />
@@ -270,6 +361,25 @@ export default function AdminProducts({ data, setData, addNotification, currentU
               </>
             )}
           </View>
+
+          <FilterBar hideSearch>
+            {activeScreen !== 'Pricing' && (
+              <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
+                <Pressable onPress={() => setCatalogTab('active')} className={`py-1.5 px-3 rounded-lg items-center justify-center ${catalogTab === 'active' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-extrabold ${catalogTab === 'active' ? 'text-white' : 'text-slate-500'}`}>Catalog</Text>
+                </Pressable>
+                <Pressable onPress={() => setCatalogTab('deleted')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${catalogTab === 'deleted' ? 'bg-indigo-600' : ''}`}>
+                  <RotateCcw size={13} color={catalogTab === 'deleted' ? '#ffffff' : '#64748b'} />
+                  <Text className={`text-[10px] font-extrabold ${catalogTab === 'deleted' ? 'text-white' : 'text-slate-500'}`}>Deleted Products</Text>
+                  {deletedProductsCount > 0 && (
+                    <View className="bg-red-500 rounded-full px-1.5 py-0.5">
+                      <Text className="text-white font-extrabold text-[8px]">{deletedProductsCount}</Text>
+                    </View>
+                  )}
+                </Pressable>
+              </View>
+            )}
+          </FilterBar>
 
           <ScrollView horizontal showsHorizontalScrollIndicator={false} className="gap-1.5">
             <View className="flex-row gap-1.5">
@@ -300,12 +410,19 @@ export default function AdminProducts({ data, setData, addNotification, currentU
 
           <View className="gap-3">
             <View className="flex-row items-center gap-3">
-              <Image source={{ uri: productForm.image_url }} className="w-16 h-16 rounded-xl bg-slate-100" />
-              <View>
-                <Pressable onPress={handlePickProductImage} className="py-1.5 px-2.5 bg-slate-100 rounded-lg active:bg-slate-200">
-                  <Text className="text-slate-700 font-bold text-xs">Choose Photo from Gallery</Text>
-                </Pressable>
-                <Text className="text-[9px] text-slate-400 mt-1">JPG/PNG, cropped to a square</Text>
+              <ProductImage uri={productForm.image_url} className="w-16 h-16 rounded-xl bg-slate-100" iconSize={28} />
+              <View className="gap-1.5">
+                <View className="flex-row gap-1.5">
+                  <Pressable onPress={handlePickProductImage} className="py-1.5 px-2.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                    <Text className="text-slate-700 font-bold text-xs">Choose Photo from Gallery</Text>
+                  </Pressable>
+                  {!!productForm.image_url && (
+                    <Pressable onPress={() => setProductForm({ ...productForm, image_url: '' })} className="py-1.5 px-2.5 bg-rose-50 border border-rose-100 rounded-lg active:bg-rose-100">
+                      <Text className="text-rose-600 font-bold text-xs">Remove Photo</Text>
+                    </Pressable>
+                  )}
+                </View>
+                <Text className="text-[9px] text-slate-400">JPG/PNG, cropped to a square</Text>
               </View>
             </View>
 
@@ -326,7 +443,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                 {data.categories.length === 0 && (
                   <Text className="text-[10px] text-slate-400 italic">No categories yet — manage categories from the catalog page.</Text>
                 )}
-                {data.categories.map(cat => (
+                {data.categories.filter(cat => cat.status === 'Active' || cat.name === productForm.category).map(cat => (
                   <Pressable key={cat.id} onPress={() => setProductForm({ ...productForm, category: cat.name })} className={`py-1.5 px-3 rounded-lg ${productForm.category === cat.name ? 'bg-slate-800' : 'bg-slate-50 border border-slate-200'}`}>
                     <Text className={`text-[10px] font-bold ${productForm.category === cat.name ? 'text-white' : 'text-slate-600'}`}>{cat.name}</Text>
                   </Pressable>
@@ -356,7 +473,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
               <View className="flex-row gap-2">
                 <TextInput
                   keyboardType="decimal-pad"
-                  value={String(productForm.unit_value)}
+                  value={productForm.unit_value === 0 ? '' : String(productForm.unit_value)}
                   onChangeText={v => setProductForm({ ...productForm, unit_value: Number(v) || 0 })}
                   className={inputClass + ' flex-1'}
                   placeholder="e.g. 100"
@@ -374,23 +491,45 @@ export default function AdminProducts({ data, setData, addNotification, currentU
 
             <View className="flex-row gap-2">
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Purchase (Rs)</Text>
-                <TextInput keyboardType="decimal-pad" value={String(productForm.purchase_price)} onChangeText={v => setProductForm({ ...productForm, purchase_price: Number(v) || 0 })} className={inputClass} />
+                <Text className="font-bold text-slate-500 mb-1 text-xs">MRP (Rs)</Text>
+                <TextInput keyboardType="decimal-pad" value={productForm.mrp === 0 ? '' : String(productForm.mrp)} onChangeText={v => updateProductFormMrp(Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
               </View>
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Wholesale (Rs)</Text>
-                <TextInput keyboardType="decimal-pad" value={String(productForm.wholesale_price)} onChangeText={v => setProductForm({ ...productForm, wholesale_price: Number(v) || 0 })} className={inputClass} />
+                <Text className="font-bold text-slate-500 mb-1 text-xs">GST/Tax %</Text>
+                <TextInput keyboardType="decimal-pad" value={productForm.tax_pct === 0 ? '' : String(productForm.tax_pct)} onChangeText={v => setProductForm({ ...productForm, tax_pct: Number(v) || 0 })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
               </View>
             </View>
             <View className="flex-row gap-2">
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Selling (Rs)</Text>
-                <TextInput keyboardType="decimal-pad" value={String(productForm.selling_price)} onChangeText={v => setProductForm({ ...productForm, selling_price: Number(v) || 0 })} className={inputClass} />
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Purchase Discount (%)</Text>
+                <TextInput keyboardType="decimal-pad" value={productForm.purchase_discount_pct === 0 ? '' : String(productForm.purchase_discount_pct)} onChangeText={v => updateProductFormPct('purchase', parseDiscountPct(v))} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
               </View>
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">GST/Tax %</Text>
-                <TextInput keyboardType="decimal-pad" value={String(productForm.tax_pct)} onChangeText={v => setProductForm({ ...productForm, tax_pct: Number(v) || 0 })} className={inputClass} />
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Wholesale Discount (%)</Text>
+                <TextInput keyboardType="decimal-pad" value={productForm.wholesale_discount_pct === 0 ? '' : String(productForm.wholesale_discount_pct)} onChangeText={v => updateProductFormPct('wholesale', parseDiscountPct(v))} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
               </View>
+              {retailEnabled && (
+                <View className="flex-1">
+                  <Text className="font-bold text-slate-500 mb-1 text-xs">Retail/Selling Discount (%)</Text>
+                  <TextInput keyboardType="decimal-pad" value={productForm.retail_discount_pct === 0 ? '' : String(productForm.retail_discount_pct)} onChangeText={v => updateProductFormPct('retail', parseDiscountPct(v))} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
+                </View>
+              )}
+            </View>
+            <View className="flex-row gap-2 bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+              <View className="flex-1">
+                <Text className="text-slate-400 text-[9px] font-bold uppercase">Purchase Price (Rs)</Text>
+                <TextInput keyboardType="decimal-pad" value={productForm.purchase_price === 0 ? '' : String(productForm.purchase_price)} onChangeText={v => updateProductFormPrice('purchase', Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-1.5 font-extrabold text-slate-700 text-xs" />
+              </View>
+              <View className="flex-1">
+                <Text className="text-slate-400 text-[9px] font-bold uppercase">Wholesale Price (Rs)</Text>
+                <TextInput keyboardType="decimal-pad" value={productForm.wholesale_price === 0 ? '' : String(productForm.wholesale_price)} onChangeText={v => updateProductFormPrice('wholesale', Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-1.5 font-extrabold text-emerald-600 text-xs" />
+              </View>
+              {retailEnabled && (
+                <View className="flex-1">
+                  <Text className="text-slate-400 text-[9px] font-bold uppercase">Selling Price (Rs)</Text>
+                  <TextInput keyboardType="decimal-pad" value={productForm.retail_price === 0 ? '' : String(productForm.retail_price)} onChangeText={v => updateProductFormPrice('retail', Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-1.5 font-extrabold text-rose-500 text-xs" />
+                </View>
+              )}
             </View>
 
             <View>
@@ -426,19 +565,41 @@ export default function AdminProducts({ data, setData, addNotification, currentU
 
           <View className="bg-slate-50 p-3 rounded-xl border border-slate-100 gap-3">
             <Text className="font-bold text-slate-800 text-xs">Active Current Price Parameters (Instant Update)</Text>
+            <View className="flex-1">
+              <Text className="font-bold text-slate-500 mb-1 text-xs">MRP (Rs)</Text>
+              <TextInput keyboardType="decimal-pad" value={priceUpdateForm.mrp === 0 ? '' : String(priceUpdateForm.mrp)} onChangeText={v => updatePriceUpdateFormMrp(Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-slate-800 text-xs" />
+            </View>
             <View className="flex-row gap-3">
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Purchase Cost (Rs)</Text>
-                <TextInput keyboardType="decimal-pad" value={String(priceUpdateForm.purchase_price)} onChangeText={v => setPriceUpdateForm({ ...priceUpdateForm, purchase_price: Number(v) || 0 })} className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-slate-700 text-xs" />
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Purchase Discount (%)</Text>
+                <TextInput keyboardType="decimal-pad" value={priceUpdateForm.purchase_discount_pct === 0 ? '' : String(priceUpdateForm.purchase_discount_pct)} onChangeText={v => updatePriceUpdateFormPct('purchase', parseDiscountPct(v))} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-slate-700 text-xs" />
               </View>
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Wholesale Price (Rs)</Text>
-                <TextInput keyboardType="decimal-pad" value={String(priceUpdateForm.wholesale_price)} onChangeText={v => setPriceUpdateForm({ ...priceUpdateForm, wholesale_price: Number(v) || 0 })} className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-emerald-600 text-xs" />
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Wholesale Discount (%)</Text>
+                <TextInput keyboardType="decimal-pad" value={priceUpdateForm.wholesale_discount_pct === 0 ? '' : String(priceUpdateForm.wholesale_discount_pct)} onChangeText={v => updatePriceUpdateFormPct('wholesale', parseDiscountPct(v))} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-emerald-600 text-xs" />
+              </View>
+              {retailEnabled && (
+                <View className="flex-1">
+                  <Text className="font-bold text-slate-500 mb-1 text-xs">Retail/Selling Discount (%)</Text>
+                  <TextInput keyboardType="decimal-pad" value={priceUpdateForm.retail_discount_pct === 0 ? '' : String(priceUpdateForm.retail_discount_pct)} onChangeText={v => updatePriceUpdateFormPct('retail', parseDiscountPct(v))} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-indigo-600 text-xs" />
+                </View>
+              )}
+            </View>
+            <View className="flex-row gap-3 bg-white border border-slate-200 rounded-xl p-2.5">
+              <View className="flex-1">
+                <Text className="text-slate-400 text-[9px] font-bold uppercase">Purchase Price (Rs)</Text>
+                <TextInput keyboardType="decimal-pad" value={priceUpdateForm.purchase_price === 0 ? '' : String(priceUpdateForm.purchase_price)} onChangeText={v => updatePriceUpdateFormPrice('purchase', Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-slate-50 border border-slate-200 rounded-lg p-1.5 font-extrabold text-slate-700 text-xs" />
               </View>
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Selling Price (Rs)</Text>
-                <TextInput keyboardType="decimal-pad" value={String(priceUpdateForm.selling_price)} onChangeText={v => setPriceUpdateForm({ ...priceUpdateForm, selling_price: Number(v) || 0 })} className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-indigo-600 text-xs" />
+                <Text className="text-slate-400 text-[9px] font-bold uppercase">Wholesale Price (Rs)</Text>
+                <TextInput keyboardType="decimal-pad" value={priceUpdateForm.wholesale_price === 0 ? '' : String(priceUpdateForm.wholesale_price)} onChangeText={v => updatePriceUpdateFormPrice('wholesale', Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-slate-50 border border-slate-200 rounded-lg p-1.5 font-extrabold text-emerald-600 text-xs" />
               </View>
+              {retailEnabled && (
+                <View className="flex-1">
+                  <Text className="text-slate-400 text-[9px] font-bold uppercase">Selling Price (Rs)</Text>
+                  <TextInput keyboardType="decimal-pad" value={priceUpdateForm.retail_price === 0 ? '' : String(priceUpdateForm.retail_price)} onChangeText={v => updatePriceUpdateFormPrice('retail', Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-slate-50 border border-slate-200 rounded-lg p-1.5 font-extrabold text-indigo-600 text-xs" />
+                </View>
+              )}
             </View>
             <Pressable onPress={handleSavePriceUpdate} className="w-full py-2 bg-emerald-600 rounded-xl items-center active:bg-emerald-700">
               <Text className="text-white font-bold text-[11px]">Update Instantly</Text>
@@ -466,7 +627,9 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             )}
           </View>
         </View>
-      ) : activeForm === 'manage_categories' ? (
+      ) : activeForm === 'manage_categories' ? (() => {
+        const visibleCategories = data.categories.filter(c => (categoryListTab === 'inactive' ? c.status === 'Inactive' : c.status === 'Active'));
+        return (
         <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-4 w-full lg:max-w-4xl lg:self-center">
           <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
             <Text className="font-extrabold text-slate-800 text-sm">Manage Categories</Text>
@@ -488,8 +651,23 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             </Pressable>
           </View>
 
+          <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
+            <Pressable onPress={() => setCategoryListTab('active')} className={`py-1.5 px-3 rounded-lg items-center justify-center ${categoryListTab === 'active' ? 'bg-indigo-600' : ''}`}>
+              <Text className={`text-[10px] font-extrabold ${categoryListTab === 'active' ? 'text-white' : 'text-slate-500'}`}>Active</Text>
+            </Pressable>
+            <Pressable onPress={() => setCategoryListTab('inactive')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${categoryListTab === 'inactive' ? 'bg-indigo-600' : ''}`}>
+              <RotateCcw size={13} color={categoryListTab === 'inactive' ? '#ffffff' : '#64748b'} />
+              <Text className={`text-[10px] font-extrabold ${categoryListTab === 'inactive' ? 'text-white' : 'text-slate-500'}`}>Inactive</Text>
+              {inactiveCategoriesCount > 0 && (
+                <View className="bg-red-500 rounded-full px-1.5 py-0.5">
+                  <Text className="text-white font-extrabold text-[8px]">{inactiveCategoriesCount}</Text>
+                </View>
+              )}
+            </Pressable>
+          </View>
+
           <View className="gap-2 md:flex-row md:flex-wrap">
-            {data.categories.map(cat => {
+            {visibleCategories.map(cat => {
               const productCount = data.products.filter(p => p.category === cat.name).length;
               const isEditing = editingCategoryId === cat.id;
               return (
@@ -515,22 +693,98 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                         <Text className="font-bold text-slate-800 text-xs">{cat.name}</Text>
                         <Text className="text-[9px] text-slate-400">{productCount} product{productCount === 1 ? '' : 's'}</Text>
                       </View>
-                      <Pressable onPress={() => handleStartEditCategory(cat.id, cat.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
-                        <Edit size={14} color="#475569" />
+                      {cat.status === 'Active' && (
+                        <Pressable onPress={() => handleStartEditCategory(cat.id, cat.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                          <Edit size={14} color="#475569" />
+                        </Pressable>
+                      )}
+                      <Pressable onPress={() => handleToggleCategoryStatus(cat)} className={`p-1.5 rounded-lg ${cat.status === 'Active' ? 'bg-rose-50 active:bg-rose-100' : 'bg-emerald-50 active:bg-emerald-100'}`}>
+                        {cat.status === 'Active' ? <Trash2 size={14} color="#e11d48" /> : <RotateCcw size={14} color="#059669" />}
                       </Pressable>
-                      {/* <Pressable onPress={() => setDeleteCategoryConfirmId(cat.id)} className="p-1.5 bg-rose-50 rounded-lg active:bg-rose-100">
-                        <Trash2 size={14} color="#e11d48" />
-                      </Pressable> */}
                     </>
                   )}
                 </View>
               );
             })}
-            {data.categories.length === 0 && (
-              <Text className="text-[10px] text-slate-400 italic py-2 text-center">No categories yet. Add one above.</Text>
+            {visibleCategories.length === 0 && (
+              <Text className="text-[10px] text-slate-400 italic py-2 text-center">
+                {categoryListTab === 'inactive' ? 'No inactive categories.' : 'No categories yet. Add one above.'}
+              </Text>
             )}
           </View>
         </View>
+        );
+      })() : viewMode === 'table' ? (
+        <DataTable
+          data={filteredProducts}
+          keyExtractor={p => p.id}
+          emptyText={catalogTab === 'deleted' ? 'No deleted products. Anything you remove from the catalog will show up here for restoring.' : 'No ice cream products found matching the filters.'}
+          columns={([
+            {
+              key: 'name', label: 'Product', width: 220,
+              render: (p: Product) => (
+                <View className="flex-row items-center gap-2">
+                  <ProductImage uri={p.image_url} className="w-8 h-8 rounded-lg bg-slate-50 flex-shrink-0" iconSize={16} />
+                  <View className="flex-1 min-w-0">
+                    <View className="flex-row items-center gap-1">
+                      <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{p.name}</Text>
+                      {p.status === 'Inactive' && <Text className="text-[8px] bg-red-50 font-black px-1 rounded text-red-600 uppercase">Inactive</Text>}
+                    </View>
+                    <Text className="text-[9px] text-slate-400" numberOfLines={1}>{p.code}</Text>
+                  </View>
+                </View>
+              ),
+            },
+            { key: 'category', label: 'Category', width: 110, render: (p: Product) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{p.category}</Text> },
+            { key: 'brand', label: 'Brand', width: 110, render: (p: Product) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{p.brand}</Text> },
+            { key: 'unit', label: 'Unit', width: 70, render: (p: Product) => <Text className="text-[10px] text-slate-600">{p.unit_value}{p.unit_type}</Text> },
+            { key: 'mrp', label: 'MRP', width: 80, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-bold text-slate-700 text-right">Rs{p.mrp.toFixed(2)}</Text> },
+            { key: 'purchase', label: 'Purchase', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-semibold text-slate-600 text-right">Rs{p.purchase_price.toFixed(2)}</Text> },
+            { key: 'wholesale', label: 'Wholesale', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-semibold text-emerald-600 text-right">Rs{p.wholesale_price.toFixed(2)}</Text> },
+            ...(retailEnabled ? [{ key: 'selling', label: 'Selling', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-extrabold text-rose-500 text-right">Rs{p.selling_price.toFixed(2)}</Text> }] : []),
+            {
+              key: 'stock', label: 'Stock', width: 100,
+              render: (p: Product) => {
+                const wh = data.warehouse_inventory.find(i => i.product_id === p.id);
+                const qty = wh ? wh.available_qty : 0;
+                const isOut = qty === 0;
+                const isLow = qty > 0 && qty <= 100;
+                return (
+                  <Text className={`text-[8px] font-extrabold px-1.5 py-0.5 rounded-md uppercase self-start ${isOut ? 'bg-red-100 text-red-600' : isLow ? 'bg-amber-100 text-amber-600' : 'bg-emerald-50 text-emerald-600'}`}>
+                    {isOut ? 'Out of Stock' : isLow ? 'Low Stock' : 'In Stock'}
+                  </Text>
+                );
+              },
+            },
+            {
+              key: 'actions', label: 'Actions', width: 100, grow: false,
+              render: (p: Product) => (
+                <View className="flex-row items-center gap-1.5">
+                  {activeScreen === 'Pricing' ? (
+                    <Pressable onPress={() => handleOpenPriceUpdate(p)} className="p-1.5 bg-indigo-50 rounded-lg active:bg-indigo-100">
+                      <DollarSign size={14} color="#4f46e5" />
+                    </Pressable>
+                  ) : (
+                    <>
+                      <Pressable onPress={() => handleOpenEditProduct(p)} className="p-1.5 bg-slate-50 rounded-lg active:bg-slate-100">
+                        <Edit size={14} color="#475569" />
+                      </Pressable>
+                      {p.status === 'Inactive' ? (
+                        <Pressable onPress={() => handleReactivateProduct(p.id)} className="p-1.5 bg-emerald-50 rounded-lg active:bg-emerald-100">
+                          <RotateCcw size={14} color="#059669" />
+                        </Pressable>
+                      ) : (
+                        <Pressable onPress={() => setDeleteProductConfirmId(p.id)} className="p-1.5 bg-rose-50 rounded-lg active:bg-rose-100">
+                          <Trash2 size={14} color="#e11d48" />
+                        </Pressable>
+                      )}
+                    </>
+                  )}
+                </View>
+              ),
+            },
+          ]) as DataTableColumn<Product>[]}
+        />
       ) : (
         <View className="gap-3 md:flex-row md:flex-wrap">
           {filteredProducts.map(p => {
@@ -541,41 +795,51 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             const isInactive = p.status === 'Inactive';
 
             return (
-              <View key={p.id} className={`w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row gap-3 ${isInactive ? 'opacity-60' : ''}`}>
-                <Image source={{ uri: p.image_url }} className="w-16 h-16 rounded-xl bg-slate-50" />
-                <View className="flex-1">
-                  <View className="flex-row items-start justify-between gap-1">
-                    <Text className="font-bold text-slate-800 text-xs flex-1" numberOfLines={1}>{p.name}</Text>
-                    <View className="flex-row items-center gap-1">
+              <View key={p.id} className={`w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-start gap-3 ${isInactive ? 'opacity-60' : ''}`}>
+                <ProductImage uri={p.image_url} className="w-16 h-16 rounded-xl bg-slate-50 flex-shrink-0" iconSize={28} />
+                <View className="flex-1 gap-1.5 min-w-0">
+                  <View className="flex-row items-center justify-between gap-2">
+                    <Text className="font-bold text-slate-800 text-xs flex-1 min-w-0" numberOfLines={1}>{p.name}</Text>
+                    <View className="flex-row items-center gap-1 flex-shrink-0">
                       {isInactive && <Text className="text-[9px] bg-red-50 font-black px-1.5 py-0.5 rounded text-red-600 uppercase">Inactive</Text>}
                       <Text className="text-[9px] bg-slate-100 font-bold px-1.5 py-0.5 rounded text-slate-400 uppercase">{p.code}</Text>
                     </View>
                   </View>
-                  <Text className="text-[10px] text-slate-400 mt-0.5">{p.brand} - {p.category} - {p.unit_value}{p.unit_type}</Text>
-                  <View className="flex-row items-center justify-between mt-2 pt-1.5 border-t border-slate-50">
-                    <View className="flex-row gap-3">
-                      <View>
-                        <Text className="text-slate-400 text-[9px]">Purchase Cost</Text>
-                        <Text className="font-semibold text-slate-600 text-[10px]">Rs {p.purchase_price.toFixed(2)}</Text>
+
+                  <Text className="text-[10px] text-slate-400" numberOfLines={1}>{p.brand} - {p.category} - {p.unit_value}{p.unit_type}</Text>
+
+                  <View className="pt-1.5 border-t border-slate-50 gap-1.5">
+                 
+                    <View className="flex-row justify-between">
+                      <View className="flex-1 items-start">
+                        <Text className="text-slate-400 text-[9px]" numberOfLines={1}>Purchase</Text>
+                        <Text className="font-semibold text-slate-600 text-[10px]" numberOfLines={1}>Rs {p.purchase_price.toFixed(2)}</Text>
                       </View>
-                      <View>
-                        <Text className="text-slate-400 text-[9px]">Wholesale Price</Text>
-                        <Text className="font-semibold text-emerald-600 text-[10px]">Rs {p.wholesale_price.toFixed(2)}</Text>
+                      <View className={`flex-1 ${retailEnabled ? 'items-center' : 'items-end'}`}>
+                        <Text className="text-slate-400 text-[9px]" numberOfLines={1}>Wholesale</Text>
+                        <Text className="font-semibold text-emerald-600 text-[10px]" numberOfLines={1}>Rs {p.wholesale_price.toFixed(2)}</Text>
                       </View>
-                      <View>
-                        <Text className="text-slate-400 text-[9px]">Selling Price</Text>
-                        <Text className="font-extrabold text-rose-500 text-[10px]">Rs {p.selling_price.toFixed(2)}</Text>
-                      </View>
-                    </View>
-                    <View className="flex-row items-center gap-1.5">
-                      {isOut ? (
-                        <Text className="text-[9px] bg-red-100 text-red-600 font-extrabold px-1.5 py-0.5 rounded-md">OOS</Text>
-                      ) : isLow ? (
-                        <Text className="text-[9px] bg-amber-100 text-amber-600 font-extrabold px-1.5 py-0.5 rounded-md">LOW</Text>
-                      ) : (
-                        <Text className="text-[9px] bg-emerald-50 text-emerald-600 font-extrabold px-1.5 py-0.5 rounded-md">OK</Text>
+                      {retailEnabled && (
+                        <View className="flex-1 items-end">
+                          <Text className="text-slate-400 text-[9px]" numberOfLines={1}>Selling</Text>
+                          <Text className="font-extrabold text-rose-500 text-[10px]" numberOfLines={1}>Rs {p.selling_price.toFixed(2)}</Text>
+                        </View>
                       )}
-                      {activeScreen === 'Pricing' && (
+                    </View>
+
+                    <View className="flex-row items-center justify-between gap-1.5">
+                         <View className="flex-row items-center justify-between gap-2">
+                      <Text className="text-[9px] font-bold text-slate-500 flex-shrink-0">MRP Rs{p.mrp.toFixed(2)}</Text>
+                      {isOut ? (
+                        <Text className="text-[8px] bg-red-100 text-red-600 font-extrabold px-1.5 py-0.5 rounded-md uppercase flex-shrink-0">Out of Stock (OOS)</Text>
+                      ) : isLow ? (
+                        <Text className="text-[8px] bg-amber-100 text-amber-600 font-extrabold px-1.5 py-0.5 rounded-md uppercase flex-shrink-0">Low Stock</Text>
+                      ) : (
+                        <Text className="text-[8px] bg-emerald-50 text-emerald-600 font-extrabold px-1.5 py-0.5 rounded-md uppercase flex-shrink-0">In Stock</Text>
+                      )}
+                    </View>
+                     <View className="flex-row items-center justify-between gap-2 mt-1">
+                       {activeScreen === 'Pricing' && (
                         <Pressable onPress={() => handleOpenPriceUpdate(p)} className="p-1.5 bg-indigo-50 rounded-lg active:bg-indigo-100">
                           <DollarSign size={14} color="#4f46e5" />
                         </Pressable>
@@ -596,6 +860,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                           )}
                         </>
                       )}
+                     </View>
                     </View>
                   </View>
                 </View>
@@ -605,7 +870,9 @@ export default function AdminProducts({ data, setData, addNotification, currentU
 
           {filteredProducts.length === 0 && (
             <View className="py-8 items-center bg-white rounded-2xl border border-slate-100">
-              <Text className="text-xs text-slate-400">No ice cream products found matching the filters.</Text>
+              <Text className="text-xs text-slate-400">
+                {catalogTab === 'deleted' ? 'No deleted products. Anything you remove from the catalog will show up here for restoring.' : 'No ice cream products found matching the filters.'}
+              </Text>
             </View>
           )}
         </View>
@@ -620,17 +887,6 @@ export default function AdminProducts({ data, setData, addNotification, currentU
         confirmLabel="Yes, Remove"
         cancelLabel="No, Keep"
         onConfirm={handleConfirmDeleteProduct}
-      />
-
-      <ConfirmModal
-        visible={!!deleteCategoryConfirmId}
-        onClose={() => setDeleteCategoryConfirmId(null)}
-        icon={AlertTriangle}
-        title="Confirm Category Deletion"
-        message={`Are you sure you want to delete "${data.categories.find(c => c.id === deleteCategoryConfirmId)?.name || 'this category'}"? This cannot be undone.`}
-        confirmLabel="Yes, Delete"
-        cancelLabel="No, Keep"
-        onConfirm={handleConfirmDeleteCategory}
       />
     </View>
   );

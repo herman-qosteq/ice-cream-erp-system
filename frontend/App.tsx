@@ -6,6 +6,8 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { LogOut, X, Bell } from 'lucide-react-native';
 import { AppProvider, useAppContext } from './src/context/AppContext';
 import { AppAlertProvider, useAppAlert } from './src/context/AppAlertContext';
+import { ViewModeProvider } from './src/context/ViewModeContext';
+import { ScrollResetProvider } from './src/context/ScrollResetContext';
 import RoleSelectScreen from './src/screens/RoleSelectScreen';
 import AdminFlow from './src/screens/admin/AdminFlow';
 import SalespersonFlow from './src/screens/salesperson/SalespersonFlow';
@@ -146,7 +148,11 @@ export default function App() {
           <StatusBar barStyle="dark-content" />
           <AppProvider>
             <AppAlertProvider>
-              <AppRouter />
+              <ViewModeProvider>
+                <ScrollResetProvider>
+                  <AppRouter />
+                </ScrollResetProvider>
+              </ViewModeProvider>
             </AppAlertProvider>
           </AppProvider>
         </SafeAreaView>

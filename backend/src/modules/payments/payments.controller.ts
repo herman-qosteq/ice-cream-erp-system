@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import * as paymentsService from './payments.service';
 import { ApiError } from '../../utils/ApiError';
+import { isPaginationRequested } from '../../utils/pagination';
 
 const paymentSchema = z.object({
   store_id: z.string().min(1),
@@ -11,7 +12,11 @@ const paymentSchema = z.object({
 });
 
 export async function list(req: Request, res: Response) {
-  res.json(await paymentsService.listPayments());
+  if (isPaginationRequested(req.query)) {
+    res.json(await paymentsService.listPaymentsPaged(req.query));
+  } else {
+    res.json(await paymentsService.listPayments());
+  }
 }
 
 export async function create(req: Request, res: Response) {

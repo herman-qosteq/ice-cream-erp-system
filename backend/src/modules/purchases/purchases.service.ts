@@ -1,6 +1,9 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { logAudit } from '../../lib/audit';
 import { num, dateOnly } from '../../utils/serialize';
+import { ApiError } from '../../utils/ApiError';
+import { parsePageParams, parseDateRangeParams, containsInsensitive, buildPagedResult } from '../../utils/pagination';
 
 interface PurchaseItemInput {
   product_id: string;
@@ -12,6 +15,7 @@ interface PurchaseItemInput {
 
 function serializePurchase(p: {
   id: string; supplier_id: string; invoice_number: string; date: Date;
+  bill_file_url?: string | null; bill_file_name?: string | null; bill_file_type?: string | null;
   items: { product_id: string; quantity: number; purchase_price: any; mfg_date: Date | null; expiry_date: Date | null }[];
 }) {
   return {
@@ -19,6 +23,9 @@ function serializePurchase(p: {
     supplier_id: p.supplier_id,
     invoice_number: p.invoice_number,
     date: dateOnly(p.date),
+    bill_file_url: p.bill_file_url ?? undefined,
+    bill_file_name: p.bill_file_name ?? undefined,
+    bill_file_type: p.bill_file_type ?? undefined,
     items: p.items.map(i => ({
       product_id: i.product_id,
       quantity: i.quantity,
@@ -34,7 +41,48 @@ export async function listPurchases() {
   return purchases.map(serializePurchase);
 }
 
-export async function createPurchase(input: { supplier_id: string; invoice_number: string; date: string; items: PurchaseItemInput[] }, actorId: string) {
+function buildPurchasesWhere(query: Record<string, unknown>): Prisma.PurchaseWhereInput {
+  const { from, to } = parseDateRangeParams(query);
+  const and: Prisma.PurchaseWhereInput[] = [];
+  if (from || to) and.push({ date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } });
+
+  const supplierId = typeof query.supplier_id === 'string' ? query.supplier_id.trim() : '';
+  if (supplierId) and.push({ supplier_id: supplierId });
+
+  const search = typeof query.search === 'string' ? query.search.trim() : '';
+  if (search) {
+    and.push({
+      OR: [
+        { invoice_number: containsInsensitive(search) },
+        { supplier: { name: containsInsensitive(search) } },
+      ],
+    });
+  }
+
+  return and.length ? { AND: and } : {};
+}
+
+export async function listPurchasesPaged(query: Record<string, unknown>) {
+  const { page, pageSize, skip, take } = parsePageParams(query);
+  const where = buildPurchasesWhere(query);
+  const [rows, total] = await Promise.all([
+    prisma.purchase.findMany({ where, include: { items: true }, orderBy: { date: 'desc' }, skip, take }),
+    prisma.purchase.count({ where }),
+  ]);
+  return buildPagedResult(rows.map(serializePurchase), total, page, pageSize);
+}
+
+export async function createPurchase(
+  input: {
+    supplier_id: string; invoice_number: string; date: string; items: PurchaseItemInput[];
+    bill_file_url?: string; bill_file_name?: string; bill_file_type?: string;
+    // Set when Receive Stock was pre-filled from a saved Purchase Order Excel
+    // request - marks that request Fulfilled and links it to the resulting
+    // Purchase, so it drops off the Pending list.
+    source_request_id?: string;
+  },
+  actorId: string
+) {
   const supplier = await prisma.supplier.findUnique({ where: { id: input.supplier_id } });
   const supplierName = supplier?.name ?? 'Supplier';
   const totalUnits = input.items.reduce((sum, i) => sum + Number(i.quantity), 0);
@@ -45,6 +93,9 @@ export async function createPurchase(input: { supplier_id: string; invoice_numbe
         supplier_id: input.supplier_id,
         invoice_number: input.invoice_number,
         date: new Date(input.date),
+        bill_file_url: input.bill_file_url,
+        bill_file_name: input.bill_file_name,
+        bill_file_type: input.bill_file_type,
         items: {
           create: input.items.map(i => ({
             product_id: i.product_id,
@@ -66,9 +117,49 @@ export async function createPurchase(input: { supplier_id: string; invoice_numbe
       });
     }
 
+    if (input.source_request_id) {
+      await tx.purchaseOrderRequest.update({
+        where: { id: input.source_request_id },
+        data: { status: 'Fulfilled', fulfilled_purchase_id: created.id },
+      });
+    }
+
     return created;
   });
 
   await logAudit({ action: 'STOCK_RECEIVE', entity_type: 'Warehouse', entity_id: purchase.id, user_id: actorId, details: `Received inward cargo of ${totalUnits} items from ${supplierName}` });
   return serializePurchase(purchase);
+}
+
+// Lets a wrongly-attached supplier bill (uploaded the wrong photo/PDF/Excel)
+// be removed or swapped for the correct one after the receipt was already
+// confirmed - passing nulls clears the attachment, non-null values replace it.
+export async function updatePurchaseBillFile(
+  id: string,
+  input: { bill_file_url: string | null; bill_file_name: string | null; bill_file_type: string | null },
+  actorId: string
+) {
+  const existing = await prisma.purchase.findUnique({ where: { id } });
+  if (!existing) throw ApiError.notFound('Purchase not found.');
+
+  const updated = await prisma.purchase.update({
+    where: { id },
+    data: {
+      bill_file_url: input.bill_file_url,
+      bill_file_name: input.bill_file_name,
+      bill_file_type: input.bill_file_type,
+    },
+    include: { items: true },
+  });
+
+  await logAudit({
+    action: input.bill_file_url ? 'PURCHASE_BILL_REPLACE' : 'PURCHASE_BILL_REMOVE',
+    entity_type: 'Purchase',
+    entity_id: id,
+    user_id: actorId,
+    details: input.bill_file_url
+      ? `Replaced the supplier bill attachment for invoice ${existing.invoice_number}.`
+      : `Removed the supplier bill attachment for invoice ${existing.invoice_number}.`,
+  });
+  return serializePurchase(updated);
 }

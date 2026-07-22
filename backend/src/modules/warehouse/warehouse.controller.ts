@@ -11,6 +11,15 @@ const adjustSchema = z.object({
   reason: z.string().default(''),
 });
 
+const correctSchema = z.object({
+  product_id: z.string().min(1),
+  available_qty: z.number().min(0),
+  reserved_qty: z.number().min(0),
+  damaged_qty: z.number().min(0),
+  expired_qty: z.number().min(0),
+  comment: z.string().default(''),
+});
+
 export async function listInventory(req: Request, res: Response) {
   res.json(await warehouseService.listInventory());
 }
@@ -19,4 +28,10 @@ export async function adjust(req: Request, res: Response) {
   const parsed = adjustSchema.safeParse(req.body);
   if (!parsed.success) throw ApiError.badRequest(parsed.error.errors[0]?.message ?? 'Invalid request');
   res.json(await warehouseService.adjustStock(parsed.data, req.auth!.sub));
+}
+
+export async function correct(req: Request, res: Response) {
+  const parsed = correctSchema.safeParse(req.body);
+  if (!parsed.success) throw ApiError.badRequest(parsed.error.errors[0]?.message ?? 'Invalid request');
+  res.json(await warehouseService.correctStock(parsed.data, req.auth!.sub));
 }

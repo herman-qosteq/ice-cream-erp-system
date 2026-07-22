@@ -7,6 +7,15 @@ export interface User {
   status: 'Active' | 'Inactive';
 }
 
+// Admin-toggleable feature flag scoped to a role (e.g. granting Salesperson
+// access to the GST/non-GST order toggle). A role/feature pair with no row
+// is treated as disabled.
+export interface RolePermission {
+  role: 'Admin' | 'Salesperson' | 'Warehouse';
+  feature: string;
+  enabled: boolean;
+}
+
 export interface ScheduledPrice {
   id: string;
   purchase_price: number;
@@ -18,6 +27,20 @@ export interface ScheduledPrice {
 export interface Category {
   id: string;
   name: string;
+  status: 'Active' | 'Inactive';
+}
+
+export interface Area {
+  id: string;
+  name: string;
+}
+
+export interface StorePricing {
+  id: string;
+  store_id: string;
+  product_id: string;
+  wholesale_discount_pct?: number;
+  retail_discount_pct?: number;
 }
 
 export interface Product {
@@ -28,6 +51,12 @@ export interface Product {
   brand: string;
   description: string;
   image_url: string;
+  mrp: number;
+  purchase_discount_pct: number;
+  wholesale_discount_pct: number;
+  retail_discount_pct: number;
+  // Derived from mrp and the discount % fields above (computed server-side);
+  // kept here so existing screens can keep reading them directly.
   purchase_price: number;
   wholesale_price: number;
   selling_price: number;
@@ -54,6 +83,12 @@ export interface Purchase {
   supplier_id: string;
   invoice_number: string;
   date: string;
+  // The supplier's own bill/price-list sent back after packing the order -
+  // stored as a base64 data URI, since there's no object storage backend.
+  // Can be a photo, PDF, or spreadsheet; bill_file_type is a MIME type.
+  bill_file_url?: string;
+  bill_file_name?: string;
+  bill_file_type?: string;
   items: {
     product_id: string;
     quantity: number;
@@ -61,6 +96,20 @@ export interface Purchase {
     mfg_date?: string;
     expiry_date?: string;
   }[];
+}
+
+// A Purchase Order Excel generated from the Warehouse page (product list, no
+// rates) and sent to a supplier - saved so it can later pre-fill Receive
+// Stock once the supplier packs the order and sends prices back, instead of
+// retyping the same product/quantity list.
+export interface PurchaseOrderRequest {
+  id: string;
+  order_ref: string;
+  supplier_id: string;
+  status: 'Pending' | 'Fulfilled' | 'Cancelled';
+  created_at: string;
+  fulfilled_purchase_id?: string;
+  items: { product_id: string; order_case: number }[];
 }
 
 export interface WarehouseInventory {
@@ -165,6 +214,10 @@ export interface PreBookingOrder {
   items: PreBookingItem[];
   notes?: string;
   dispatched_items?: { product_id: string; quantity: number }[];
+  // Set once delivered - the real Order this booking produced. Lets the
+  // Admin-only Edit/Delete-delivered actions know there's something to
+  // operate on (older, pre-existing deliveries won't have this).
+  fulfilled_order_id?: string;
 }
 
 export interface Invoice {
@@ -174,6 +227,10 @@ export interface Invoice {
   total: number;
   tax: number;
   grand_total: number;
+  // Indian tax-invoice "Round Off": grand_total minus the exact (unrounded)
+  // total+tax. Optional because offline-queued/legacy invoices built before
+  // this field existed won't have it - treat as 0 when absent.
+  round_off?: number;
   created_at: string;
   paid_amount?: number;
   payment_status?: 'Paid' | 'Partial' | 'Unpaid' | 'Credit';
@@ -199,11 +256,18 @@ export interface CreditLedger {
   reference: string;
 }
 
+// What kind of record entity_id points at, so a notification tap knows which
+// screen to switch to and which record to open there. Absent (undefined) for
+// notification types with nothing to navigate to, e.g. 'system'.
+export type NotificationEntityType = 'order' | 'prebooking' | 'purchase' | 'store' | 'supplier' | 'product' | 'user' | 'truck';
+
 export interface AppNotification {
   id: string;
   type: 'low_stock' | 'out_of_stock' | 'expiry' | 'refill' | 'payment_due' | 'payment_received' | 'credit_exceeded'
     | 'new_order' | 'order_update' | 'delivery' | 'partner_update' | 'product_update' | 'user_update' | 'stock_update' | 'system';
   message: string;
+  entity_type?: NotificationEntityType | null;
+  entity_id?: string | null;
   is_read: boolean;
   created_at: string;
 }

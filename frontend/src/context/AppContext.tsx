@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { View, ActivityIndicator, Text } from 'react-native';
 import { ERPData, loadAllData, emptyErpData, saveSyncQueue, saveOfflineFlag, resolveActor } from '../storage';
-import { AppNotification, User } from '../types';
+import { AppNotification, NotificationEntityType, User } from '../types';
 import { authApi, notificationsApi } from '../api/endpoints';
 import { getToken, setToken, setOnSessionInvalid } from '../api/client';
 import { connectRealtime, disconnectRealtime } from '../realtime';
@@ -15,7 +15,7 @@ interface PushAlert {
 interface AppContextValue {
   data: ERPData;
   setData: (updater: ERPData | ((prev: ERPData) => ERPData)) => void;
-  addNotification: (type: AppNotification['type'], message: string) => void;
+  addNotification: (type: AppNotification['type'], message: string, entityType?: NotificationEntityType, entityId?: string) => void;
   syncQueueOffline: (action: string, payload: any) => void;
   triggerSync: () => void;
   toggleOffline: () => void;
@@ -24,7 +24,16 @@ interface AppContextValue {
   setCurrentUser: (user: User | null) => void;
   pushAlert: PushAlert | null;
   login: (identifier: string, password: string) => Promise<{ ok: boolean; error?: string }>;
-  refreshData: () => Promise<void>;
+  refreshData: () => Promise<ERPData>;
+  // Lets a mounted paginated list (usePaginatedList) react to a realtime
+  // `data:changed` event for its own resource by refetching just its current
+  // page/cursor, instead of the blunt full-blob reload every other resource
+  // still falls back to. Returns an unsubscribe function.
+  subscribeToResource: (resource: string, callback: () => void) => () => void;
+  // See notifyResourceChanged in AppProvider - lets callers outside the
+  // generic write-broadcast path (currently just notifications markRead/
+  // clearAll) nudge a mounted paginated list for that resource to refetch.
+  notifyResourceChanged: (resource: string) => void;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
@@ -45,6 +54,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const refreshData = useCallback(async () => {
     const fresh = await loadAllData();
     setDataState(fresh);
+    return fresh;
   }, []);
 
   // Coalesces bursts of `data:changed` events (e.g. a truck-load batch that
@@ -59,6 +69,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }, 400);
   }, [refreshData]);
 
+  // Resource-aware realtime dispatch: if a paginated screen is mounted and
+  // watching the resource a write just touched, only ITS current page/cursor
+  // refetches. Nothing subscribed for that resource (master data, or an
+  // in-scope paginated resource whose screen isn't currently open) falls
+  // back to today's exact full-blob reload, unchanged.
+  const resourceListenersRef = useRef<Map<string, Set<() => void>>>(new Map());
+
+  const subscribeToResource = useCallback((resource: string, callback: () => void) => {
+    let listeners = resourceListenersRef.current.get(resource);
+    if (!listeners) {
+      listeners = new Set();
+      resourceListenersRef.current.set(resource, listeners);
+    }
+    listeners.add(callback);
+    return () => {
+      listeners!.delete(callback);
+      if (listeners!.size === 0) resourceListenersRef.current.delete(resource);
+    };
+  }, []);
+
+  // Notifications never go through the generic write-broadcast middleware
+  // (server-side it has its own richer `notification:new` event, and
+  // markRead/clearAll don't broadcast at all) - so callers that mutate
+  // notifications call this directly to nudge a mounted paginated Notification
+  // Hub into refetching its current page, mirroring what the generic
+  // `data:changed` -> subscribeToResource path does for every other resource.
+  const notifyResourceChanged = useCallback((resource: string) => {
+    resourceListenersRef.current.get(resource)?.forEach(cb => cb());
+  }, []);
+
   // Another connected tab/device/user just created a notification (new order,
   // stock update, etc.) — show the same instant toast + badge bump locally
   // that the originating session already saw.
@@ -72,14 +112,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setTimeout(() => {
       setPushAlert(prev => (prev?.id === notification.id ? null : prev));
     }, 4000);
-  }, []);
+    notifyResourceChanged('notifications');
+  }, [notifyResourceChanged]);
+
+  const onDataChanged = useCallback((resource: string) => {
+    const listeners = resourceListenersRef.current.get(resource);
+    if (listeners && listeners.size > 0) {
+      listeners.forEach(cb => cb());
+    } else {
+      scheduleRefresh();
+    }
+  }, [scheduleRefresh]);
 
   const startRealtime = useCallback((token: string) => {
     connectRealtime(token, {
-      onDataChanged: () => scheduleRefresh(),
+      onDataChanged,
       onNotification: handleRemoteNotification,
     });
-  }, [scheduleRefresh, handleRemoteNotification]);
+  }, [onDataChanged, handleRemoteNotification]);
 
   // On boot, restore a previously logged-in session from the stored JWT (if any).
   useEffect(() => {
@@ -152,23 +202,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   // Notifications persist to the backend in the background so the list survives
   // a refreshData(), while still showing an instant local toast + list entry.
-  const addNotification = useCallback((type: AppNotification['type'], message: string) => {
+  const addNotification = useCallback((type: AppNotification['type'], message: string, entityType?: NotificationEntityType, entityId?: string) => {
     const newNotif: AppNotification = {
       id: 'n_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
       type,
       message,
+      entity_type: entityType,
+      entity_id: entityId,
       is_read: false,
       created_at: new Date().toISOString()
     };
 
     setDataState(prev => ({ ...prev, notifications: [newNotif, ...prev.notifications] }));
-    notificationsApi.create({ type, message }).catch(() => {});
+    // Only nudge the paginated Notification Hub to refetch once the row
+    // actually exists server-side - refetching immediately (fire-and-forget)
+    // could race ahead of the write and miss it.
+    notificationsApi.create({ type, message, entity_type: entityType, entity_id: entityId })
+      .then(() => notifyResourceChanged('notifications'))
+      .catch(() => {});
 
     setPushAlert({ id: newNotif.id, type: type.toUpperCase().replace('_', ' '), message });
     setTimeout(() => {
       setPushAlert(prev => (prev?.id === newNotif.id ? null : prev));
     }, 4000);
-  }, []);
+  }, [notifyResourceChanged]);
 
   // The offline sync queue remains a device-local concept: actions performed
   // while offline are queued here and replayed against the API once back online.
@@ -240,6 +297,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         pushAlert,
         login,
         refreshData,
+        subscribeToResource,
+        notifyResourceChanged,
       }}
     >
       {children}

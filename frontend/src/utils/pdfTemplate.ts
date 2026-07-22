@@ -4,9 +4,12 @@
 // typography became the template here — every other PDF is built from these
 // same pieces so nothing can visually drift from it again.
 
-const BRAND_NAME = 'Mayben traders';
+// Exported so other document builders (e.g. excelExport.ts) can reuse the
+// same brand identity instead of re-typing it.
+export const BRAND_NAME = 'Mayben traders';
+export const BRAND_SUPPORT_PHONE = '+91 73736 74757';
 const BRAND_TAGLINE = 'Premium Distribution & Logistics Network ERP';
-const BRAND_GSTIN_LINE = 'GSTIN: 27AAAAA1111A1Z1 | Support: +91 98765 43210';
+const BRAND_GSTIN_LINE = `GSTIN: 27AAAAA1111A1Z1 | Support: ${BRAND_SUPPORT_PHONE}`;
 
 export const PDF_STYLE = `
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 22px; color: #1e293b; }
@@ -110,4 +113,28 @@ export function freshReportRef(prefix: string): string {
 /** Composes the final "<Document_Type>_<PREFIX-ID>.pdf" filename. */
 export function buildPdfFileName(documentLabel: string, refCode: string): string {
   return `${sanitizeFileNamePart(documentLabel)}_${sanitizeFileNamePart(refCode)}.pdf`;
+}
+
+const EXTENSION_BY_MIME_TYPE: Record<string, string> = {
+  'application/pdf': 'pdf',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+};
+
+/** Same "<Document_Type>_<PREFIX-ID>.<ext>" convention as buildPdfFileName,
+ * but for user-uploaded attachments (e.g. a supplier bill photo/PDF/Excel)
+ * whose extension isn't fixed - so a downloaded/shared bill is always named
+ * after the invoice or bill ID it belongs to instead of the original
+ * "IMG_1234.jpg"-style camera/scanner filename, which is meaningless once
+ * it's sitting in a Downloads folder next to a dozen other receipts. */
+export function buildAttachmentFileName(documentLabel: string, refCode: string, originalName: string, mimeType?: string): string {
+  const originalExt = originalName.includes('.') ? originalName.split('.').pop() : undefined;
+  const ext = (originalExt && originalExt.length <= 5 ? originalExt.toLowerCase() : undefined)
+    || (mimeType && EXTENSION_BY_MIME_TYPE[mimeType])
+    || 'dat';
+  return `${sanitizeFileNamePart(documentLabel)}_${sanitizeFileNamePart(refCode)}.${ext}`;
 }

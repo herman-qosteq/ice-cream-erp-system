@@ -1,6 +1,7 @@
 import React from 'react';
 import { View, Text, Pressable } from 'react-native';
 import { Menu, Bell, LogOut } from 'lucide-react-native';
+import { formatBadgeCount } from '../../utils/format';
 
 type HeaderProps = {
   title: string;
@@ -44,8 +45,8 @@ export default function Header({
         <View className="p-2 rounded-xl relative">
           <Bell size={18} color="#334155" />
           {unreadNotifsCount > 0 && (
-            <View className="absolute top-1 right-1 w-4 h-4 bg-rose-500 rounded-full items-center justify-center">
-              <Text className="text-white font-extrabold text-[8px]">{unreadNotifsCount}</Text>
+            <View className="absolute top-1 right-1 min-w-[16px] h-4 px-1 bg-rose-500 rounded-full items-center justify-center">
+              <Text className="text-white font-extrabold text-[8px]">{formatBadgeCount(unreadNotifsCount)}</Text>
             </View>
           )}
         </View>

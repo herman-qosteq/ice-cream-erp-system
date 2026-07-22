@@ -2,22 +2,29 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, Pressable, Image, ScrollView, Linking, Modal } from 'react-native';
 import {
   LayoutDashboard, Truck, Search, Store as StoreIcon, Plus, ShoppingCart, CheckCircle,
-  CreditCard, LogOut, MessageCircle, Download, Eye, MessageSquare, AlertTriangle, Edit,
+  CreditCard, LogOut, MessageCircle, Download, Eye, MessageSquare, AlertTriangle, Edit, X,
 } from 'lucide-react-native';
 import { ERPData } from '../../storage';
-import { Order, Invoice, Payment, Store, PreBookingOrder, AppNotification } from '../../types';
+import { Order, Invoice, Payment, Store, PreBookingOrder, PreBookingItem, AppNotification, NotificationEntityType, Product } from '../../types';
 import SelectField from '../../components/common/SelectField';
 import DateField from '../../components/common/DateField';
 import ConfirmModal from '../../components/common/ConfirmModal';
+import ViewToggle from '../../components/common/ViewToggle';
+import DataTable, { DataTableColumn } from '../../components/common/DataTable';
+import FilterBar, { FILTER_PILL_CLASS, FILTER_PILL_TEXT_CLASS } from '../../components/common/FilterBar';
 import { exportHtmlReport } from '../../utils/reportExport';
-import { buildOrderInvoicePdf } from '../../utils/orderInvoicePdf';
+import { buildOrderInvoicePdf, buildPreBookingBillPdf } from '../../utils/orderInvoicePdf';
 import { useAppContext } from '../../context/AppContext';
+import { useViewMode } from '../../context/ViewModeContext';
+import { useScrollReset, useResetScrollOnChange } from '../../context/ScrollResetContext';
 import { ordersApi, storesApi, preBookingsApi } from '../../api/endpoints';
+import { getEffectiveProductPrice, isRetailPricingEnabled } from '../../utils/pricing';
+import { computeInvoiceTotals, formatWholeRupees } from '../../utils/billing';
 
 interface SalespersonFlowProps {
   data: ERPData;
   setData: (updater: ERPData | ((prev: ERPData) => ERPData)) => void;
-  addNotification: (type: AppNotification['type'], message: string) => void;
+  addNotification: (type: AppNotification['type'], message: string, entityType?: NotificationEntityType, entityId?: string) => void;
   syncQueueOffline: (action: string, payload: any) => void;
   currentUser: any;
   setCurrentUser: (user: any) => void;
@@ -28,8 +35,11 @@ const inputClass = "w-full bg-white border border-slate-200 rounded-xl p-2.5 tex
 
 export default function SalespersonFlow({ data, setData, addNotification, syncQueueOffline, currentUser, setCurrentUser, showAlert }: SalespersonFlowProps) {
   const { refreshData } = useAppContext();
+  const { viewMode } = useViewMode();
   const [activeTab, setActiveTab] = useState<'home' | 'inventory' | 'stores' | 'deliveries' | 'visits'>('home');
   const [activeForm, setActiveForm] = useState<'list' | 'create_order' | 'preview_invoice' | 'payment_settlement' | 'collect_payment' | 'qr_pay' | 'register_store' | 'add_visit' | 'bill_settlement_ledger'>('list');
+  const { scrollRef } = useScrollReset();
+  useResetScrollOnChange(activeForm, activeTab);
 
   const formatINR = (amount: number) => `Rs ${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
@@ -40,7 +50,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
   const [storeStatusFilter, setStoreStatusFilter] = useState<'All' | 'Paid' | 'Unpaid' | 'Partial'>('All');
   const [expandedInvoices, setExpandedInvoices] = useState<string[]>([]);
   const [settlementOrigin, setSettlementOrigin] = useState<'order' | 'ledger'>('order');
-  const [preBookingView, setPreBookingView] = useState<'create' | 'list'>('create');
+  const [preBookingView, setPreBookingView] = useState<'create' | 'confirm' | 'list'>('create');
   const [expandedPreBookings, setExpandedPreBookings] = useState<string[]>([]);
   const [preBookingConfirmAction, setPreBookingConfirmAction] = useState<{ bookingId: string; action: 'deliver' | 'cancel' } | null>(null);
   const [preBookingSettleAmount, setPreBookingSettleAmount] = useState(0);
@@ -74,7 +84,28 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
   const [tempInvoice, setTempInvoice] = useState<Invoice | null>(null);
 
   const [orderItems, setOrderItems] = useState<{ [productId: string]: number }>({});
+  // Product IDs in the order they were first selected (qty raised above 0) -
+  // keeps the picker and the invoice/payment bill showing "recently touched"
+  // items pinned to the top in that order instead of resorting alphabetically.
+  const [orderItemOrder, setOrderItemOrder] = useState<string[]>([]);
+  const updateOrderItemOrder = (productId: string, qty: number) => {
+    setOrderItemOrder(prev => {
+      if (qty > 0) return prev.includes(productId) ? prev : [...prev, productId];
+      return prev.includes(productId) ? prev.filter(id => id !== productId) : prev;
+    });
+  };
   const [pricingMode, setPricingMode] = useState<'wholesale' | 'retail'>('wholesale');
+  const [orderGstMode, setOrderGstMode] = useState<'with_gst' | 'without_gst'>('with_gst');
+  const [orderProductSearch, setOrderProductSearch] = useState('');
+
+  // Admin-grantable: hidden from Salesperson unless enabled in Role Permissions.
+  const canToggleGst = data.rolePermissions.some(rp => rp.role === 'Salesperson' && rp.feature === 'gst_toggle' && rp.enabled);
+  // Admin-grantable, app-wide: off by default, hiding the Retail/Selling
+  // pricing-mode toggle. Reads use an "effective" mode clamped to
+  // 'wholesale' so a stale 'retail' selection from before the feature was
+  // disabled can't silently leak through.
+  const retailEnabled = isRetailPricingEnabled(data.rolePermissions);
+  const effectivePricingMode = retailEnabled ? pricingMode : 'wholesale';
   const [paymentAmount, setPaymentAmount] = useState(0);
   const [paymentMethod, setPaymentMethod] = useState<'Cash' | 'UPI' | 'Google Pay' | 'PhonePe' | 'Paytm' | 'Bank Transfer' | 'Credit'>('UPI');
 
@@ -84,16 +115,34 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     follow_up_date: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0]
   });
   const [bookingItems, setBookingItems] = useState<{ [productId: string]: number }>({});
+  // Product IDs in the order they were first selected (qty raised above 0) -
+  // keeps the picker and the saved booking's item order showing "recently
+  // touched" items pinned to the top instead of resorting alphabetically.
+  const [bookingItemOrder, setBookingItemOrder] = useState<string[]>([]);
+  const updateBookingItemOrder = (productId: string, qty: number) => {
+    setBookingItemOrder(prev => {
+      if (qty > 0) return prev.includes(productId) ? prev : [...prev, productId];
+      return prev.includes(productId) ? prev.filter(id => id !== productId) : prev;
+    });
+  };
   const [preBookingForm, setPreBookingForm] = useState({
     scheduled_delivery_date: new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0],
     notes: ''
   });
+  // Draft built by handleSavePreBookingOrder (the "Save Pre-Booking &
+  // Reserve Stock" button) and reviewed on the Pre-Booking Confirmation
+  // view; the actual save only happens once the user hits "Confirm
+  // Pre-Booking" there (handleConfirmPreBookingOrder).
+  const [pendingPreBooking, setPendingPreBooking] = useState<{ items: PreBookingItem[]; storeId: string; storeName: string; scheduledDate: string; notes?: string; grandTotal: number; roundOff: number } | null>(null);
   const [preBookingPricingMode, setPreBookingPricingMode] = useState<'wholesale' | 'retail'>('wholesale');
+  const effectivePreBookingPricingMode = retailEnabled ? preBookingPricingMode : 'wholesale';
+  const [preBookingGstMode, setPreBookingGstMode] = useState<'with_gst' | 'without_gst'>('with_gst');
+  const [preBookingProductSearch, setPreBookingProductSearch] = useState('');
   const [editingBookingId, setEditingBookingId] = useState<string | null>(null);
 
   const assignedTruck = data.trucks.find(t => t.driver_user_id === currentUser.id);
   const truckId = assignedTruck?.id || 't1';
-  const hasTruckStock = data.products.some(p => (data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === p.id)?.quantity || 0) > 0);
+  const hasTruckStock = data.products.some(p => p.status === 'Active' && (data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === p.id)?.quantity || 0) > 0);
 
   const todayStr = new Date().toISOString().split('T')[0];
   const todayLocalStr = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().split('T')[0];
@@ -106,6 +155,13 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
 
   const downloadInvoicePDF = async (order: Order, invoice: Invoice, store: Store) => {
     const { html, fileName } = buildOrderInvoicePdf(order, invoice, store, data.products);
+    await exportHtmlReport(html, fileName, showAlert);
+  };
+
+  const handleDownloadPreBookingPdf = async (booking: PreBookingOrder) => {
+    const store = data.stores.find(s => s.id === booking.store_id);
+    if (!store) { showAlert('Unable to find the partner store for this pre-booking.'); return; }
+    const { html, fileName } = buildPreBookingBillPdf(booking, store, data.products);
     await exportHtmlReport(html, fileName, showAlert);
   };
 
@@ -122,7 +178,8 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     const paidVal = inv.paid_amount || 0;
     const dueVal = Math.max(0, inv.grand_total - paidVal);
     const paymentStatusText = inv.payment_status === 'Paid' ? 'FULLY PAID' : inv.payment_status === 'Partial' ? `PARTIAL PAID (Paid: Rs. ${paidVal.toFixed(2)})` : 'UNPAID / CREDIT';
-    const text = `*FROSTFLOW ICE CREAMS - DISPATCH INVOICE*\n\nHello *${store.owner_name}* (${store.name}), your invoice *${inv.invoice_number}* is ready and dispatched.${itemDetails}\n\n*Billing Summary:*\n- Total: Rs. ${inv.total.toFixed(2)}\n- GST Tax: Rs. ${inv.tax.toFixed(2)}\n- *Grand Total: Rs. ${inv.grand_total.toFixed(2)}*\n- Settlement Status: *${paymentStatusText}*\n- Balance Outstanding: *Rs. ${dueVal.toFixed(2)}*\n\nThank you for choosing FrostFlow Ice Creams!`;
+    const roundOffLine = `\n- Round Off: ${(inv.round_off || 0) > 0 ? '+' : ''}Rs. ${(inv.round_off || 0).toFixed(2)}`;
+    const text = `*FROSTFLOW ICE CREAMS - DISPATCH INVOICE*\n\nHello *${store.owner_name}* (${store.name}), your invoice *${inv.invoice_number}* is ready and dispatched.${itemDetails}\n\n*Billing Summary:*\n- Total: Rs. ${inv.total.toFixed(2)}\n- GST Tax: Rs. ${inv.tax.toFixed(2)}${roundOffLine}\n- *Grand Total: Rs. ${inv.grand_total.toFixed(2)}*\n- Settlement Status: *${paymentStatusText}*\n- Balance Outstanding: *Rs. ${dueVal.toFixed(2)}*\n\nThank you for choosing FrostFlow Ice Creams!`;
     const url = `https://wa.me/${phoneWithCountry}?text=${encodeURIComponent(text)}`;
     Linking.openURL(url).catch(() => showAlert('Could not open WhatsApp. Please ensure it is installed.'));
   };
@@ -134,7 +191,10 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     }
     setSelectedStore(store);
     setOrderItems({});
+    setOrderItemOrder([]);
     setPricingMode('wholesale');
+    setOrderGstMode('with_gst');
+    setOrderProductSearch('');
     setActiveForm('create_order');
   };
 
@@ -146,6 +206,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
       return;
     }
     setOrderItems({ ...orderItems, [productId]: nextQty });
+    updateOrderItemOrder(productId, nextQty);
   };
 
   const handleSetItemQty = (productId: string, valStr: string) => {
@@ -155,7 +216,9 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     if (num > currentTruckStock) {
       showAlert(`Limit exceeded! Only ${currentTruckStock} units of this flavor are available in your truck inventory.`);
     }
-    setOrderItems({ ...orderItems, [productId]: Math.max(0, Math.min(currentTruckStock, num)) });
+    const nextQty = Math.max(0, Math.min(currentTruckStock, num));
+    setOrderItems({ ...orderItems, [productId]: nextQty });
+    updateOrderItemOrder(productId, nextQty);
   };
 
   const getEffectiveAvailableForBooking = (productId: string) => {
@@ -177,6 +240,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
       return;
     }
     setBookingItems({ ...bookingItems, [productId]: nextQty });
+    updateBookingItemOrder(productId, nextQty);
   };
 
   const handleSetPreBookingQty = (productId: string, valStr: string) => {
@@ -189,31 +253,34 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
         ? `${productName} is out of stock in the warehouse. It cannot be added to this pre-booking.`
         : `Only ${currentWarehouseStock} units of ${productName} are available in the warehouse right now.`);
     }
-    setBookingItems({ ...bookingItems, [productId]: Math.max(0, Math.min(currentWarehouseStock, num)) });
+    const nextQty = Math.max(0, Math.min(currentWarehouseStock, num));
+    setBookingItems({ ...bookingItems, [productId]: nextQty });
+    updateBookingItemOrder(productId, nextQty);
   };
 
   const handleConfirmOrder = () => {
-    const activeItems = Object.entries(orderItems)
-      .filter(([_, qty]) => (qty as number) > 0)
-      .map(([prodId, qty]) => {
+    // Built from orderItemOrder (selection order), not Object.entries, so the
+    // invoice/payment steps show items in the order they were actually picked.
+    const activeItems = orderItemOrder
+      .map(prodId => {
+        const qty = orderItems[prodId] || 0;
+        if (qty <= 0) return null;
         const p = data.products.find(prod => prod.id === prodId)!;
-        const appliedPrice = pricingMode === 'wholesale' ? p.wholesale_price : p.selling_price;
-        return { product_id: prodId, quantity: qty as number, unit_price: appliedPrice, tax_pct: p.tax_pct };
-      });
+        const appliedPrice = getEffectiveProductPrice(p, effectivePricingMode, selectedStore?.id, data.storePricing);
+        const tax_pct = canToggleGst && orderGstMode === 'without_gst' ? 0 : p.tax_pct;
+        return { product_id: prodId, quantity: qty, unit_price: appliedPrice, tax_pct };
+      })
+      .filter((item): item is { product_id: string; quantity: number; unit_price: number; tax_pct: number } => item !== null);
     if (activeItems.length === 0) {
       showAlert('Please add at least one ice cream item to create an order.');
       return;
     }
-    // Round total/tax to cents before summing into grand_total, so grand_total
-    // always equals total+tax exactly as displayed/stored.
-    const total = parseFloat(activeItems.reduce((acc, item) => acc + (item.quantity * item.unit_price), 0).toFixed(2));
-    const tax = parseFloat(activeItems.reduce((acc, item) => acc + (item.quantity * item.unit_price * (item.tax_pct / 100)), 0).toFixed(2));
-    const grandTotal = parseFloat((total + tax).toFixed(2));
+    const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(activeItems);
     const orderId = 'o_' + Date.now();
     const newOrder: Order = { id: orderId, store_id: selectedStore!.id, salesperson_id: currentUser.id, truck_id: truckId, status: 'Delivered', created_at: new Date().toISOString(), items: activeItems };
     const newInvoice: Invoice = {
       id: 'inv_' + Date.now(), order_id: orderId, invoice_number: 'INV-' + Math.floor(Math.random() * 90000 + 10000),
-      total, tax, grand_total: grandTotal, created_at: new Date().toISOString()
+      total, tax, grand_total: grandTotal, round_off: roundOff, created_at: new Date().toISOString()
     };
     setTempOrder(newOrder);
     setTempInvoice(newInvoice);
@@ -245,8 +312,8 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
       setLastCreatedOrder(result.order);
       setPaymentAmount(parseFloat(result.invoice.grand_total.toFixed(2)));
       setPaymentMethod('UPI');
-      addNotification('new_order', `Driver completed order for ${selectedStore?.name}. Grand Total: Rs${result.invoice.grand_total.toFixed(2)}`);
-      showAlert('Order Confirmed successfully! Now please record the payment settlement.');
+      // The order isn't announced as confirmed yet - that notification fires
+      // once payment settlement is also recorded, in handleFinalizeSettlementOnly.
       setSettlementOrigin('order');
       setActiveForm('payment_settlement');
     } catch (e: any) {
@@ -274,8 +341,19 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     try {
       const result = await ordersApi.settle(lastCreatedOrder.id, { method: paymentMethod, amount: paymentAmount });
       await refreshData();
+      // Only now - once payment details are confirmed, not when the order
+      // was first recorded - do we announce the order as confirmed. Skip
+      // this for the ledger origin: there, we're just collecting payment
+      // against an older order, not confirming a brand-new one. The
+      // notification always fires here regardless of which of the three
+      // payment outcomes (Fully Paid / Partially Paid / Credit) happened -
+      // it just states which one so the message isn't misleadingly generic.
+      if (settlementOrigin === 'order') {
+        const paymentStatusLabel = result.paymentStatus === 'Paid' ? 'Fully Paid' : result.paymentStatus === 'Partial' ? 'Partially Paid' : 'Payment Pending (Credit)';
+        addNotification('new_order', `Order confirmed for ${selectedStore?.name} - ${paymentStatusLabel}. Grand Total: Rs${formatWholeRupees(generatedInvoice.grand_total)}.`, 'order', lastCreatedOrder.id);
+      }
       if (result.actualCollection > 0) {
-        addNotification('payment_received', `Driver collected Rs${result.actualCollection} from ${selectedStore?.name}.`);
+        addNotification('payment_received', `Driver collected Rs${formatWholeRupees(result.actualCollection)} from ${selectedStore?.name}.`, 'store', selectedStore?.id);
       }
       showAlert('Payment Settlement recorded successfully!');
       setActiveForm(settlementOrigin === 'ledger' ? 'bill_settlement_ledger' : 'collect_payment');
@@ -302,13 +380,13 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
       return;
     }
     try {
-      await storesApi.create({
+      const created = await storesApi.create({
         name: newStoreForm.name, owner_name: newStoreForm.owner_name || 'Manager', phone: newStoreForm.phone,
         alt_phone: '', address: newStoreForm.address || 'Address placeholder', area: newStoreForm.area, city: newStoreForm.city,
         state: 'Maharashtra', pincode: '411001', gst_number: '', credit_limit: 1000, refill_frequency: 'Weekly', ranking: 'Silver',
       });
       await refreshData();
-      addNotification('partner_update', `Driver registered new store in area ${newStoreForm.area}: ${newStoreForm.name}`);
+      addNotification('partner_update', `Driver registered new store in area ${newStoreForm.area}: ${newStoreForm.name}`, 'store', created.id);
       showAlert('Store registered successfully!');
       setActiveForm('list');
     } catch (e: any) {
@@ -334,14 +412,19 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     }
   };
 
+  // Built from bookingItemOrder (selection order), not Object.entries, so the
+  // saved booking - and every downstream bill/delivery view - shows items
+  // in the order they were actually picked.
   const buildPreBookingItems = () => {
-    return Object.entries(bookingItems)
-      .filter(([, quantity]) => Number(quantity) > 0)
-      .map(([productId, quantity]) => {
+    return bookingItemOrder
+      .map(productId => {
+        const quantity = bookingItems[productId] || 0;
+        if (quantity <= 0) return null;
         const product = data.products.find(item => item.id === productId);
         if (!product) return null;
-        const unit_price = preBookingPricingMode === 'wholesale' ? product.wholesale_price : product.selling_price;
-        return { product_id: productId, quantity: Number(quantity), unit_price, tax_pct: product.tax_pct };
+        const unit_price = getEffectiveProductPrice(product, effectivePreBookingPricingMode, selectedStore?.id, data.storePricing);
+        const tax_pct = canToggleGst && preBookingGstMode === 'without_gst' ? 0 : product.tax_pct;
+        return { product_id: productId, quantity, unit_price, tax_pct };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
   };
@@ -364,8 +447,12 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
 
   const resetPreBookingForm = () => {
     setBookingItems({});
+    setBookingItemOrder([]);
+    setPendingPreBooking(null);
     setPreBookingForm({ scheduled_delivery_date: new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0], notes: '' });
     setPreBookingPricingMode('wholesale');
+    setPreBookingGstMode('with_gst');
+    setPreBookingProductSearch('');
     setEditingBookingId(null);
     setSelectedStore(null);
   };
@@ -377,18 +464,49 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     const items: { [productId: string]: number } = {};
     booking.items.forEach(item => { items[item.product_id] = item.quantity; });
     setBookingItems(items);
+    setBookingItemOrder(booking.items.map(item => item.product_id));
     const firstItem = booking.items[0];
     const firstProduct = firstItem ? data.products.find(p => p.id === firstItem.product_id) : null;
-    setPreBookingPricingMode(firstProduct && firstItem.unit_price === firstProduct.wholesale_price ? 'wholesale' : 'retail');
+    const firstWholesaleRate = firstProduct ? getEffectiveProductPrice(firstProduct, 'wholesale', booking.store_id, data.storePricing) : 0;
+    setPreBookingPricingMode(firstProduct && firstItem.unit_price === firstWholesaleRate ? 'wholesale' : 'retail');
+    setPreBookingGstMode(firstItem && firstItem.tax_pct <= 0 ? 'without_gst' : 'with_gst');
     setEditingBookingId(booking.id);
     setPreBookingView('create');
   };
 
-  const handleSavePreBookingOrder = async () => {
+  // Only builds the pre-booking draft and navigates to the Pre-Booking
+  // Confirmation view — nothing is sent to the backend (or offline queue)
+  // yet. The save only happens once the user reviews the bill there and
+  // hits "Confirm Pre-Booking" (handleConfirmPreBookingOrder).
+  const handleSavePreBookingOrder = () => {
     if (!selectedStore) {
       showAlert('Please select a store for the pre-booking order.');
       return;
     }
+    const bookingItemsList = buildPreBookingItems();
+    if (bookingItemsList.length === 0) {
+      showAlert('Please add at least one product to pre-book.');
+      return;
+    }
+    const { grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(bookingItemsList);
+    setPendingPreBooking({
+      items: bookingItemsList, storeId: selectedStore.id, storeName: selectedStore.name,
+      scheduledDate: preBookingForm.scheduled_delivery_date, notes: preBookingForm.notes.trim() || undefined, grandTotal, roundOff,
+    });
+    setPreBookingView('confirm');
+  };
+
+  // Discards the draft entirely and returns to the picker — the already
+  // chosen quantities are still sitting in bookingItems/bookingItemOrder,
+  // so nothing needs to be re-picked.
+  const handleBackFromPreBookingConfirmation = () => {
+    setPendingPreBooking(null);
+    setPreBookingView('create');
+  };
+
+  const handleConfirmPreBookingOrder = async () => {
+    if (!selectedStore || !pendingPreBooking) return;
+    const { items: bookingItemsList, storeId, storeName, scheduledDate, notes } = pendingPreBooking;
 
     if (editingBookingId) {
       const existingBooking = data.preBookingOrders.find(b => b.id === editingBookingId);
@@ -398,18 +516,13 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
         setPreBookingView('list');
         return;
       }
-      const bookingItemsList = buildPreBookingItems();
-      if (bookingItemsList.length === 0) {
-        showAlert('Please add at least one product to pre-book.');
-        return;
-      }
 
       if (data.isOffline) {
         const releasedWarehouse = restoreReservedWarehouseStock(existingBooking.items);
         const updatedWarehouse = reserveWarehouseStock(bookingItemsList, releasedWarehouse);
         const updatedBooking: PreBookingOrder = {
-          ...existingBooking, store_id: selectedStore.id, scheduled_delivery_date: preBookingForm.scheduled_delivery_date,
-          items: bookingItemsList, notes: preBookingForm.notes.trim() || undefined
+          ...existingBooking, store_id: storeId, scheduled_delivery_date: scheduledDate,
+          items: bookingItemsList, notes
         };
         const updatedPreBookings = data.preBookingOrders.map(b => (b.id === editingBookingId ? updatedBooking : b));
         syncQueueOffline('UPDATE_PREBOOKING', { preBookingOrder: updatedBooking, reservation: updatedWarehouse });
@@ -422,11 +535,11 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
 
       try {
         await preBookingsApi.update(editingBookingId, {
-          store_id: selectedStore.id, scheduled_delivery_date: preBookingForm.scheduled_delivery_date,
-          items: bookingItemsList, notes: preBookingForm.notes.trim() || undefined,
+          store_id: storeId, scheduled_delivery_date: scheduledDate,
+          items: bookingItemsList, notes,
         });
         await refreshData();
-        addNotification('order_update', `Pre-booking updated for ${selectedStore.name}.`);
+        addNotification('order_update', `Pre-booking updated for ${storeName}.`, 'prebooking', editingBookingId);
         showAlert('Pre-booking updated successfully.');
         resetPreBookingForm();
         setPreBookingView('list');
@@ -436,17 +549,11 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
       return;
     }
 
-    const bookingItemsList = buildPreBookingItems();
-    if (bookingItemsList.length === 0) {
-      showAlert('Please add at least one product to pre-book.');
-      return;
-    }
-
     if (data.isOffline) {
       const updatedWarehouse = reserveWarehouseStock(bookingItemsList);
       const newBooking: PreBookingOrder = {
-        id: `pb_${Date.now()}`, store_id: selectedStore.id, salesperson_id: currentUser.id, created_at: new Date().toISOString(),
-        scheduled_delivery_date: preBookingForm.scheduled_delivery_date, status: 'Booked', items: bookingItemsList, notes: preBookingForm.notes.trim() || undefined
+        id: `pb_${Date.now()}`, store_id: storeId, salesperson_id: currentUser.id, created_at: new Date().toISOString(),
+        scheduled_delivery_date: scheduledDate, status: 'Booked', items: bookingItemsList, notes
       };
       syncQueueOffline('CREATE_PREBOOKING', { preBookingOrder: newBooking, reservation: updatedWarehouse });
       setData({ ...data, warehouse_inventory: updatedWarehouse, preBookingOrders: [newBooking, ...data.preBookingOrders] });
@@ -457,12 +564,12 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     }
 
     try {
-      await preBookingsApi.create({
-        store_id: selectedStore.id, salesperson_id: currentUser.id, scheduled_delivery_date: preBookingForm.scheduled_delivery_date,
-        items: bookingItemsList, notes: preBookingForm.notes.trim() || undefined,
+      const created = await preBookingsApi.create({
+        store_id: storeId, salesperson_id: currentUser.id, scheduled_delivery_date: scheduledDate,
+        items: bookingItemsList, notes,
       });
       await refreshData();
-      addNotification('new_order', `Pre-booking saved for ${selectedStore.name} and stock reserved in warehouse.`);
+      addNotification('new_order', `Pre-booking saved for ${storeName} and stock reserved in warehouse.`, 'prebooking', created.id);
       showAlert('Pre-booking saved successfully.');
       resetPreBookingForm();
       setPreBookingView('list');
@@ -475,18 +582,21 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     try {
       const result = await preBookingsApi.deliver(preBookingOrderId, { method: preBookingSettleMethod, amount: preBookingSettleAmount });
       await refreshData();
-      addNotification('delivery', `Pre-booking order ${preBookingOrderId} completed. Payment status: ${result.payment_status}.`);
+      addNotification('delivery', `Pre-booking order ${preBookingOrderId} completed. Payment status: ${result.payment_status}.`, 'prebooking', preBookingOrderId);
       showAlert(`Pre-booking delivery completed. Payment status: ${result.payment_status}.`);
       setPreBookingConfirmAction(null);
     } catch (e: any) {
+      // Close first - a still-open Deliver Pre-Booking Modal would otherwise
+      // hide the shared alert, which renders outside any Modal's portal.
+      setPreBookingConfirmAction(null);
       showAlert(e.message ?? 'Unable to deliver pre-booking.');
     }
   };
 
   const handleDeliverPreBookingOrder = (preBookingOrderId: string) => {
     const booking = data.preBookingOrders.find(item => item.id === preBookingOrderId);
-    const grandTotal = booking ? booking.items.reduce((sum, item) => sum + (item.quantity * item.unit_price * (1 + item.tax_pct / 100)), 0) : 0;
-    setPreBookingSettleAmount(parseFloat(grandTotal.toFixed(2)));
+    const grandTotal = booking ? computeInvoiceTotals(booking.items).grand_total : 0;
+    setPreBookingSettleAmount(grandTotal);
     setPreBookingSettleMethod('UPI');
     setPreBookingConfirmAction({ bookingId: preBookingOrderId, action: 'deliver' });
   };
@@ -495,7 +605,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
     try {
       await preBookingsApi.cancel(preBookingOrderId);
       await refreshData();
-      addNotification('partner_update', `Pre-booking order ${preBookingOrderId} cancelled.`);
+      addNotification('partner_update', `Pre-booking order ${preBookingOrderId} cancelled.`, 'prebooking', preBookingOrderId);
       showAlert('Pre-booking cancelled and warehouse stock released.');
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to cancel pre-booking.');
@@ -571,29 +681,69 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
       </View>
 
       {activeForm === 'create_order' ? (
-        <ScrollView className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
+        <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
         <View className="w-full lg:max-w-4xl gap-4">
           <View className="flex-row justify-between items-center border-b border-slate-200 pb-2">
             <Text className="font-extrabold text-slate-800 text-sm">Create Store Order ({selectedStore?.name})</Text>
             <Pressable onPress={() => setActiveForm('list')}><Text className="text-slate-500 text-xs font-bold">Back</Text></Pressable>
           </View>
 
-          <View className="flex-row items-center justify-between bg-white/70 p-3 rounded-xl border border-slate-200">
-            <Text className="text-[10px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
-            <View className="flex-row bg-slate-100 p-1 rounded-lg">
-              <Pressable onPress={() => setPricingMode('wholesale')} className={`px-3 py-1.5 rounded-md ${pricingMode === 'wholesale' ? 'bg-white' : ''}`}>
-                <Text className={`text-xs font-bold ${pricingMode === 'wholesale' ? 'text-indigo-700' : 'text-slate-500'}`}>Wholesale</Text>
-              </Pressable>
-              <Pressable onPress={() => setPricingMode('retail')} className={`px-3 py-1.5 rounded-md ${pricingMode === 'retail' ? 'bg-white' : ''}`}>
-                <Text className={`text-xs font-bold ${pricingMode === 'retail' ? 'text-indigo-700' : 'text-slate-500'}`}>Selling</Text>
-              </Pressable>
+          {retailEnabled && (
+            <View className="flex-row items-center justify-between bg-white/70 p-2 rounded-xl border border-slate-200">
+              <Text className="text-[9px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
+              <View className="flex-row bg-slate-100 p-0.5 rounded-lg">
+                <Pressable onPress={() => setPricingMode('wholesale')} className={`px-2 py-1 rounded-md ${pricingMode === 'wholesale' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${pricingMode === 'wholesale' ? 'text-white' : 'text-slate-500'}`}>Wholesale</Text>
+                </Pressable>
+                <Pressable onPress={() => setPricingMode('retail')} className={`px-2 py-1 rounded-md ${pricingMode === 'retail' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${pricingMode === 'retail' ? 'text-white' : 'text-slate-500'}`}>Selling</Text>
+                </Pressable>
+              </View>
             </View>
+          )}
+
+          {canToggleGst && (
+            <View className="flex-row items-center justify-between bg-white/70 p-2 rounded-xl border border-slate-200">
+              <Text className="text-[9px] font-bold text-slate-500 uppercase">GST</Text>
+              <View className="flex-row bg-slate-100 p-0.5 rounded-lg">
+                <Pressable onPress={() => setOrderGstMode('with_gst')} className={`px-2 py-1 rounded-md ${orderGstMode === 'with_gst' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${orderGstMode === 'with_gst' ? 'text-white' : 'text-slate-500'}`}>With GST</Text>
+                </Pressable>
+                <Pressable onPress={() => setOrderGstMode('without_gst')} className={`px-2 py-1 rounded-md ${orderGstMode === 'without_gst' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${orderGstMode === 'without_gst' ? 'text-white' : 'text-slate-500'}`}>No GST</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+
+          <View className="flex-row items-center gap-2 bg-white/70 border border-slate-200 rounded-xl px-3">
+            <Search size={14} color="#94a3b8" />
+            <TextInput
+              value={orderProductSearch}
+              onChangeText={setOrderProductSearch}
+              placeholder="Search products..."
+              placeholderTextColor="#94a3b8"
+              className="flex-1 text-xs text-slate-800 py-2"
+              style={{ outlineStyle: 'none' } as any}
+            />
+            {orderProductSearch.length > 0 && (
+              <Pressable onPress={() => setOrderProductSearch('')} hitSlop={8}>
+                <X size={14} color="#94a3b8" />
+              </Pressable>
+            )}
           </View>
 
           <View className="gap-2 md:flex-row md:flex-wrap">
-            {data.products
-              .filter(p => (data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === p.id)?.quantity || 0) > 0)
-              .map(p => {
+            {(() => {
+              const baseOrderProducts = data.products
+                .filter(p => p.status === 'Active')
+                .filter(p => (data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === p.id)?.quantity || 0) > 0)
+                .filter(p => p.name.toLowerCase().includes(orderProductSearch.trim().toLowerCase()));
+              // Deliberately NOT reordered by selection - a product keeps its
+              // normal position (and scroll position stays put) no matter how
+              // its quantity is changed.
+              return baseOrderProducts;
+            })().map(p => {
               const truckStock = data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === p.id)?.quantity || 0;
               const qty = orderItems[p.id] || 0;
               return (
@@ -604,7 +754,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                   </View>
                   <View className="items-end">
                     <Text className="text-[8px] text-slate-400 font-bold">Rate</Text>
-                    <Text className="text-xs font-black text-emerald-700">{formatINR(pricingMode === 'wholesale' ? p.wholesale_price : p.selling_price)}</Text>
+                    <Text className="text-xs font-black text-emerald-700">{formatINR(getEffectiveProductPrice(p, effectivePricingMode, selectedStore?.id, data.storePricing))}</Text>
                   </View>
                   <View className="flex-row items-center gap-1.5">
                     <Pressable onPress={() => handleUpdateItemQty(p.id, -1)} className="w-7 h-7 bg-white border border-slate-200 rounded-lg items-center justify-center active:bg-slate-100"><Text className="font-bold text-slate-800">-</Text></Pressable>
@@ -617,6 +767,9 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
             {!hasTruckStock && (
               <Text className="w-full py-8 text-center text-slate-400 italic bg-white/70 rounded-2xl border border-white/50">No cargo loaded on this truck — no products available to order.</Text>
             )}
+            {hasTruckStock && orderProductSearch.trim() && data.products.filter(p => p.status === 'Active' && (data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === p.id)?.quantity || 0) > 0 && p.name.toLowerCase().includes(orderProductSearch.trim().toLowerCase())).length === 0 && (
+              <Text className="w-full py-8 text-center text-slate-400 italic bg-white/70 rounded-2xl border border-white/50">No products match your search.</Text>
+            )}
           </View>
 
           {hasTruckStock && (
@@ -627,7 +780,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
         </View>
         </ScrollView>
       ) : activeForm === 'preview_invoice' ? (
-        <ScrollView className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
+        <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
         <View className="w-full lg:max-w-2xl gap-4">
           <View className="flex-row justify-between items-center border-b border-slate-200 pb-2">
             <View>
@@ -682,15 +835,17 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
             <View className="pt-2 border-t border-slate-100 gap-1.5">
               <View className="flex-row justify-between"><Text className="text-slate-500 text-xs">Subtotal:</Text><Text className="font-bold text-slate-700 text-xs">{tempInvoice ? formatINR(tempInvoice.total) : formatINR(0)}</Text></View>
               <View className="flex-row justify-between"><Text className="text-slate-500 text-xs">GST:</Text><Text className="font-bold text-slate-700 text-xs">{tempInvoice ? formatINR(tempInvoice.tax) : formatINR(0)}</Text></View>
+              <View className="flex-row justify-between"><Text className="text-slate-500 text-xs">Total (Before Round Off):</Text><Text className="font-bold text-slate-700 text-xs">{tempInvoice ? formatINR(tempInvoice.total + tempInvoice.tax) : formatINR(0)}</Text></View>
+              <View className="flex-row justify-between"><Text className="text-slate-500 text-xs">Round Off:</Text><Text className="font-bold text-slate-700 text-xs">{(tempInvoice?.round_off || 0) > 0 ? '+' : ''}{formatINR(tempInvoice?.round_off || 0)}</Text></View>
               <View className="flex-row justify-between bg-slate-50 p-2 rounded-xl">
-                <Text className="text-indigo-600 uppercase font-extrabold text-xs">Grand Total:</Text>
-                <Text className="text-indigo-600 text-sm font-black">{tempInvoice ? formatINR(tempInvoice.grand_total) : formatINR(0)}</Text>
+                <Text className="text-indigo-600 uppercase font-extrabold text-xs">Net Amount (Grand Total):</Text>
+                <Text className="text-indigo-600 text-sm font-black">Rs {tempInvoice ? formatWholeRupees(tempInvoice.grand_total) : '0'}</Text>
               </View>
             </View>
           </View>
 
           <Pressable onPress={handleFinalizeOrderOnly} className="w-full py-3 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
-            <Text className="text-white font-black text-xs uppercase">Confirm Order</Text>
+            <Text className="text-white font-black text-xs uppercase">Save Order & Continue to Payment</Text>
           </Pressable>
         </View>
         </ScrollView>
@@ -708,7 +863,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
         else if (isUnpaidPreset) { btnColor = 'bg-rose-600 active:bg-rose-700'; btnLabel = 'Record As Unpaid (100% Credit)'; }
 
         return (
-          <ScrollView className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
+          <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
           <View className="w-full lg:max-w-2xl gap-4">
             <View className="flex-row items-center gap-2 border-b border-slate-200 pb-2">
               <Pressable onPress={() => setActiveForm(settlementOrigin === 'ledger' ? 'bill_settlement_ledger' : 'list')} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
@@ -720,15 +875,32 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
               </View>
             </View>
 
-            <View className="bg-white border border-slate-200 rounded-2xl p-4 gap-2">
-              <View className="flex-row justify-between border-b border-slate-100 pb-2"><Text className="text-slate-400 font-bold uppercase text-[9px]">Client Partner</Text><Text className="font-extrabold text-slate-800 text-xs">{selectedStore?.name}</Text></View>
-              <View className="flex-row justify-between border-b border-slate-100 pb-2"><Text className="text-slate-400 font-bold uppercase text-[9px]">Invoice Number</Text><Text className="font-extrabold text-slate-800 text-xs">{generatedInvoice?.invoice_number}</Text></View>
-              <View className="flex-row justify-between border-b border-slate-100 pb-2"><Text className="text-slate-400 font-bold uppercase text-[9px]">Grand Total</Text><Text className="font-extrabold text-slate-800 text-xs">{formatINR(totalBillAmount)}</Text></View>
-              {priorPaid > 0 && <View className="flex-row justify-between border-b border-slate-100 pb-2"><Text className="text-slate-400 font-bold uppercase text-[9px]">Previously Paid</Text><Text className="font-extrabold text-emerald-600 text-xs">{formatINR(priorPaid)}</Text></View>}
+            <View className="bg-white border border-slate-200 rounded-2xl p-3 gap-1.5">
+              <View className="flex-row justify-between border-b border-slate-100 pb-1.5"><Text className="text-slate-400 font-bold uppercase text-[9px]">Client Partner</Text><Text className="font-extrabold text-slate-800 text-xs">{selectedStore?.name}</Text></View>
+              <View className="flex-row justify-between border-b border-slate-100 pb-1.5"><Text className="text-slate-400 font-bold uppercase text-[9px]">Invoice Number</Text><Text className="font-extrabold text-slate-800 text-xs">{generatedInvoice?.invoice_number}</Text></View>
+
+              {/* Order bill: same product order as the picker/invoice preview (selection order), never alphabetical. */}
+              {!!lastCreatedOrder?.items.length && (
+                <View className="border-b border-slate-100 pb-1.5 gap-1">
+                  <Text className="text-slate-400 font-black text-[8px] uppercase">Order Bill</Text>
+                  {lastCreatedOrder.items.map(item => {
+                    const prod = data.products.find(p => p.id === item.product_id);
+                    return (
+                      <View key={item.product_id} className="flex-row justify-between items-center">
+                        <Text numberOfLines={1} className="flex-1 text-slate-700 font-bold text-[10px] pr-2">{prod?.name || 'Unknown'} <Text className="text-slate-400 font-semibold">x{item.quantity}</Text></Text>
+                        <Text className="text-slate-600 font-bold text-[10px]">{formatINR(item.quantity * item.unit_price)}</Text>
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+
+              <View className="flex-row justify-between border-b border-slate-100 pb-1.5"><Text className="text-slate-400 font-bold uppercase text-[9px]">Grand Total</Text><Text className="font-extrabold text-slate-800 text-xs">{formatINR(totalBillAmount)}</Text></View>
+              {priorPaid > 0 && <View className="flex-row justify-between border-b border-slate-100 pb-1.5"><Text className="text-slate-400 font-bold uppercase text-[9px]">Previously Paid</Text><Text className="font-extrabold text-emerald-600 text-xs">{formatINR(priorPaid)}</Text></View>}
               <View className="flex-row justify-between"><Text className="text-slate-400 font-bold uppercase text-[9px]">Remaining Due</Text><Text className="font-black text-indigo-600 text-sm">{formatINR(remainingToPay)}</Text></View>
             </View>
 
-            <View className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 gap-3">
+            <View className="bg-indigo-50 border border-indigo-100 rounded-2xl p-3 gap-2">
               <Text className="font-extrabold text-indigo-900 text-xs uppercase">Record Settlement</Text>
               <View className="flex-row gap-2">
                 <Pressable onPress={() => { setPaymentMethod('UPI'); setPaymentAmount(parseFloat(remainingToPay.toFixed(2))); }} className={`flex-1 py-2.5 rounded-xl border items-center ${isPaidPreset ? 'bg-emerald-600 border-emerald-600' : 'bg-white border-indigo-100'}`}>
@@ -764,7 +936,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                   <TextInput
                     editable={paymentMethod !== 'Credit'}
                     keyboardType="decimal-pad"
-                    value={String(paymentAmount)}
+                    value={paymentAmount === 0 ? '' : String(paymentAmount)}
                     onChangeText={v => {
                       const requested = parseFloat(Number(v || 0).toFixed(2));
                       if (requested > remainingToPay + 0.05) {
@@ -772,6 +944,8 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                       }
                       setPaymentAmount(Math.max(0, Math.min(remainingToPay, requested)));
                     }}
+                    placeholder="0"
+                    placeholderTextColor="#94a3b8"
                     className={`w-full border border-indigo-200 font-black text-indigo-900 rounded-xl p-2.5 ${paymentMethod === 'Credit' ? 'bg-slate-100 text-slate-400' : 'bg-white'}`}
                   />
                 </View>
@@ -784,9 +958,9 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
               )}
 
               {paymentMethod === 'UPI' && (
-                <View className="bg-white border border-slate-200 rounded-2xl p-3 items-center gap-2">
-                  <Image source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=upi://pay?pa=distributor@ic-erp&pn=Ice%20Cream%20Distributors&am=${paymentAmount}&cu=INR` }} className="w-32 h-32" />
-                  <Text className="text-[9px] font-black text-slate-500 uppercase">Scan via GPay, PhonePe, Paytm, BHIM UPI</Text>
+                <View className="bg-white border border-slate-200 rounded-xl p-2 flex-row items-center gap-2.5">
+                  <Image source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=100x100&data=upi://pay?pa=distributor@ic-erp&pn=Ice%20Cream%20Distributors&am=${paymentAmount}&cu=INR` }} className="w-16 h-16" />
+                  <Text className="flex-1 text-[9px] font-black text-slate-500 uppercase">Scan via GPay, PhonePe, Paytm, BHIM UPI</Text>
                 </View>
               )}
 
@@ -824,7 +998,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
         </View>
         </View>
       ) : activeForm === 'register_store' ? (
-        <ScrollView className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
+        <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
         <View className="w-full lg:max-w-2xl gap-4">
           <View className="flex-row justify-between items-center border-b border-slate-200 pb-2">
             <Text className="font-extrabold text-slate-800 text-sm">Register New Outlet</Text>
@@ -844,7 +1018,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
         </View>
         </ScrollView>
       ) : activeForm === 'add_visit' ? (
-        <ScrollView className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
+        <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
         <View className="w-full lg:max-w-2xl gap-4">
           <View className="flex-row justify-between items-center border-b border-slate-200 pb-2">
             <Text className="font-extrabold text-slate-800 text-sm">Site Visit Logs ({selectedStore?.name})</Text>
@@ -866,7 +1040,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
         </View>
         </ScrollView>
       ) : activeForm === 'bill_settlement_ledger' ? (
-        <ScrollView className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
+        <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
         <View className="w-full lg:max-w-5xl gap-4">
           <View className="flex-row justify-between items-center border-b border-slate-200 pb-3">
             <View>
@@ -876,35 +1050,109 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
             <Pressable onPress={() => setActiveForm('list')} className="bg-white border border-slate-200 px-2.5 py-1 rounded-lg active:bg-slate-50"><Text className="text-slate-500 font-bold text-xs">Back</Text></Pressable>
           </View>
 
-          <View className="relative justify-center lg:max-w-sm">
-            <View className="absolute left-3 z-10"><Search size={14} color="#94a3b8" /></View>
-            <TextInput value={ledgerSearch} onChangeText={setLedgerSearch} placeholder="Search by Invoice #, Outlet, Owner name..." placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 pl-9 pr-4 py-2.5 text-[11px] rounded-xl" />
-          </View>
+          <FilterBar searchValue={ledgerSearch} onSearchChange={setLedgerSearch} searchPlaceholder="Search by Invoice #, Outlet, Owner name...">
+            <SelectField
+              value={ledgerFilter}
+              onValueChange={v => setLedgerFilter(v as typeof ledgerFilter)}
+              options={[
+                { label: 'All Payments', value: 'All' },
+                { label: 'Fully Paid', value: 'Paid' },
+                { label: 'Partial Paid', value: 'Partial' },
+                { label: 'Unpaid / Credit', value: 'Credit' },
+              ]}
+              title="Settlement Status"
+              className={FILTER_PILL_CLASS}
+              textClassName={FILTER_PILL_TEXT_CLASS}
+            />
+          </FilterBar>
 
-          <View className="flex-row flex-wrap gap-1.5">
-            {(['All', 'Paid', 'Partial', 'Credit'] as const).map(f => (
-              <Pressable key={f} onPress={() => setLedgerFilter(f)} className={`px-2.5 py-1 rounded-lg border ${ledgerFilter === f ? 'bg-blue-600 border-blue-600' : 'bg-white border-slate-200'}`}>
-                <Text className={`text-[10px] font-bold ${ledgerFilter === f ? 'text-white' : 'text-slate-600'}`}>{f === 'Credit' ? 'Unpaid / Credit' : f}</Text>
-              </Pressable>
-            ))}
-          </View>
+          {(() => {
+            const filteredInvoices = data.invoices.filter(inv => {
+              const order = data.orders.find(o => o.id === inv.order_id);
+              const store = order ? data.stores.find(s => s.id === order.store_id) : null;
+              const searchMatch = !ledgerSearch || inv.invoice_number.toLowerCase().includes(ledgerSearch.toLowerCase()) || (store && (store.name.toLowerCase().includes(ledgerSearch.toLowerCase()) || store.owner_name.toLowerCase().includes(ledgerSearch.toLowerCase())));
+              let filterMatch = true;
+              if (ledgerFilter === 'Paid') filterMatch = inv.payment_status === 'Paid';
+              else if (ledgerFilter === 'Partial') filterMatch = inv.payment_status === 'Partial';
+              else if (ledgerFilter === 'Credit') filterMatch = inv.payment_status === 'Credit' || !inv.payment_status;
+              return searchMatch && filterMatch;
+            });
 
-          <View className="gap-3 md:flex-row md:flex-wrap">
-            {(() => {
-              const filteredInvoices = data.invoices.filter(inv => {
-                const order = data.orders.find(o => o.id === inv.order_id);
-                const store = order ? data.stores.find(s => s.id === order.store_id) : null;
-                const searchMatch = !ledgerSearch || inv.invoice_number.toLowerCase().includes(ledgerSearch.toLowerCase()) || (store && (store.name.toLowerCase().includes(ledgerSearch.toLowerCase()) || store.owner_name.toLowerCase().includes(ledgerSearch.toLowerCase())));
-                let filterMatch = true;
-                if (ledgerFilter === 'Paid') filterMatch = inv.payment_status === 'Paid';
-                else if (ledgerFilter === 'Partial') filterMatch = inv.payment_status === 'Partial';
-                else if (ledgerFilter === 'Credit') filterMatch = inv.payment_status === 'Credit' || !inv.payment_status;
-                return searchMatch && filterMatch;
-              });
-              if (filteredInvoices.length === 0) {
-                return <Text className="w-full text-center text-slate-400 italic py-8 bg-white border border-slate-200 rounded-2xl text-xs">No bills match your current search and filters.</Text>;
-              }
-              return filteredInvoices.map(inv => {
+            if (viewMode === 'table') {
+              return (
+                <DataTable
+                  data={filteredInvoices}
+                  keyExtractor={inv => inv.id}
+                  emptyText="No bills match your current search and filters."
+                  columns={[
+                    { key: 'invoice', label: 'Invoice', width: 110, render: inv => <Text className="font-extrabold text-slate-800 text-[11px]" numberOfLines={1}>{inv.invoice_number}</Text> },
+                    {
+                      key: 'store', label: 'Store', width: 160,
+                      render: inv => {
+                        const order = data.orders.find(o => o.id === inv.order_id);
+                        const store = order ? data.stores.find(s => s.id === order.store_id) : null;
+                        return <Text className="text-[10px] text-slate-600" numberOfLines={1}>{store?.name || '-'}</Text>;
+                      },
+                    },
+                    { key: 'date', label: 'Date', width: 100, grow: false, render: inv => <Text className="text-[10px] text-slate-500">{new Date(inv.created_at).toLocaleDateString()}</Text> },
+                    {
+                      key: 'amounts', label: 'Total / Paid / Due', width: 170,
+                      render: inv => {
+                        const paidVal = inv.paid_amount || 0;
+                        const remainingVal = Math.max(0, inv.grand_total - paidVal);
+                        return (
+                          <Text className="text-[10px]" numberOfLines={1}>
+                            <Text className="font-bold text-slate-700">Rs{formatWholeRupees(inv.grand_total)}</Text>
+                            {' / '}<Text className="font-bold text-emerald-600">Rs{formatWholeRupees(paidVal)}</Text>
+                            {' / '}<Text className={`font-bold ${remainingVal > 0 ? 'text-rose-600' : 'text-slate-500'}`}>Rs{formatWholeRupees(remainingVal)}</Text>
+                          </Text>
+                        );
+                      },
+                    },
+                    {
+                      key: 'status', label: 'Status', width: 90, grow: false,
+                      render: inv => {
+                        const isPaid = inv.payment_status === 'Paid';
+                        const isPartial = inv.payment_status === 'Partial';
+                        return <Text className={`px-2 py-0.5 font-bold rounded-full text-[9px] uppercase self-start ${isPaid ? 'bg-emerald-100 text-emerald-800' : isPartial ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>{inv.payment_status || 'Unpaid'}</Text>;
+                      },
+                    },
+                    {
+                      key: 'actions', label: 'Actions', width: 150, grow: false,
+                      render: inv => {
+                        const order = data.orders.find(o => o.id === inv.order_id);
+                        const store = order ? data.stores.find(s => s.id === order.store_id) : null;
+                        const isPaid = inv.payment_status === 'Paid';
+                        const paidVal = inv.paid_amount || 0;
+                        const remainingVal = Math.max(0, inv.grand_total - paidVal);
+                        if (!store || !order) return null;
+                        return (
+                          <View className="flex-row flex-wrap items-center gap-1">
+                            <Pressable onPress={() => downloadInvoicePDF(order, inv, store)} className="p-1.5 bg-slate-50 rounded-lg border border-slate-200"><Download size={13} color="#475569" /></Pressable>
+                            <Pressable onPress={() => handleWhatsAppShare(inv, store, order)} className="p-1.5 bg-emerald-50 rounded-lg border border-emerald-200"><MessageSquare size={13} color="#059669" /></Pressable>
+                            {!isPaid && (
+                              <Pressable
+                                onPress={() => { setSelectedStore(store); setGeneratedInvoice(inv); setLastCreatedOrder(order); setPaymentAmount(parseFloat(remainingVal.toFixed(2))); setSettlementOrigin('ledger'); setActiveForm('payment_settlement'); }}
+                                className="py-1 px-2 bg-blue-600 rounded-lg active:bg-blue-700"
+                              >
+                                <Text className="font-black text-[9px] text-white">Settle</Text>
+                              </Pressable>
+                            )}
+                          </View>
+                        );
+                      },
+                    },
+                  ] as DataTableColumn<typeof filteredInvoices[number]>[]}
+                />
+              );
+            }
+
+            if (filteredInvoices.length === 0) {
+              return <Text className="w-full text-center text-slate-400 italic py-8 bg-white border border-slate-200 rounded-2xl text-xs">No bills match your current search and filters.</Text>;
+            }
+            return (
+              <View className="gap-3 md:flex-row md:flex-wrap">
+              {filteredInvoices.map(inv => {
                 const order = data.orders.find(o => o.id === inv.order_id);
                 const store = order ? data.stores.find(s => s.id === order.store_id) : null;
                 const isPaid = inv.payment_status === 'Paid';
@@ -925,9 +1173,9 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                       </View>
                     )}
                     <View className="flex-row justify-between bg-slate-50 p-2 rounded-xl">
-                      <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">BILL TOTAL</Text><Text className="font-black text-slate-700 text-[11px]">Rs {inv.grand_total.toFixed(2)}</Text></View>
-                      <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">PAID</Text><Text className="font-black text-emerald-600 text-[11px]">Rs {paidVal.toFixed(2)}</Text></View>
-                      <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">DUE</Text><Text className={`font-black text-[11px] ${remainingVal > 0 ? 'text-rose-600' : 'text-slate-500'}`}>{formatINR(remainingVal)}</Text></View>
+                      <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">BILL TOTAL</Text><Text className="font-black text-slate-700 text-[11px]">Rs {formatWholeRupees(inv.grand_total)}</Text></View>
+                      <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">PAID</Text><Text className="font-black text-emerald-600 text-[11px]">Rs {formatWholeRupees(paidVal)}</Text></View>
+                      <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">DUE</Text><Text className={`font-black text-[11px] ${remainingVal > 0 ? 'text-rose-600' : 'text-slate-500'}`}>Rs {formatWholeRupees(remainingVal)}</Text></View>
                     </View>
 
                     {isExpanded && store && order && (
@@ -987,13 +1235,14 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                     )}
                   </View>
                 );
-              });
-            })()}
-          </View>
+              })}
+              </View>
+            );
+          })()}
         </View>
         </ScrollView>
       ) : (
-        <ScrollView className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
+        <ScrollView ref={scrollRef} className="flex-1" contentContainerStyle={{ padding: 16, alignItems: 'center' }}>
         <View className="w-full lg:max-w-[1400px] gap-4">
           {activeTab === 'home' && (
             <View className="gap-4">
@@ -1050,9 +1299,9 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                           <Text className={`px-2 py-0.5 font-bold rounded-full text-[8px] uppercase ${isPaid ? 'bg-emerald-100 text-emerald-800' : isPartial ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>{inv.payment_status || 'Unpaid'}</Text>
                         </View>
                         <View className="flex-row justify-between pt-1 border-t border-slate-100">
-                          <Text className="text-[9px] font-extrabold text-slate-700">Rs{inv.grand_total.toFixed(2)}</Text>
-                          <Text className="text-[9px] font-extrabold text-emerald-600">Rs{paidVal.toFixed(2)}</Text>
-                          <Text className={`text-[9px] font-extrabold ${remainingVal > 0 ? 'text-rose-600' : 'text-slate-500'}`}>Rs{remainingVal.toFixed(2)}</Text>
+                          <Text className="text-[9px] font-extrabold text-slate-700">Rs{formatWholeRupees(inv.grand_total)}</Text>
+                          <Text className="text-[9px] font-extrabold text-emerald-600">Rs{formatWholeRupees(paidVal)}</Text>
+                          <Text className={`text-[9px] font-extrabold ${remainingVal > 0 ? 'text-rose-600' : 'text-slate-500'}`}>Rs{formatWholeRupees(remainingVal)}</Text>
                         </View>
                       </View>
                     );
@@ -1065,37 +1314,61 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
 
           {activeTab === 'inventory' && (
             <View className="gap-4">
-              <View className="relative justify-center lg:max-w-sm">
-                <View className="absolute left-3 z-10"><Search size={16} color="#94a3b8" /></View>
-                <TextInput value={availSearch} onChangeText={setAvailSearch} placeholder="Search truck stock..." placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 pl-9 pr-4 py-2.5 text-xs rounded-xl" />
-              </View>
+              <FilterBar searchValue={availSearch} onSearchChange={setAvailSearch} searchPlaceholder="Search truck stock..." hideViewToggle />
               <View className="bg-white/70 border border-white/50 p-3 rounded-2xl">
-                <Text className="font-bold text-slate-800 text-xs mb-3">My Dispatched Cargo Quantities</Text>
-                <View className="gap-2 md:flex-row md:flex-wrap">
-                  {data.products
+                <View className="flex-row items-center justify-between mb-3">
+                  <Text className="font-bold text-slate-800 text-xs">My Dispatched Cargo Quantities</Text>
+                </View>
+                <ViewToggle />
+                {(() => {
+                  const cargoList = data.products
+                    .filter(p => p.status === 'Active')
                     .filter(p => p.name.toLowerCase().includes(availSearch.toLowerCase()))
                     .map(p => {
                       const truckQty = data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === p.id)?.quantity || 0;
                       const whQty = data.warehouse_inventory.find(wh => wh.product_id === p.id)?.available_qty || 0;
                       return { ...p, truckQty, whQty };
                     })
-                    .sort((a, b) => { const aHas = a.truckQty > 0 ? 1 : 0; const bHas = b.truckQty > 0 ? 1 : 0; if (aHas !== bHas) return bHas - aHas; return a.name.localeCompare(b.name); })
-                    .map(p => {
-                      const isNotLoaded = p.truckQty === 0;
-                      return (
-                        <View key={p.id} className={`w-full md:w-[48%] xl:w-[32%] p-2.5 rounded-xl border flex-row items-center justify-between ${isNotLoaded ? 'bg-slate-100 border-slate-200' : 'bg-white/80 border-white/60'}`}>
-                          <View className="flex-1">
-                            <Text className={`font-bold text-xs ${isNotLoaded ? 'text-slate-500' : 'text-slate-800'}`}>{p.name}</Text>
-                            <Text className="text-[10px] text-slate-400">{p.brand}</Text>
+                    .sort((a, b) => { const aHas = a.truckQty > 0 ? 1 : 0; const bHas = b.truckQty > 0 ? 1 : 0; if (aHas !== bHas) return bHas - aHas; return a.name.localeCompare(b.name); });
+
+                  if (viewMode === 'table') {
+                    return (
+                      <View className="mt-3">
+                        <DataTable
+                          data={cargoList}
+                          keyExtractor={p => p.id}
+                          emptyText="No products match your cargo search."
+                          columns={[
+                            { key: 'name', label: 'Product', width: 180, render: p => <Text className={`font-bold text-[11px] ${p.truckQty === 0 ? 'text-slate-500' : 'text-slate-800'}`} numberOfLines={1}>{p.name}</Text> },
+                            { key: 'brand', label: 'Brand', width: 120, render: p => <Text className="text-[10px] text-slate-500" numberOfLines={1}>{p.brand}</Text> },
+                            { key: 'truck', label: 'Truck Qty', width: 90, align: 'right' as const, render: p => <Text className={`font-black text-right px-1.5 py-0.5 rounded text-[10px] ${p.truckQty === 0 ? 'text-slate-400 bg-slate-200' : 'text-pink-700 bg-pink-100'}`}>{p.truckQty}</Text> },
+                            { key: 'warehouse', label: 'Warehouse Qty', width: 110, align: 'right' as const, render: p => <Text className="font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded text-[10px] text-right">{p.whQty}</Text> },
+                          ] as DataTableColumn<typeof cargoList[number]>[]}
+                        />
+                      </View>
+                    );
+                  }
+
+                  return (
+                    <View className="gap-2 md:flex-row md:flex-wrap mt-3">
+                      {cargoList.map(p => {
+                        const isNotLoaded = p.truckQty === 0;
+                        return (
+                          <View key={p.id} className={`w-full md:w-[48%] xl:w-[32%] p-2.5 rounded-xl border flex-row items-center justify-between ${isNotLoaded ? 'bg-slate-100 border-slate-200' : 'bg-white/80 border-white/60'}`}>
+                            <View className="flex-1">
+                              <Text className={`font-bold text-xs ${isNotLoaded ? 'text-slate-500' : 'text-slate-800'}`}>{p.name}</Text>
+                              <Text className="text-[10px] text-slate-400">{p.brand}</Text>
+                            </View>
+                            <View className="flex-row items-center gap-2">
+                              <View className="items-center"><Text className="text-[9px] text-slate-400 font-bold">Truck</Text><Text className={`font-black px-1.5 py-0.5 rounded text-[10px] ${isNotLoaded ? 'text-slate-400 bg-slate-200' : 'text-pink-700 bg-pink-100'}`}>{p.truckQty}</Text></View>
+                              <View className="items-center"><Text className="text-[9px] text-slate-400 font-bold">Silo</Text><Text className="font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded text-[10px]">{p.whQty}</Text></View>
+                            </View>
                           </View>
-                          <View className="flex-row items-center gap-2">
-                            <View className="items-center"><Text className="text-[9px] text-slate-400 font-bold">Truck</Text><Text className={`font-black px-1.5 py-0.5 rounded text-[10px] ${isNotLoaded ? 'text-slate-400 bg-slate-200' : 'text-pink-700 bg-pink-100'}`}>{p.truckQty}</Text></View>
-                            <View className="items-center"><Text className="text-[9px] text-slate-400 font-bold">Silo</Text><Text className="font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded text-[10px]">{p.whQty}</Text></View>
-                          </View>
-                        </View>
-                      );
-                    })}
-                </View>
+                        );
+                      })}
+                    </View>
+                  );
+                })()}
               </View>
             </View>
           )}
@@ -1109,43 +1382,91 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                 </View>
                 <Pressable onPress={() => setActiveForm('register_store')} className="bg-blue-600 p-2.5 rounded-xl active:bg-blue-700"><Plus size={20} color="#fff" /></Pressable>
               </View>
-              <View className="flex-row flex-wrap gap-1.5">
-                {(['All', 'Paid', 'Unpaid', 'Partial'] as const).map(f => (
-                  <Pressable key={f} onPress={() => setStoreStatusFilter(f)} className={`px-3 py-1 rounded-lg border ${storeStatusFilter === f ? 'bg-blue-600 border-blue-600' : 'bg-white border-slate-200'}`}>
-                    <Text className={`text-[10px] font-bold ${storeStatusFilter === f ? 'text-white' : 'text-slate-600'}`}>{f === 'Unpaid' ? 'Unpaid / Credit' : f}</Text>
-                  </Pressable>
-                ))}
-              </View>
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {(() => {
-                  const filteredStores = data.stores.filter(s => {
-                    if (s.status !== 'Active') return false;
-                    const searchMatch = s.name.toLowerCase().includes(storeSearch.toLowerCase()) || s.area.toLowerCase().includes(storeSearch.toLowerCase()) || (s.owner_name && s.owner_name.toLowerCase().includes(storeSearch.toLowerCase()));
-                    if (!searchMatch) return false;
-                    if (storeStatusFilter === 'All') return true;
-                    return getStoreStatus(s.id, s.outstanding_balance) === storeStatusFilter;
-                  });
-                  if (filteredStores.length === 0) return <Text className="w-full text-center text-slate-400 italic py-8 bg-white/70 border border-white/50 rounded-2xl text-xs">No partner outlets match your search or filter.</Text>;
-                  return filteredStores.map(s => {
-                    const status = getStoreStatus(s.id, s.outstanding_balance);
-                    return (
-                      <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white/70 border border-white/50 rounded-2xl p-3 relative border-l-4 border-l-blue-400">
-                        <View className="absolute top-3 right-3 flex-row items-center gap-1.5">
-                          <Text className={`text-[8px] font-extrabold px-1.5 py-0.5 rounded border uppercase ${status === 'Paid' ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : status === 'Partial' ? 'bg-amber-50 text-amber-600 border-amber-100' : 'bg-rose-50 text-rose-600 border-rose-100'}`}>{status === 'Unpaid' ? 'Credit/Unpaid' : status}</Text>
+              <FilterBar hideSearch>
+                <SelectField
+                  value={storeStatusFilter}
+                  onValueChange={v => setStoreStatusFilter(v as typeof storeStatusFilter)}
+                  options={[
+                    { label: 'All Payments', value: 'All' },
+                    { label: 'Fully Paid', value: 'Paid' },
+                    { label: 'Unpaid / Credit', value: 'Unpaid' },
+                    { label: 'Partial Paid', value: 'Partial' },
+                  ]}
+                  title="Settlement Status"
+                  className={FILTER_PILL_CLASS}
+                  textClassName={FILTER_PILL_TEXT_CLASS}
+                />
+              </FilterBar>
+              {(() => {
+                const filteredStores = data.stores.filter(s => {
+                  if (s.status !== 'Active') return false;
+                  const searchMatch = s.name.toLowerCase().includes(storeSearch.toLowerCase()) || s.area.toLowerCase().includes(storeSearch.toLowerCase()) || (s.owner_name && s.owner_name.toLowerCase().includes(storeSearch.toLowerCase()));
+                  if (!searchMatch) return false;
+                  if (storeStatusFilter === 'All') return true;
+                  return getStoreStatus(s.id, s.outstanding_balance) === storeStatusFilter;
+                });
+
+                if (viewMode === 'table') {
+                  return (
+                    <DataTable
+                      data={filteredStores}
+                      keyExtractor={s => s.id}
+                      emptyText="No partner outlets match your search or filter."
+                      columns={[
+                        {
+                          key: 'name', label: 'Store', width: 190,
+                          render: s => {
+                            const status = getStoreStatus(s.id, s.outstanding_balance);
+                            return (
+                              <View className="gap-0.5">
+                                <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text>
+                                <Text className={`text-[8px] font-extrabold px-1.5 py-0.5 rounded border uppercase self-start ${status === 'Paid' ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : status === 'Partial' ? 'bg-amber-50 text-amber-600 border-amber-100' : 'bg-rose-50 text-rose-600 border-rose-100'}`}>{status === 'Unpaid' ? 'Credit/Unpaid' : status}</Text>
+                              </View>
+                            );
+                          },
+                        },
+                        { key: 'area', label: 'Area', width: 100, render: s => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.area}</Text> },
+                        { key: 'phone', label: 'Phone', width: 110, render: s => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.phone}</Text> },
+                        { key: 'outstanding', label: 'Outstanding', width: 100, align: 'right' as const, render: s => <Text className="font-bold text-slate-700 text-[11px] text-right">{formatINR(s.outstanding_balance)}</Text> },
+                        {
+                          key: 'actions', label: 'Actions', width: 150, grow: false,
+                          render: s => (
+                            <View className="flex-row flex-wrap items-center gap-1.5">
+                              <Pressable onPress={() => { setSelectedStore(s); setActiveForm('add_visit'); }} className="py-1 px-2 bg-amber-50 border border-amber-200 rounded-lg active:bg-amber-100"><Text className="text-amber-700 text-[9px] font-bold">Visit</Text></Pressable>
+                              <Pressable onPress={() => { setSelectedStore(s); setActiveTab('deliveries'); }} className="py-1 px-2 bg-emerald-50 border border-emerald-200 rounded-lg active:bg-emerald-100"><Text className="text-emerald-700 text-[9px] font-bold">Pre-book</Text></Pressable>
+                              <Pressable onPress={() => handleStartOrder(s)} className="py-1 px-2 bg-blue-600 rounded-lg active:bg-blue-700"><Text className="text-white text-[9px] font-black">Order</Text></Pressable>
+                            </View>
+                          ),
+                        },
+                      ] as DataTableColumn<typeof filteredStores[number]>[]}
+                    />
+                  );
+                }
+
+                if (filteredStores.length === 0) return <Text className="w-full text-center text-slate-400 italic py-8 bg-white/70 border border-white/50 rounded-2xl text-xs">No partner outlets match your search or filter.</Text>;
+                return (
+                  <View className="gap-2.5 md:flex-row md:flex-wrap">
+                    {filteredStores.map(s => {
+                      const status = getStoreStatus(s.id, s.outstanding_balance);
+                      return (
+                        <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white/70 border border-white/50 rounded-2xl p-3 relative border-l-4 border-l-blue-400">
+                          <View className="absolute top-3 right-3 flex-row items-center gap-1.5">
+                            <Text className={`text-[8px] font-extrabold px-1.5 py-0.5 rounded border uppercase ${status === 'Paid' ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : status === 'Partial' ? 'bg-amber-50 text-amber-600 border-amber-100' : 'bg-rose-50 text-rose-600 border-rose-100'}`}>{status === 'Unpaid' ? 'Credit/Unpaid' : status}</Text>
+                          </View>
+                          <Text className="font-bold text-slate-800 text-xs pr-20">{s.name}</Text>
+                          <Text className="text-[10px] text-slate-400 mt-0.5">Area: {s.area} - Ph: {s.phone}</Text>
+                          <Text className="font-bold text-slate-700 text-xs mt-1">{formatINR(s.outstanding_balance)}</Text>
+                          <View className="flex-row flex-wrap gap-2 mt-3 pt-2 border-t border-white/40 justify-end">
+                            <Pressable onPress={() => { setSelectedStore(s); setActiveForm('add_visit'); }} className="py-1 px-2.5 bg-amber-50 border border-amber-200 rounded-lg active:bg-amber-100"><Text className="text-amber-700 text-[9px] font-bold">Log Visit</Text></Pressable>
+                            <Pressable onPress={() => { setSelectedStore(s); setActiveTab('deliveries'); }} className="py-1 px-2.5 bg-emerald-50 border border-emerald-200 rounded-lg active:bg-emerald-100"><Text className="text-emerald-700 text-[9px] font-bold">Pre-book</Text></Pressable>
+                            <Pressable onPress={() => handleStartOrder(s)} className="py-1 px-3 bg-blue-600 rounded-lg active:bg-blue-700"><Text className="text-white text-[9px] font-black">Create Order</Text></Pressable>
+                          </View>
                         </View>
-                        <Text className="font-bold text-slate-800 text-xs pr-20">{s.name}</Text>
-                        <Text className="text-[10px] text-slate-400 mt-0.5">Area: {s.area} - Ph: {s.phone}</Text>
-                        <Text className="font-bold text-slate-700 text-xs mt-1">{formatINR(s.outstanding_balance)}</Text>
-                        <View className="flex-row flex-wrap gap-2 mt-3 pt-2 border-t border-white/40 justify-end">
-                          <Pressable onPress={() => { setSelectedStore(s); setActiveForm('add_visit'); }} className="py-1 px-2.5 bg-amber-50 border border-amber-200 rounded-lg active:bg-amber-100"><Text className="text-amber-700 text-[9px] font-bold">Log Visit</Text></Pressable>
-                          <Pressable onPress={() => { setSelectedStore(s); setActiveTab('deliveries'); }} className="py-1 px-2.5 bg-emerald-50 border border-emerald-200 rounded-lg active:bg-emerald-100"><Text className="text-emerald-700 text-[9px] font-bold">Pre-book</Text></Pressable>
-                          <Pressable onPress={() => handleStartOrder(s)} className="py-1 px-3 bg-blue-600 rounded-lg active:bg-blue-700"><Text className="text-white text-[9px] font-black">Create Order</Text></Pressable>
-                        </View>
-                      </View>
-                    );
-                  });
-                })()}
-              </View>
+                      );
+                    })}
+                  </View>
+                );
+              })()}
             </View>
           )}
 
@@ -1184,6 +1505,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                         onValueChange={v => setSelectedStore(data.stores.find(store => store.id === v) || null)}
                         options={data.stores.filter(store => store.status === 'Active' || store.id === selectedStore?.id).map(store => ({ label: store.name, value: store.id }))}
                         title="Select Store"
+                        searchable
                         className="bg-white border border-slate-200 rounded-xl p-2.5 flex-row items-center justify-between"
                       />
                     </View>
@@ -1193,25 +1515,68 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                     </View>
                   </View>
 
-                  <View className="flex-row items-center justify-between bg-white/70 border border-white/50 rounded-2xl p-3">
-                    <Text className="text-[10px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
-                    <View className="flex-row bg-slate-100 p-1 rounded-lg">
-                      <Pressable onPress={() => setPreBookingPricingMode('wholesale')} className={`px-3 py-1.5 rounded-md ${preBookingPricingMode === 'wholesale' ? 'bg-white' : ''}`}>
-                        <Text className={`text-xs font-bold ${preBookingPricingMode === 'wholesale' ? 'text-indigo-700' : 'text-slate-500'}`}>Wholesale</Text>
-                      </Pressable>
-                      <Pressable onPress={() => setPreBookingPricingMode('retail')} className={`px-3 py-1.5 rounded-md ${preBookingPricingMode === 'retail' ? 'bg-white' : ''}`}>
-                        <Text className={`text-xs font-bold ${preBookingPricingMode === 'retail' ? 'text-indigo-700' : 'text-slate-500'}`}>Selling</Text>
-                      </Pressable>
+                  {retailEnabled && (
+                    <View className="flex-row items-center justify-between bg-white/70 border border-white/50 rounded-2xl p-2">
+                      <Text className="text-[9px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
+                      <View className="flex-row bg-slate-100 p-0.5 rounded-lg">
+                        <Pressable onPress={() => setPreBookingPricingMode('wholesale')} className={`px-2 py-1 rounded-md ${preBookingPricingMode === 'wholesale' ? 'bg-indigo-600' : ''}`}>
+                          <Text className={`text-[10px] font-bold ${preBookingPricingMode === 'wholesale' ? 'text-white' : 'text-slate-500'}`}>Wholesale</Text>
+                        </Pressable>
+                        <Pressable onPress={() => setPreBookingPricingMode('retail')} className={`px-2 py-1 rounded-md ${preBookingPricingMode === 'retail' ? 'bg-indigo-600' : ''}`}>
+                          <Text className={`text-[10px] font-bold ${preBookingPricingMode === 'retail' ? 'text-white' : 'text-slate-500'}`}>Selling</Text>
+                        </Pressable>
+                      </View>
                     </View>
-                  </View>
+                  )}
+
+                  {canToggleGst && (
+                    <View className="flex-row items-center justify-between bg-white/70 border border-white/50 rounded-2xl p-2">
+                      <Text className="text-[9px] font-bold text-slate-500 uppercase">GST</Text>
+                      <View className="flex-row bg-slate-100 p-0.5 rounded-lg">
+                        <Pressable onPress={() => setPreBookingGstMode('with_gst')} className={`px-2 py-1 rounded-md ${preBookingGstMode === 'with_gst' ? 'bg-indigo-600' : ''}`}>
+                          <Text className={`text-[10px] font-bold ${preBookingGstMode === 'with_gst' ? 'text-white' : 'text-slate-500'}`}>With GST</Text>
+                        </Pressable>
+                        <Pressable onPress={() => setPreBookingGstMode('without_gst')} className={`px-2 py-1 rounded-md ${preBookingGstMode === 'without_gst' ? 'bg-indigo-600' : ''}`}>
+                          <Text className={`text-[10px] font-bold ${preBookingGstMode === 'without_gst' ? 'text-white' : 'text-slate-500'}`}>No GST</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  )}
 
                   <View className="bg-white/70 border border-white/50 rounded-2xl p-4 gap-3">
                     <Text className="text-xs font-extrabold text-slate-700 uppercase">2. Select Products & Quantities</Text>
-                    <View className="gap-2 md:flex-row md:flex-wrap">
-                      {data.products.filter(product => product.status === 'Active' && getEffectiveAvailableForBooking(product.id) > 0).length === 0 && (
-                        <Text className="text-[10px] text-slate-400 italic py-2 text-center">No products currently have warehouse stock available to pre-book.</Text>
+                    <View className="flex-row items-center gap-2 bg-white border border-slate-200 rounded-xl px-3">
+                      <Search size={14} color="#94a3b8" />
+                      <TextInput
+                        value={preBookingProductSearch}
+                        onChangeText={setPreBookingProductSearch}
+                        placeholder="Search products..."
+                        placeholderTextColor="#94a3b8"
+                        className="flex-1 text-xs text-slate-800 py-2"
+                        style={{ outlineStyle: 'none' } as any}
+                      />
+                      {preBookingProductSearch.length > 0 && (
+                        <Pressable onPress={() => setPreBookingProductSearch('')} hitSlop={8}>
+                          <X size={14} color="#94a3b8" />
+                        </Pressable>
                       )}
-                      {data.products.filter(product => product.status === 'Active' && getEffectiveAvailableForBooking(product.id) > 0).map(product => {
+                    </View>
+                    <View className="gap-2 md:flex-row md:flex-wrap">
+                      {(() => {
+                        const baseBookingProducts = data.products.filter(product => product.status === 'Active' && getEffectiveAvailableForBooking(product.id) > 0 && product.name.toLowerCase().includes(preBookingProductSearch.trim().toLowerCase()));
+                        if (baseBookingProducts.length === 0) {
+                          return <Text className="text-[10px] text-slate-400 italic py-2 text-center">{preBookingProductSearch.trim() ? 'No products match your search.' : 'No products currently have warehouse stock available to pre-book.'}</Text>;
+                        }
+                        return null;
+                      })()}
+                      {(() => {
+                        const baseBookingProducts = data.products
+                          .filter(product => product.status === 'Active' && getEffectiveAvailableForBooking(product.id) > 0 && product.name.toLowerCase().includes(preBookingProductSearch.trim().toLowerCase()));
+                        // Deliberately NOT reordered by selection - a product
+                        // keeps its normal position (and scroll position stays
+                        // put) no matter how its quantity is changed.
+                        return baseBookingProducts;
+                      })().map(product => {
                         const warehouseInventory = data.warehouse_inventory.find(inv => inv.product_id === product.id);
                         const availableQty = getEffectiveAvailableForBooking(product.id);
                         const reservedQty = warehouseInventory?.reserved_qty || 0;
@@ -1220,12 +1585,12 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                           <View key={product.id} className={`w-full md:w-[48%] bg-white/90 border rounded-xl p-3 flex-row items-center justify-between gap-3 ${qty > 0 ? 'border-emerald-300' : 'border-white/60'}`}>
                             <View className="flex-1">
                               <Text className="font-bold text-slate-800 text-xs">{product.name}</Text>
-                              <Text className="text-[9px] font-bold text-emerald-700 mt-0.5">Rate: {formatINR(preBookingPricingMode === 'wholesale' ? product.wholesale_price : product.selling_price)}</Text>
+                              <Text className="text-[9px] font-bold text-emerald-700 mt-0.5">Rate: {formatINR(getEffectiveProductPrice(product, effectivePreBookingPricingMode, selectedStore?.id, data.storePricing))}</Text>
                               <Text className={`text-[9px] font-bold px-1.5 py-0.5 rounded self-start mt-1 ${availableQty > 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>WH: {availableQty} avail{reservedQty > 0 ? ` - ${reservedQty} reserved` : ''}</Text>
                             </View>
                             <View className="flex-row items-center gap-1.5">
                               <Pressable onPress={() => handleUpdatePreBookingQty(product.id, -1)} className="w-7 h-7 bg-white border border-slate-200 rounded-lg items-center justify-center active:bg-slate-100"><Text className="font-bold text-slate-700">-</Text></Pressable>
-                              <TextInput keyboardType="number-pad" value={String(qty)} onChangeText={v => handleSetPreBookingQty(product.id, v)} className="w-12 bg-white border border-slate-200 rounded-lg p-1 text-center font-extrabold text-xs" />
+                              <TextInput keyboardType="number-pad" value={qty === 0 ? '' : String(qty)} onChangeText={v => handleSetPreBookingQty(product.id, v)} placeholder="0" placeholderTextColor="#94a3b8" className="w-12 bg-white border border-slate-200 rounded-lg p-1 text-center font-extrabold text-xs" />
                               <Pressable onPress={() => handleUpdatePreBookingQty(product.id, 1)} className="w-7 h-7 bg-white border border-slate-200 rounded-lg items-center justify-center active:bg-slate-100"><Text className={`font-bold ${qty >= availableQty ? 'text-slate-300' : 'text-slate-700'}`}>+</Text></Pressable>
                             </View>
                           </View>
@@ -1260,6 +1625,68 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                 </View>
               )}
 
+              {preBookingView === 'confirm' && pendingPreBooking && (
+                <View className="gap-3 w-full lg:max-w-3xl lg:self-center">
+                  <View className="bg-emerald-600 rounded-2xl p-4 flex-row items-center justify-between">
+                    <View className="flex-1">
+                      <View className="flex-row items-center gap-2 mb-0.5"><CheckCircle size={16} color="#fff" /><Text className="font-extrabold text-sm text-white">Pre-Booking Confirmation</Text></View>
+                      <Text className="text-[10px] text-white/85 leading-relaxed">Review the full details before reserving stock.</Text>
+                    </View>
+                    <Pressable onPress={handleBackFromPreBookingConfirmation} className="bg-white/20 px-2.5 py-1.5 rounded-lg active:bg-white/30">
+                      <Text className="text-white font-bold text-[10px]">Back</Text>
+                    </Pressable>
+                  </View>
+
+                  <View className="bg-white/70 border border-white/50 rounded-2xl p-4 gap-2">
+                    <View className="flex-row justify-between"><Text className="text-slate-400 font-bold uppercase text-[9px]">Store Partner</Text><Text className="font-extrabold text-slate-800 text-xs">{pendingPreBooking.storeName}</Text></View>
+                    <View className="flex-row justify-between"><Text className="text-slate-400 font-bold uppercase text-[9px]">Scheduled Delivery Date</Text><Text className="font-extrabold text-slate-800 text-xs">{new Date(pendingPreBooking.scheduledDate).toLocaleDateString()}</Text></View>
+                    {!!pendingPreBooking.notes && (
+                      <View>
+                        <Text className="text-slate-400 font-bold uppercase text-[9px] mb-0.5">Notes</Text>
+                        <Text className="text-slate-700 text-xs">{pendingPreBooking.notes}</Text>
+                      </View>
+                    )}
+                  </View>
+
+                  {/* Same product order as the picker (selection order), never alphabetical. */}
+                  <View className="bg-white/70 border border-white/50 rounded-2xl p-4 gap-1.5">
+                    <Text className="text-xs font-extrabold text-slate-700 uppercase mb-0.5">Selected Products & Quantities</Text>
+                    {pendingPreBooking.items.map(item => {
+                      const p = data.products.find(prod => prod.id === item.product_id);
+                      return (
+                        <View key={item.product_id} className="flex-row justify-between items-center border-b border-slate-100 pb-1.5 last:border-0 last:pb-0">
+                          <View className="flex-1 pr-2">
+                            <Text numberOfLines={1} className="font-bold text-slate-800 text-[11px]">{p?.name || 'Unknown'}</Text>
+                            <Text className="text-slate-400 text-[9px]">{item.quantity} units x {formatINR(item.unit_price)}{item.tax_pct > 0 ? ` (+${item.tax_pct}% GST)` : ''}</Text>
+                          </View>
+                          <Text className="font-bold text-slate-700 text-[11px]">{formatINR(item.quantity * item.unit_price)}</Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+
+                  <View className="bg-white/70 border border-white/50 rounded-2xl p-4 gap-1">
+                    <View className="flex-row justify-between items-center">
+                      <Text className="text-slate-500 font-semibold text-[10px] uppercase">Total (Before Round Off)</Text>
+                      <Text className="font-bold text-slate-600 text-xs">{formatINR(pendingPreBooking.grandTotal - pendingPreBooking.roundOff)}</Text>
+                    </View>
+                    <View className="flex-row justify-between items-center">
+                      <Text className="text-slate-500 font-semibold text-[10px] uppercase">Round Off</Text>
+                      <Text className="font-bold text-slate-600 text-xs">{pendingPreBooking.roundOff > 0 ? '+' : ''}{formatINR(pendingPreBooking.roundOff)}</Text>
+                    </View>
+                    <View className="flex-row justify-between items-center pt-1 border-t border-slate-200">
+                      <Text className="font-extrabold text-slate-700 text-xs uppercase">Estimated Value</Text>
+                      <Text className="font-black text-indigo-600 text-sm">{formatINR(pendingPreBooking.grandTotal)}</Text>
+                    </View>
+                  </View>
+
+                  <Pressable onPress={handleConfirmPreBookingOrder} className="w-full py-3 bg-emerald-600 rounded-xl items-center flex-row justify-center gap-2 active:bg-emerald-700">
+                    <CheckCircle size={16} color="#fff" />
+                    <Text className="text-white font-extrabold text-xs uppercase">{editingBookingId ? 'Confirm Update' : 'Confirm Pre-Booking'}</Text>
+                  </Pressable>
+                </View>
+              )}
+
               {preBookingView === 'list' && (
                 <View className="gap-4">
                   <View className="flex-row items-center justify-between">
@@ -1267,7 +1694,40 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                     <Text className="text-[10px] font-extrabold px-2.5 py-1 rounded-full bg-blue-100 text-blue-700 border border-blue-200">{pendingPreBookings.length} Saved</Text>
                   </View>
 
-                  {pendingPreBookings.length === 0 ? (
+                  <ViewToggle />
+
+                  {viewMode === 'table' ? (
+                    <DataTable
+                      data={pendingPreBookings}
+                      keyExtractor={booking => booking.id}
+                      emptyText="No pre-bookings saved yet."
+                      columns={[
+                        { key: 'id', label: 'Booking ID', width: 110, render: booking => <Text className="font-extrabold text-slate-800 text-[11px]" numberOfLines={1}>{booking.id.toUpperCase()}</Text> },
+                        { key: 'store', label: 'Store', width: 160, render: booking => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{data.stores.find(s => s.id === booking.store_id)?.name || '-'}</Text> },
+                        { key: 'scheduled', label: 'Scheduled Date', width: 110, grow: false, render: booking => <Text className="text-[10px] text-slate-600">{booking.scheduled_delivery_date}</Text> },
+                        { key: 'total', label: 'Total', width: 90, align: 'right' as const, render: booking => <Text className="font-black text-indigo-600 text-[11px] text-right">Rs{formatWholeRupees(computeInvoiceTotals(booking.items).grand_total)}</Text> },
+                        {
+                          key: 'status', label: 'Status', width: 90, grow: false,
+                          render: booking => <Text className={`px-2 py-0.5 font-bold rounded-full text-[9px] uppercase self-start ${booking.status === 'Booked' ? 'bg-emerald-100 text-emerald-700' : booking.status === 'Delivered' ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-500'}`}>{booking.status}</Text>,
+                        },
+                        {
+                          key: 'actions', label: 'Actions', width: 150, grow: false,
+                          render: booking => (
+                            <View className="flex-row flex-wrap items-center gap-1">
+                              <Pressable onPress={() => handleDownloadPreBookingPdf(booking)} className="p-1.5 rounded-lg border bg-slate-50 border-slate-200"><Download size={13} color="#475569" /></Pressable>
+                              {booking.status === 'Booked' && (
+                                <>
+                                  <Pressable onPress={() => handleOpenEditPreBooking(booking)} className="p-1.5 rounded-lg border bg-slate-50 border-slate-200"><Edit size={13} color="#475569" /></Pressable>
+                                  <Pressable onPress={() => handleDeliverPreBookingOrder(booking.id)} className="py-1 px-2 bg-emerald-600 rounded-lg active:bg-emerald-700"><Text className="text-white text-[9px] font-black">Deliver</Text></Pressable>
+                                  <Pressable onPress={() => handleCancelPreBookingOrder(booking.id)} className="py-1 px-2 bg-rose-50 border border-rose-200 rounded-lg active:bg-rose-100"><Text className="text-rose-700 text-[9px] font-bold">Cancel</Text></Pressable>
+                                </>
+                              )}
+                            </View>
+                          ),
+                        },
+                      ] as DataTableColumn<typeof pendingPreBookings[number]>[]}
+                    />
+                  ) : pendingPreBookings.length === 0 ? (
                     <View className="py-10 items-center bg-white/70 border border-dashed border-white/70 rounded-2xl">
                       <ShoppingCart size={28} color="#cbd5e1" />
                       <Text className="text-slate-400 font-semibold text-xs mt-2">No pre-bookings saved yet.</Text>
@@ -1279,9 +1739,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                         const store = data.stores.find(s => s.id === booking.store_id);
                         const itemCount = booking.items.reduce((sum, item) => sum + item.quantity, 0);
                         const isBooked = booking.status === 'Booked';
-                        const subtotal = booking.items.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0);
-                        const taxTotal = booking.items.reduce((sum, item) => sum + ((item.quantity * item.unit_price * item.tax_pct) / 100), 0);
-                        const grandTotal = subtotal + taxTotal;
+                        const { tax: taxTotal, grand_total: grandTotal } = computeInvoiceTotals(booking.items);
                         const isExpanded = expandedPreBookings.includes(booking.id);
                         return (
                           <View key={booking.id} className={`w-full md:w-[48%] xl:w-[32%] p-3 border bg-white rounded-2xl gap-2.5 ${isBooked ? 'border-emerald-200' : 'border-slate-200'}`}>
@@ -1300,7 +1758,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                             <View className="flex-row justify-between bg-slate-50 p-2 rounded-xl">
                               <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">ITEMS</Text><Text className="font-black text-slate-700 text-[11px]">{itemCount} units</Text></View>
                               <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">TAX</Text><Text className="font-black text-slate-700 text-[11px]">Rs{taxTotal.toFixed(2)}</Text></View>
-                              <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">TOTAL</Text><Text className="font-black text-indigo-600 text-[11px]">Rs{grandTotal.toFixed(2)}</Text></View>
+                              <View className="items-center flex-1"><Text className="text-slate-400 font-bold text-[8px]">TOTAL</Text><Text className="font-black text-indigo-600 text-[11px]">Rs{formatWholeRupees(grandTotal)}</Text></View>
                             </View>
                             {isExpanded && (
                               <View className="bg-slate-50 rounded-xl p-3 gap-2">
@@ -1319,6 +1777,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                               <Pressable onPress={() => togglePreBookingExpand(booking.id)} className={`p-1.5 rounded-lg border flex-row items-center gap-1 ${isExpanded ? 'bg-blue-50 border-blue-200' : 'bg-slate-50 border-slate-200'}`}>
                                 <Eye size={14} color={isExpanded ? '#1d4ed8' : '#475569'} /><Text className={`font-bold text-[10px] ${isExpanded ? 'text-blue-700' : 'text-slate-600'}`}>{isExpanded ? 'Hide' : 'Details'}</Text>
                               </Pressable>
+                              <Pressable onPress={() => handleDownloadPreBookingPdf(booking)} className="p-1.5 rounded-lg border bg-slate-50 border-slate-200"><Download size={14} color="#475569" /></Pressable>
                               {isBooked && (
                                 <>
                                   <Pressable onPress={() => handleOpenEditPreBooking(booking)} className="p-1.5 rounded-lg border bg-slate-50 border-slate-200 flex-row items-center gap-1"><Edit size={14} color="#475569" /><Text className="font-bold text-[10px] text-slate-600">Edit</Text></Pressable>
@@ -1362,6 +1821,20 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
           {activeTab === 'visits' && (
             <View className="gap-2.5">
               <Text className="font-bold text-slate-600 text-xs uppercase">Site Visits Logging History</Text>
+              <ViewToggle />
+              {viewMode === 'table' ? (
+                <DataTable
+                  data={data.visits}
+                  keyExtractor={(v: any) => v.id}
+                  emptyText="No visit audits logged yet for this shift."
+                  columns={[
+                    { key: 'store', label: 'Store', width: 160, render: (v: any) => <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{data.stores.find(s => s.id === v.store_id)?.name || '-'}</Text> },
+                    { key: 'date', label: 'Visit Date', width: 100, grow: false, render: (v: any) => <Text className="text-[10px] text-slate-500">{new Date(v.date).toLocaleDateString()}</Text> },
+                    { key: 'notes', label: 'Notes', width: 260, render: (v: any) => <Text className="text-slate-600 italic text-[11px]" numberOfLines={2}>"{v.notes}"</Text> },
+                    { key: 'follow_up', label: 'Follow-up', width: 100, grow: false, render: (v: any) => v.follow_up_date ? <Text className="text-[9px] text-pink-600 font-extrabold uppercase">{v.follow_up_date}</Text> : <Text className="text-[10px] text-slate-300">-</Text> },
+                  ] as DataTableColumn<any>[]}
+                />
+              ) : (
               <View className="gap-2.5 md:flex-row md:flex-wrap">
               {data.visits.map((v: any) => {
                 const store = data.stores.find(s => s.id === v.store_id);
@@ -1375,6 +1848,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
               })}
               {data.visits.length === 0 && <Text className="w-full py-8 text-center text-slate-400 italic bg-white/70 rounded-2xl border border-white/50">No visit audits logged yet for this shift.</Text>}
               </View>
+              )}
             </View>
           )}
         </View>
@@ -1416,7 +1890,7 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
       {preBookingConfirmAction && preBookingConfirmAction.action === 'deliver' && (() => {
         const booking = data.preBookingOrders.find(o => o.id === preBookingConfirmAction.bookingId);
         if (!booking) return null;
-        const grandTotal = booking.items.reduce((sum, item) => sum + (item.quantity * item.unit_price * (1 + item.tax_pct / 100)), 0);
+        const grandTotal = computeInvoiceTotals(booking.items).grand_total;
         const isUnpaid = preBookingSettleMethod === 'Credit' || preBookingSettleAmount <= 0;
         const isPartial = !isUnpaid && preBookingSettleAmount < grandTotal - 0.05;
         let btnColor = 'bg-emerald-600 active:bg-emerald-700';
@@ -1428,18 +1902,31 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
           <Modal visible transparent animationType="fade" onRequestClose={() => setPreBookingConfirmAction(null)}>
             <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
               <ScrollView className="w-full max-w-sm" style={{ maxHeight: '92%' }} contentContainerStyle={{ flexGrow: 0 }}>
-                <View className="bg-white w-full rounded-3xl p-5 gap-3">
+                <View className="bg-white w-full rounded-3xl p-4 gap-2.5">
                   <Text className="text-base font-black text-slate-800 text-center">Confirm Delivery & Payment</Text>
-                  <Text className="text-xs text-slate-500 font-semibold text-center leading-relaxed">
+                  <Text className="text-[10px] text-slate-500 font-semibold text-center leading-relaxed">
                     Mark pre-booking {booking.id.toUpperCase()} as delivered and record how much was collected from the store.
                   </Text>
 
-                  <View className="bg-slate-50 rounded-xl p-3 flex-row justify-between items-center">
-                    <Text className="text-slate-400 font-bold text-[10px] uppercase">Bill Total</Text>
-                    <Text className="font-black text-indigo-600 text-sm">{formatINR(grandTotal)}</Text>
+                  {/* Same product order as the picker (selection order), never alphabetical. */}
+                  <View className="bg-slate-50 rounded-xl p-2.5 gap-1">
+                    <Text className="text-slate-400 font-black text-[8px] uppercase mb-0.5">Pre-Booking Bill</Text>
+                    {booking.items.map(item => {
+                      const p = data.products.find(prod => prod.id === item.product_id);
+                      return (
+                        <View key={item.product_id} className="flex-row justify-between items-center">
+                          <Text numberOfLines={1} className="flex-1 text-slate-700 font-bold text-[10px] pr-2">{p?.name || 'Unknown'} <Text className="text-slate-400 font-semibold">x{item.quantity}</Text></Text>
+                          <Text className="text-slate-600 font-bold text-[10px]">{formatINR(item.quantity * item.unit_price)}</Text>
+                        </View>
+                      );
+                    })}
+                    <View className="flex-row justify-between items-center border-t border-slate-200 mt-1 pt-1">
+                      <Text className="text-slate-400 font-bold text-[10px] uppercase">Bill Total</Text>
+                      <Text className="font-black text-indigo-600 text-sm">Rs {formatWholeRupees(grandTotal)}</Text>
+                    </View>
                   </View>
 
-                  <View className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 gap-3">
+                  <View className="bg-indigo-50 border border-indigo-100 rounded-2xl p-3 gap-2">
                     <Text className="font-extrabold text-indigo-900 text-xs uppercase">Record Settlement</Text>
                     <View className="flex-row gap-2">
                       <Pressable onPress={() => { setPreBookingSettleMethod('UPI'); setPreBookingSettleAmount(parseFloat(grandTotal.toFixed(2))); }} className={`flex-1 py-2.5 rounded-xl border items-center ${!isPartial && !isUnpaid ? 'bg-emerald-600 border-emerald-600' : 'bg-white border-indigo-100'}`}>
@@ -1474,8 +1961,10 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                         <TextInput
                           editable={preBookingSettleMethod !== 'Credit'}
                           keyboardType="decimal-pad"
-                          value={String(preBookingSettleAmount)}
+                          value={preBookingSettleAmount === 0 ? '' : String(preBookingSettleAmount)}
                           onChangeText={v => setPreBookingSettleAmount(Math.max(0, Math.min(grandTotal, parseFloat(v) || 0)))}
+                          placeholder="0"
+                          placeholderTextColor="#94a3b8"
                           className={`w-full border border-indigo-200 font-black text-indigo-900 rounded-xl p-2.5 ${preBookingSettleMethod === 'Credit' ? 'bg-slate-100 text-slate-400' : 'bg-white'}`}
                         />
                       </View>
@@ -1493,9 +1982,9 @@ export default function SalespersonFlow({ data, setData, addNotification, syncQu
                     )}
 
                     {preBookingSettleMethod === 'UPI' && (
-                      <View className="bg-white border border-slate-200 rounded-2xl p-3 items-center gap-2">
-                        <Image source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=upi://pay?pa=distributor@ic-erp&pn=Ice%20Cream%20Distributors&am=${preBookingSettleAmount}&cu=INR` }} className="w-32 h-32" />
-                        <Text className="text-[9px] font-black text-slate-500 uppercase">Scan via GPay, PhonePe, Paytm, BHIM UPI</Text>
+                      <View className="bg-white border border-slate-200 rounded-xl p-2 flex-row items-center gap-2.5">
+                        <Image source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=100x100&data=upi://pay?pa=distributor@ic-erp&pn=Ice%20Cream%20Distributors&am=${preBookingSettleAmount}&cu=INR` }} className="w-16 h-16" />
+                        <Text className="flex-1 text-[9px] font-black text-slate-500 uppercase">Scan via GPay, PhonePe, Paytm, BHIM UPI</Text>
                       </View>
                     )}
                   </View>

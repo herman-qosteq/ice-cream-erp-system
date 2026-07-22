@@ -753,7 +753,7 @@ CREATE TABLE `users` (
 
 LOCK TABLES `users` WRITE;
 /*!40000 ALTER TABLE `users` DISABLE KEYS */;
-INSERT INTO `users` VALUES ('u1','Mayben (Admin)','+91 98765 43210','Admin','$2a$10$0Bz1fSyy24lY/kb7hVsG8OCk.re8PrD0kEJwTGHUWNXa6FGMF3Ahi','Active','2026-07-07 12:34:55.201','2026-07-09 05:10:44.980'),('u2','Herman (Driver)','+91 91234 56789','Salesperson','$2a$10$D2yKqbog8dBj7iORk52kruFXdcjX.VbvS2/jHytCVCuKWJLw/29l.','Active','2026-07-07 12:34:55.208','2026-07-09 05:09:32.765'),('u3','Darwin (Warehouse)','+91 99887 76655','Warehouse','$2a$10$un75Ls0e1BOhY.MOskFiB.ZWyiiGw/SVrLw2dhT/OonI5wiFHPLj6','Active','2026-07-07 12:34:55.213','2026-07-09 05:09:51.092'),('u4','Vikram Singh (Driver-2)','+91 90909 12345','Salesperson','$2a$10$8Cv3xWkJulNKVNFS/mVvLuXOql9l4p8Cs/28aE8fJEkLpoMRUNzzi','Active','2026-07-07 12:34:55.219','2026-07-09 05:11:19.066');
+INSERT INTO `users` VALUES ('u1','Mayben (Admin)','+91 7373674757','Admin','$2a$10$0Bz1fSyy24lY/kb7hVsG8OCk.re8PrD0kEJwTGHUWNXa6FGMF3Ahi','Active','2026-07-07 12:34:55.201','2026-07-09 05:10:44.980'),('u2','Herman (Driver)','+91 91234 56789','Salesperson','$2a$10$D2yKqbog8dBj7iORk52kruFXdcjX.VbvS2/jHytCVCuKWJLw/29l.','Active','2026-07-07 12:34:55.208','2026-07-09 05:09:32.765'),('u3','Darwin (Warehouse)','+91 99887 76655','Warehouse','$2a$10$un75Ls0e1BOhY.MOskFiB.ZWyiiGw/SVrLw2dhT/OonI5wiFHPLj6','Active','2026-07-07 12:34:55.213','2026-07-09 05:09:51.092'),('u4','Vikram Singh (Driver-2)','+91 90909 12345','Salesperson','$2a$10$8Cv3xWkJulNKVNFS/mVvLuXOql9l4p8Cs/28aE8fJEkLpoMRUNzzi','Active','2026-07-07 12:34:55.219','2026-07-09 05:11:19.066');
 /*!40000 ALTER TABLE `users` ENABLE KEYS */;
 UNLOCK TABLES;
 

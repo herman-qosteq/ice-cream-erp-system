@@ -7,3 +7,4 @@ export const warehouseRouter = Router();
 
 warehouseRouter.get('/inventory', requireAuth, asyncHandler(warehouseController.listInventory));
 warehouseRouter.post('/inventory/adjust', requireAuth, requireRole('Admin', 'Warehouse'), asyncHandler(warehouseController.adjust));
+warehouseRouter.post('/inventory/correct', requireAuth, requireRole('Admin', 'Warehouse'), asyncHandler(warehouseController.correct));

@@ -7,3 +7,4 @@ export const purchasesRouter = Router();
 
 purchasesRouter.get('/', requireAuth, asyncHandler(purchasesController.list));
 purchasesRouter.post('/', requireAuth, requireRole('Admin', 'Warehouse'), asyncHandler(purchasesController.create));
+purchasesRouter.patch('/:id/bill-file', requireAuth, requireRole('Admin', 'Warehouse'), asyncHandler(purchasesController.updateBillFile));

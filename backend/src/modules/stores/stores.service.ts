@@ -47,7 +47,25 @@ interface StoreInput {
 // used throughout the rest of the app for relative date calculations.
 const TODAY = new Date('2026-06-27');
 
+// No DB-level unique constraint on Store - phone (every outlet's primary
+// contact number) and GST number (a real legal identifier when present) are
+// checked here instead, so the same partner outlet can't be registered twice.
+async function assertNoDuplicateStore(input: StoreInput, excludeId?: string) {
+  const phone = input.phone.trim();
+  if (phone) {
+    const byPhone = await prisma.store.findFirst({ where: { phone: { equals: phone }, ...(excludeId ? { NOT: { id: excludeId } } : {}) } });
+    if (byPhone) throw ApiError.conflict(`A store with this phone number already exists.`);
+  }
+
+  const gst = input.gst_number?.trim();
+  if (gst) {
+    const byGst = await prisma.store.findFirst({ where: { gst_number: { equals: gst }, ...(excludeId ? { NOT: { id: excludeId } } : {}) } });
+    if (byGst) throw ApiError.conflict(`A store with this GST number already exists.`);
+  }
+}
+
 export async function createStore(input: StoreInput, actorId: string) {
+  await assertNoDuplicateStore(input);
   const refillDays = refillDaysFor(input.refill_frequency, input.custom_days);
   const nextRefillDate = new Date(TODAY.getTime() + refillDays * 86400000);
 
@@ -61,6 +79,8 @@ export async function createStore(input: StoreInput, actorId: string) {
 export async function updateStore(id: string, input: StoreInput, actorId: string) {
   const existing = await prisma.store.findUnique({ where: { id } });
   if (!existing) throw ApiError.notFound('Store not found');
+
+  await assertNoDuplicateStore(input, id);
 
   const refillDays = refillDaysFor(input.refill_frequency, input.custom_days);
   const baseDate = existing.last_purchase_date ?? TODAY;

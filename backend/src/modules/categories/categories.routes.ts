@@ -8,3 +8,4 @@ export const categoriesRouter = Router();
 categoriesRouter.get('/', requireAuth, asyncHandler(categoriesController.list));
 categoriesRouter.post('/', requireAuth, requireRole('Admin'), asyncHandler(categoriesController.create));
 categoriesRouter.patch('/:id', requireAuth, requireRole('Admin'), asyncHandler(categoriesController.rename));
+categoriesRouter.patch('/:id/status', requireAuth, requireRole('Admin'), asyncHandler(categoriesController.toggleStatus));

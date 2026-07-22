@@ -1,38 +1,60 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, TextInput, Pressable, Image, Modal, Linking, ScrollView } from 'react-native';
-import { Search, MapPin, DollarSign, AlertTriangle, MessageSquare, Download, Eye, Plus, Truck } from 'lucide-react-native';
+import { Search, MapPin, DollarSign, AlertTriangle, MessageSquare, Download, Eye, Plus, Truck, X, Tag, Edit, Check, Trash2, RotateCcw, Copy } from 'lucide-react-native';
 import { ERPData, resolveActor } from '../../storage';
-import { Store, Order, Invoice, Payment, Supplier, Purchase, PreBookingItem, PreBookingOrder } from '../../types';
+import { Store, Order, Invoice, Payment, Supplier, Purchase, PreBookingItem, PreBookingOrder, Product, NotificationEntityType } from '../../types';
 import { calculateStoreHealthScore } from '../../data';
 import SelectField from '../../components/common/SelectField';
 import DateField from '../../components/common/DateField';
 import ConfirmModal from '../../components/common/ConfirmModal';
 import { exportHtmlReport } from '../../utils/reportExport';
-import { buildOrderInvoicePdf } from '../../utils/orderInvoicePdf';
-import { renderPdfDocument, renderInfoTable, renderSummaryLine, buildPdfFileName, stableRecordRef } from '../../utils/pdfTemplate';
+import { buildOrderInvoicePdf, buildPreBookingBillPdf } from '../../utils/orderInvoicePdf';
+import { renderPdfDocument, renderInfoTable, renderSummaryLine, buildPdfFileName, buildAttachmentFileName, stableRecordRef, freshReportRef } from '../../utils/pdfTemplate';
 import { pickImageAsDataUri } from '../../utils/imagePicker';
+import { viewOrDownloadDataUriFile, pickBillFileAsDataUri } from '../../utils/documentPicker';
 import { useAppContext } from '../../context/AppContext';
-import { suppliersApi, storesApi, preBookingsApi, ordersApi, paymentsApi, settingsApi } from '../../api/endpoints';
+import { useViewMode } from '../../context/ViewModeContext';
+import { useResetScrollOnChange } from '../../context/ScrollResetContext';
+import ViewToggle from '../../components/common/ViewToggle';
+import DataTable, { DataTableColumn } from '../../components/common/DataTable';
+import FilterBar, { FILTER_PILL_CLASS, FILTER_PILL_TEXT_CLASS } from '../../components/common/FilterBar';
+import DateRangeFilterField from '../../components/common/DateRangeFilterField';
+import ScrollableSection from '../../components/common/ScrollableSection';
+import PaginationFooter from '../../components/common/PaginationFooter';
+import { suppliersApi, storesApi, preBookingsApi, ordersApi, paymentsApi, settingsApi, areasApi, storePricingApi, purchasesApi } from '../../api/endpoints';
+import { getEffectiveProductPrice, getEffectiveDiscountPct, priceFromDiscount, discountFromPrice, isRetailPricingEnabled } from '../../utils/pricing';
+import { computeInvoiceTotals, formatWholeRupees } from '../../utils/billing';
+import { DateFilterMode, getDateFilterRange as getDateFilterRangeUtil, isWithinDateFilter as isWithinDateFilterUtil } from '../../utils/dateFilter';
+import { usePaginatedList } from '../../hooks/usePaginatedList';
+import { useResponsiveTableHeight } from '../../hooks/useResponsiveTableHeight';
 
 interface AdminSalesProps {
   data: ERPData;
   setData: (updater: ERPData | ((prev: ERPData) => ERPData)) => void;
-  addNotification: (type: any, message: string) => void;
+  addNotification: (type: any, message: string, entityType?: NotificationEntityType, entityId?: string) => void;
   currentUser: any;
   activeScreen?: string;
   showAlert: (opts: any) => void;
-  initialPaymentStoreId?: string | null;
-  onConsumeInitialPaymentStore?: () => void;
   initialPreBookingTodayFilter?: boolean;
   onConsumeInitialPreBookingTodayFilter?: () => void;
+  pendingNotificationTarget?: { entityType: NotificationEntityType; entityId: string } | null;
+  onConsumePendingNotificationTarget?: () => void;
   hideAdminControls?: boolean;
 }
 
 const inputClass = "w-full bg-slate-50 border border-slate-200 rounded p-2 text-xs text-slate-800";
 
-export default function AdminSales({ data, setData, addNotification, currentUser, activeScreen, showAlert, initialPaymentStoreId, onConsumeInitialPaymentStore, initialPreBookingTodayFilter, onConsumeInitialPreBookingTodayFilter, hideAdminControls = false }: AdminSalesProps) {
-  const { refreshData } = useAppContext();
+export default function AdminSales({ data, setData, addNotification, currentUser, activeScreen, showAlert, initialPreBookingTodayFilter, onConsumeInitialPreBookingTodayFilter, pendingNotificationTarget, onConsumePendingNotificationTarget, hideAdminControls = false }: AdminSalesProps) {
+  const { refreshData, notifyResourceChanged } = useAppContext();
+  const { viewMode } = useViewMode();
   const [salesTab, setSalesTab] = useState<'stores' | 'suppliers' | 'orders' | 'prebookings' | 'payments' | 'credit' | 'refill' | 'inactive'>('stores');
+
+  // Admin-grantable, app-wide: off by default, hiding the Retail/Selling
+  // price tier everywhere (pricing-mode toggles, Store Pricing "Selling %"
+  // overrides). Read sites below use an "effective" mode that clamps to
+  // 'wholesale' rather than resetting state, so a stale 'retail' selection
+  // from before the feature was disabled can't silently leak through.
+  const retailEnabled = isRetailPricingEnabled(data.rolePermissions);
 
   useEffect(() => {
     if (!activeScreen) return;
@@ -45,26 +67,251 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     else if (screenLower === 'credit') setSalesTab('credit');
     else if (screenLower === 'refill') setSalesTab('refill');
     else if (screenLower === 'inactive') setSalesTab('inactive');
+
+    // Navigating to a (possibly different) tab must always drop back to the
+    // list - activeForm drives a top-level ternary that overrides the
+    // salesTab-driven list view entirely, so without this reset a still-open
+    // Bill/Edit/Details/Create sub-view stays on screen forever no matter
+    // what the user taps in the sidebar or tab bar. Any popup/ConfirmModal
+    // below is rendered independently of activeForm too (it's just gated by
+    // its own visible flag), so it's closed here for the same reason - none
+    // of these should survive an explicit "go look at something else" action.
+    // (If this same navigation is actually a notification deep-link into a
+    // specific record, the pendingNotificationTarget effect below re-opens
+    // the right activeForm/record right after this runs.)
+    setActiveForm('list');
+    setViewingStore(null);
+    setReportingStore(null);
+    setViewingSupplier(null);
+    setReportingSupplier(null);
+    setViewingPreBooking(null);
+    setDeleteStoreConfirmId(null);
+    setDeleteAreaConfirmId(null);
+    setDeleteSupplierConfirmId(null);
+    setDeleteOrderConfirmId(null);
+    setDeletePreBookingConfirmId(null);
+    setCancelOrderConfirmId(null);
+    setShowUnsavedPricingModal(false);
+    setShowClonePricingModal(false);
+    setShowCloneFromModal(false);
+    setShowNewOrderPaymentModal(false);
+    setShowConfirmOrderDialog(false);
+    setPreBookingConfirmAction(null);
   }, [activeScreen]);
 
+  // Opens the specific record a tapped notification pointed at, once its
+  // owning tab is on-screen (AdminFlow switched screens to get here - see
+  // notificationEntityScreen there). Each branch owns a different tab/state
+  // pair, so only the matching entityType actually does anything per tap.
+  useEffect(() => {
+    if (!pendingNotificationTarget) return;
+    const { entityType, entityId } = pendingNotificationTarget;
+    if (entityType === 'order') {
+      const order = data.orders.find(o => o.id === entityId);
+      if (order) { setSalesTab('orders'); setSelectedOrder(order); setActiveForm('order_details'); }
+    } else if (entityType === 'prebooking') {
+      const pb = data.preBookingOrders.find(p => p.id === entityId);
+      if (pb) { setSalesTab('prebookings'); openPreBookingViewer(pb); }
+    } else if (entityType === 'purchase') {
+      const purchase = data.purchases.find(p => p.id === entityId);
+      if (purchase) { setSalesTab('suppliers'); openPurchaseViewer(purchase); }
+    } else if (entityType === 'store') {
+      const store = data.stores.find(s => s.id === entityId);
+      if (store) { setSalesTab('stores'); setViewingStore(store); }
+    } else if (entityType === 'supplier') {
+      const supplier = data.suppliers.find(s => s.id === entityId);
+      if (supplier) { setSalesTab('suppliers'); setViewingSupplier(supplier); }
+    } else {
+      return;
+    }
+    onConsumePendingNotificationTarget?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingNotificationTarget]);
+
   const [storeSearch, setStoreSearch] = useState('');
+  const [storeListTab, setStoreListTab] = useState<'active' | 'inactive'>('active');
+  const [supplierListTab, setSupplierListTab] = useState<'active' | 'inactive'>('active');
   const [expandedStoreId, setExpandedStoreId] = useState<string | null>(null);
   const [deleteStoreConfirmId, setDeleteStoreConfirmId] = useState<string | null>(null);
+  const [newAreaName, setNewAreaName] = useState('');
+  const [editingAreaId, setEditingAreaId] = useState<string | null>(null);
+  const [editingAreaName, setEditingAreaName] = useState('');
+  const [deleteAreaConfirmId, setDeleteAreaConfirmId] = useState<string | null>(null);
+  const [pricingStore, setPricingStore] = useState<Store | null>(null);
+  const [storePricingEdits, setStorePricingEdits] = useState<Record<string, { wholesale: string; retail: string; wholesalePrice: string; retailPrice: string }>>({});
+  const emptyPricingEdit = { wholesale: '', retail: '', wholesalePrice: '', retailPrice: '' };
+  // Price -> % direction: recomputes just that side's % from the typed
+  // price; the price itself is stored exactly as typed.
+  const updateStorePricingPrice = (productId: string, field: 'wholesale' | 'retail', priceStr: string, mrp: number) => {
+    setStorePricingEdits(prev => {
+      const current = prev[productId] || emptyPricingEdit;
+      const priceField = field === 'wholesale' ? 'wholesalePrice' : 'retailPrice';
+      return { ...prev, [productId]: { ...current, [priceField]: priceStr, [field]: String(discountFromPrice(mrp, parseFloat(priceStr) || 0)) } };
+    });
+  };
+  // % -> Price direction: recomputes just that side's price from the typed %.
+  const updateStorePricingPct = (productId: string, field: 'wholesale' | 'retail', pctStr: string, mrp: number) => {
+    setStorePricingEdits(prev => {
+      const current = prev[productId] || emptyPricingEdit;
+      const priceField = field === 'wholesale' ? 'wholesalePrice' : 'retailPrice';
+      return { ...prev, [productId]: { ...current, [field]: pctStr, [priceField]: priceFromDiscount(mrp, parseFloat(pctStr) || 0).toFixed(2) } };
+    });
+  };
+  const [pricingProductIds, setPricingProductIds] = useState<string[]>([]);
+  const [productPricingSearch, setProductPricingSearch] = useState('');
+  const [showUnsavedPricingModal, setShowUnsavedPricingModal] = useState(false);
+  const [showClonePricingModal, setShowClonePricingModal] = useState(false);
+  const [cloneTargetStoreIds, setCloneTargetStoreIds] = useState<string[]>([]);
+  const [cloneStoreSearch, setCloneStoreSearch] = useState('');
+  const [showCloneFromModal, setShowCloneFromModal] = useState(false);
+  const [cloneSourceStoreId, setCloneSourceStoreId] = useState('');
+  const [cloneFromStoreSearch, setCloneFromStoreSearch] = useState('');
   const [selectedStore, setSelectedStore] = useState<Store | null>(null);
   const [viewingStore, setViewingStore] = useState<Store | null>(null);
+  const [reportingStore, setReportingStore] = useState<Store | null>(null);
+  // Set when a bill is opened from the Purchase Report popup, so "Back" on
+  // the order details screen can reopen that popup instead of falling
+  // through to the plain stores list. Null when order_details was opened
+  // from anywhere else (e.g. the Orders tab), so Back behaves as before.
+  const [returnToStoreReport, setReturnToStoreReport] = useState<Store | null>(null);
+  // Same idea for opening an invoice from inside the Partner Purchase Report -
+  // Back should return to that report instead of dropping to the plain list.
+  const [returnToSupplierReport, setReturnToSupplierReport] = useState<Supplier | null>(null);
+  // Independent from the shared dateFilterMode/customDateFrom/customDateTo
+  // above (used by the Orders/Payments/Stores/Pre-bookings tabs) so opening
+  // a store's report can't change - or be changed by - filters on other tabs.
+  const [storeReportDateMode, setStoreReportDateMode] = useState<DateFilterMode>('today');
+  const [storeReportFrom, setStoreReportFrom] = useState(new Date().toISOString().split('T')[0]);
+  const [storeReportTo, setStoreReportTo] = useState(new Date().toISOString().split('T')[0]);
   const [viewingSupplier, setViewingSupplier] = useState<Supplier | null>(null);
+  const [reportingSupplier, setReportingSupplier] = useState<Supplier | null>(null);
+  // Independent from every other date-filter state in this file - same
+  // reasoning as storeReportDateMode above.
+  const [supplierReportDateMode, setSupplierReportDateMode] = useState<DateFilterMode>('today');
+  const [supplierReportFrom, setSupplierReportFrom] = useState(new Date().toISOString().split('T')[0]);
+  const [supplierReportTo, setSupplierReportTo] = useState(new Date().toISOString().split('T')[0]);
+  const [viewingPurchase, setViewingPurchase] = useState<Purchase | null>(null);
+  // Bill remove/replace feedback stays entirely inside the invoice viewer's
+  // own <Modal> instead of opening a second one - two RN <Modal>s (or a
+  // <Modal> plus the app's global alert, which renders outside any portal)
+  // don't reliably stack in front of one another, so a second popup can end
+  // up invisible behind the first until it's manually closed.
+  const [confirmRemoveBill, setConfirmRemoveBill] = useState(false);
+  const [billActionStatus, setBillActionStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  const openPurchaseViewer = (p: Purchase) => {
+    setConfirmRemoveBill(false);
+    setBillActionStatus(null);
+    setViewingPurchase(p);
+    setActiveForm('purchase_details');
+    // The invoice viewer is a full page now (activeForm-driven), not a
+    // <Modal> - switching pages underneath a still-open Partner Purchase
+    // Report <Modal> is invisible to the user since that Modal keeps
+    // covering the whole screen, so it must be closed too when navigating
+    // to the invoice from inside it. Remembered so Back can reopen it.
+    if (reportingSupplier) {
+      setReturnToSupplierReport(reportingSupplier);
+      setReportingSupplier(null);
+    }
+  };
+  const closePurchaseViewer = () => {
+    setActiveForm('list');
+    setViewingPurchase(null);
+    setConfirmRemoveBill(false);
+    setBillActionStatus(null);
+    if (returnToSupplierReport) {
+      setReportingSupplier(returnToSupplierReport);
+      setReturnToSupplierReport(null);
+    }
+  };
+  const [viewingPreBooking, setViewingPreBooking] = useState<PreBookingOrder | null>(null);
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
-  const [activeForm, setActiveForm] = useState<'list' | 'add_store' | 'edit_store' | 'add_payment' | 'order_details' | 'add_supplier' | 'add_prebooking' | 'create_order'>('list');
+  const [activeForm, setActiveForm] = useState<'list' | 'add_store' | 'edit_store' | 'add_payment' | 'order_details' | 'edit_order' | 'edit_delivered_prebooking' | 'add_supplier' | 'add_prebooking' | 'prebooking_confirmation' | 'create_order' | 'order_confirmation' | 'manage_areas' | 'store_pricing' | 'purchase_details'>('list');
+  useResetScrollOnChange(salesTab, activeForm);
   const [newOrderStoreId, setNewOrderStoreId] = useState<string>('');
-  const [newOrderTruckId, setNewOrderTruckId] = useState<string>('');
   const [newOrderItems, setNewOrderItems] = useState<Record<string, number>>({});
+  // Admin-only "Edit Order" (Confirmed/Delivered orders) - product_id -> qty,
+  // seeded from the order's current items when the form opens.
+  const [editOrderItems, setEditOrderItems] = useState<Record<string, number>>({});
+  const [editOrderProductSearch, setEditOrderProductSearch] = useState('');
+  const [deleteOrderConfirmId, setDeleteOrderConfirmId] = useState<string | null>(null);
+  // Admin-only "Edit" for a Delivered pre-booking (operates on the real order
+  // it produced - see backend prebookings.service.ts editDeliveredPreBooking).
+  const [editDeliveredPreBookingItems, setEditDeliveredPreBookingItems] = useState<Record<string, number>>({});
+  const [editDeliveredPreBookingSearch, setEditDeliveredPreBookingSearch] = useState('');
+  const [editingDeliveredPreBookingId, setEditingDeliveredPreBookingId] = useState<string | null>(null);
+  const [deletePreBookingConfirmId, setDeletePreBookingConfirmId] = useState<string | null>(null);
+
+  const openPreBookingViewer = (pb: PreBookingOrder) => {
+    setDeletePreBookingConfirmId(null);
+    // Same reasoning as openPurchaseViewer above - the Pre-Booking Bill is
+    // itself a <Modal>, so it must not open on top of the still-visible
+    // Partner Store Report <Modal> (nested Modals don't reliably stack).
+    if (reportingStore) {
+      setReturnToStoreReport(reportingStore);
+      setReportingStore(null);
+    }
+    setViewingPreBooking(pb);
+  };
+  const closePreBookingViewer = () => {
+    setDeletePreBookingConfirmId(null);
+    setViewingPreBooking(null);
+    if (returnToStoreReport) {
+      setReportingStore(returnToStoreReport);
+      setReturnToStoreReport(null);
+    }
+  };
+  // Tracks product IDs in the order they were first selected (qty raised
+  // above 0), so the picker and every downstream bill/invoice view can show
+  // "recently touched" items pinned to the top instead of resorting the
+  // whole catalog alphabetically. A product drops back out once its qty
+  // returns to 0, and re-adding it later puts it back at the end.
+  const [newOrderItemOrder, setNewOrderItemOrder] = useState<string[]>([]);
+  const updateNewOrderItemOrder = (productId: string, qty: number) => {
+    setNewOrderItemOrder(prev => {
+      if (qty > 0) return prev.includes(productId) ? prev : [...prev, productId];
+      return prev.includes(productId) ? prev.filter(id => id !== productId) : prev;
+    });
+  };
   const [newOrderPricingMode, setNewOrderPricingMode] = useState<'wholesale' | 'retail'>('wholesale');
+  const [newOrderGstMode, setNewOrderGstMode] = useState<'with_gst' | 'without_gst'>('with_gst');
+  const [newOrderProductSearch, setNewOrderProductSearch] = useState('');
+  const [pendingNewOrder, setPendingNewOrder] = useState<{ items: { product_id: string; quantity: number; unit_price: number; tax_pct: number }[]; storeId: string; grandTotal: number; roundOff: number; storeName: string } | null>(null);
+  // Gates the payment-collection modal separately from pendingNewOrder itself,
+  // so "Create Order & Generate Invoice" first lands on a full Order
+  // Confirmation page (activeForm 'order_confirmation') and the payment modal
+  // only opens once the admin explicitly hits "Confirm Order" there.
+  const [showNewOrderPaymentModal, setShowNewOrderPaymentModal] = useState(false);
+  // Gates the "are these details correct?" popup on the Order Confirmation
+  // page — payment only opens once the admin explicitly confirms there.
+  const [showConfirmOrderDialog, setShowConfirmOrderDialog] = useState(false);
+  const [newOrderSettleAmount, setNewOrderSettleAmount] = useState(0);
+  const [newOrderSettleMethod, setNewOrderSettleMethod] = useState<'Cash' | 'UPI' | 'Google Pay' | 'PhonePe' | 'Paytm' | 'Bank Transfer' | 'Credit'>('UPI');
   const [preBookingStoreId, setPreBookingStoreId] = useState<string>(data.stores[0]?.id || '');
   const [preBookingDate, setPreBookingDate] = useState<string>(new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0]);
   const [preBookingNotes, setPreBookingNotes] = useState<string>('');
   const [preBookingItems, setPreBookingItems] = useState<Record<string, number>>({});
+  // Product IDs in the order they were first selected (qty raised above 0) -
+  // keeps the picker (Table + Grid) and the saved booking's item order
+  // showing "recently touched" items pinned to the top instead of resorting
+  // alphabetically. A product drops back out once its qty returns to 0.
+  const [preBookingItemOrder, setPreBookingItemOrder] = useState<string[]>([]);
+  const updatePreBookingItemOrder = (productId: string, qty: number) => {
+    setPreBookingItemOrder(prev => {
+      if (qty > 0) return prev.includes(productId) ? prev : [...prev, productId];
+      return prev.includes(productId) ? prev.filter(id => id !== productId) : prev;
+    });
+  };
   const [preBookingPricingMode, setPreBookingPricingMode] = useState<'wholesale' | 'retail'>('wholesale');
+  const effectiveNewOrderPricingMode = retailEnabled ? newOrderPricingMode : 'wholesale';
+  const effectivePreBookingPricingMode = retailEnabled ? preBookingPricingMode : 'wholesale';
+  const [preBookingGstMode, setPreBookingGstMode] = useState<'with_gst' | 'without_gst'>('with_gst');
+  const [preBookingProductSearch, setPreBookingProductSearch] = useState('');
   const [editingPreBookingId, setEditingPreBookingId] = useState<string | null>(null);
+  // Draft built by handleSavePreBooking (the "Save Pre-Booking & Reserve
+  // Stock" button) and reviewed on the Pre-Booking Confirmation page; the
+  // API call only happens once the user hits "Confirm Pre-Booking" there.
+  const [pendingPreBooking, setPendingPreBooking] = useState<{ items: PreBookingItem[]; storeId: string; storeName: string; scheduledDate: string; notes?: string; grandTotal: number; roundOff: number } | null>(null);
   const [preBookingSearch, setPreBookingSearch] = useState<string>('');
   const [preBookingStatusFilter, setPreBookingStatusFilter] = useState<'All' | 'Booked' | 'Delivered' | 'Cancelled'>('All');
   const [preBookingConfirmAction, setPreBookingConfirmAction] = useState<{ bookingId: string; action: 'deliver' | 'cancel' } | null>(null);
@@ -78,65 +325,91 @@ export default function AdminSales({ data, setData, addNotification, currentUser
   const [orderStatusFilter, setOrderStatusFilter] = useState<'All' | 'Confirmed' | 'Delivered' | 'Cancelled'>('All');
   const [orderPaymentFilter, setOrderPaymentFilter] = useState<'All' | 'Paid' | 'Partial' | 'Unpaid'>('All');
 
-  type DateFilterMode = 'all' | 'today' | 'yesterday' | 'week' | 'month' | 'custom';
-  const [dateFilterMode, setDateFilterMode] = useState<DateFilterMode>('all');
+  const [dateFilterMode, setDateFilterMode] = useState<DateFilterMode>('today');
   const todayIso = new Date().toISOString().split('T')[0];
   const [customDateFrom, setCustomDateFrom] = useState(todayIso);
   const [customDateTo, setCustomDateTo] = useState(todayIso);
 
-  const getDateFilterRange = (): { start: Date; end: Date } | null => {
-    const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const endOfToday = new Date(startOfToday.getTime() + 86400000 - 1);
-    if (dateFilterMode === 'today') return { start: startOfToday, end: endOfToday };
-    if (dateFilterMode === 'yesterday') {
-      const startYesterday = new Date(startOfToday.getTime() - 86400000);
-      return { start: startYesterday, end: new Date(startOfToday.getTime() - 1) };
-    }
-    if (dateFilterMode === 'week') return { start: new Date(startOfToday.getTime() - 6 * 86400000), end: endOfToday };
-    if (dateFilterMode === 'month') return { start: new Date(now.getFullYear(), now.getMonth(), 1), end: endOfToday };
-    if (dateFilterMode === 'custom') return { start: new Date(customDateFrom + 'T00:00:00'), end: new Date(customDateTo + 'T23:59:59.999') };
-    return null;
-  };
+  const orders = usePaginatedList<Order, { status?: string; paymentStatus?: string }>({
+    resource: 'orders',
+    mode: 'offset',
+    pageSize: 25,
+    enabled: salesTab === 'orders',
+    filters: {
+      status: orderStatusFilter !== 'All' ? orderStatusFilter : undefined,
+      paymentStatus: orderPaymentFilter !== 'All' ? orderPaymentFilter : undefined,
+    },
+    search: orderSearch,
+    dateFilterMode,
+    customDateFrom,
+    customDateTo,
+    fetcher: params => ordersApi.listPaged(params),
+  });
+  const ordersTableHeight = useResponsiveTableHeight(300);
 
-  const isWithinDateFilter = (dateStr: string | undefined | null) => {
-    const range = getDateFilterRange();
-    if (!range) return true;
-    if (!dateStr) return false;
-    const d = new Date(dateStr);
-    return d >= range.start && d <= range.end;
-  };
+  const [paymentSearch, setPaymentSearch] = useState('');
+  const [paymentMethodFilter, setPaymentMethodFilter] = useState('All');
+  const payments = usePaginatedList<Payment, { method?: string }>({
+    resource: 'payments',
+    mode: 'offset',
+    pageSize: 25,
+    enabled: salesTab === 'payments',
+    filters: { method: paymentMethodFilter !== 'All' ? paymentMethodFilter : undefined },
+    search: paymentSearch,
+    dateFilterMode,
+    customDateFrom,
+    customDateTo,
+    fetcher: params => paymentsApi.listPaged(params),
+  });
+  const paymentsTableHeight = useResponsiveTableHeight(320);
 
-  const renderDateFilterBar = () => (
-    <View className="gap-1.5">
-      <Text className="text-[9px] font-bold text-slate-400 uppercase">Date Range</Text>
-      <View className="flex-row flex-wrap gap-1.5">
-        {([
-          { mode: 'all' as const, label: 'All' },
-          { mode: 'today' as const, label: 'Today' },
-          { mode: 'yesterday' as const, label: 'Yesterday' },
-          { mode: 'week' as const, label: 'This Week' },
-          { mode: 'month' as const, label: 'This Month' },
-          { mode: 'custom' as const, label: 'Custom' },
-        ]).map(opt => (
-          <Pressable key={opt.mode} onPress={() => setDateFilterMode(opt.mode)} className={`px-2.5 py-1 rounded-lg border ${dateFilterMode === opt.mode ? 'bg-indigo-600 border-indigo-600' : 'bg-white border-slate-200'}`}>
-            <Text className={`text-[10px] font-bold ${dateFilterMode === opt.mode ? 'text-white' : 'text-slate-600'}`}>{opt.label}</Text>
-          </Pressable>
-        ))}
-      </View>
-      {dateFilterMode === 'custom' && (
-        <View className="flex-row gap-2 mt-1">
-          <View className="flex-1">
-            <Text className="text-[9px] font-bold text-slate-400 uppercase mb-1">From</Text>
-            <DateField value={customDateFrom} onValueChange={setCustomDateFrom} title="Select Start Date" className="bg-white border border-slate-200 rounded-lg p-2 flex-row items-center justify-between" textClassName="text-[11px] text-slate-700 flex-1" />
-          </View>
-          <View className="flex-1">
-            <Text className="text-[9px] font-bold text-slate-400 uppercase mb-1">To</Text>
-            <DateField value={customDateTo} onValueChange={setCustomDateTo} title="Select End Date" className="bg-white border border-slate-200 rounded-lg p-2 flex-row items-center justify-between" textClassName="text-[11px] text-slate-700 flex-1" />
-          </View>
-        </View>
-      )}
-    </View>
+  const preBookings = usePaginatedList<PreBookingOrder, { status?: string }>({
+    resource: 'prebookings',
+    mode: 'offset',
+    pageSize: 25,
+    enabled: salesTab === 'prebookings',
+    filters: { status: hideAdminControls ? 'Booked' : (preBookingStatusFilter !== 'All' ? preBookingStatusFilter : undefined) },
+    search: preBookingSearch,
+    dateFilterMode,
+    customDateFrom,
+    customDateTo,
+    fetcher: params => preBookingsApi.listPaged(params),
+  });
+  const preBookingsTableHeight = useResponsiveTableHeight(320);
+
+  // Purchase receipts are always viewed scoped to one supplier at a time (the
+  // "Purchase Report" modal below) rather than a flat cross-supplier table -
+  // enabled only while that modal is open, filtered server-side by supplier.
+  const supplierPurchases = usePaginatedList<Purchase, { supplier_id?: string }>({
+    resource: 'purchases',
+    mode: 'offset',
+    pageSize: 25,
+    enabled: !!reportingSupplier,
+    filters: { supplier_id: reportingSupplier?.id },
+    dateFilterMode: supplierReportDateMode,
+    customDateFrom: supplierReportFrom,
+    customDateTo: supplierReportTo,
+    fetcher: params => purchasesApi.listPaged(params),
+  });
+
+  const getDateFilterRange = (): { start: Date; end: Date } | null => getDateFilterRangeUtil(dateFilterMode, customDateFrom, customDateTo);
+
+  const isWithinDateFilter = (dateStr: string | undefined | null) => isWithinDateFilterUtil(dateStr, dateFilterMode, customDateFrom, customDateTo);
+
+  // Single compact pill (folds the custom From/To pickers into its own
+  // sheet) shared by every tab that filters on this same date-range state -
+  // Orders, Payments, and Prebookings all render this exact instance rather
+  // than each keeping its own copy.
+  const renderDateFilterField = () => (
+    <DateRangeFilterField
+      mode={dateFilterMode}
+      onModeChange={setDateFilterMode}
+      customFrom={customDateFrom}
+      customTo={customDateTo}
+      onCustomFromChange={setCustomDateFrom}
+      onCustomToChange={setCustomDateTo}
+      title="Date Range"
+    />
   );
 
   const [editingSupplierId, setEditingSupplierId] = useState<string | null>(null);
@@ -167,11 +440,11 @@ export default function AdminSales({ data, setData, addNotification, currentUser
       if (editingSupplierId) {
         await suppliersApi.update(editingSupplierId, supplierForm);
         await refreshData();
-        addNotification('partner_update', `Supplier "${supplierForm.name}" updated successfully.`);
+        addNotification('partner_update', `Supplier "${supplierForm.name}" updated successfully.`, 'supplier', editingSupplierId);
       } else {
-        await suppliersApi.create(supplierForm);
+        const created = await suppliersApi.create(supplierForm);
         await refreshData();
-        addNotification('partner_update', `Supplier "${supplierForm.name}" registered successfully.`);
+        addNotification('partner_update', `Supplier "${supplierForm.name}" registered successfully.`, 'supplier', created.id);
       }
       setActiveForm('list');
       setEditingSupplierId(null);
@@ -186,7 +459,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     try {
       await suppliersApi.setStatus(supplierId, 'Active');
       await refreshData();
-      addNotification('partner_update', `Supplier "${supplier.name}" has been reactivated.`);
+      addNotification('partner_update', `Supplier "${supplier.name}" has been reactivated.`, 'supplier', supplierId);
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to reactivate supplier.');
     }
@@ -243,6 +516,41 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     await exportHtmlReport(html, fileName, showAlert);
   };
 
+  // Lets a wrongly-attached supplier bill (wrong photo/PDF/Excel picked during
+  // Receive Stock) be swapped for the correct one after the receipt was
+  // already confirmed, instead of being stuck with the mistake forever.
+  // Deliberately keeps the invoice viewer open and reports outcomes via the
+  // inline billActionStatus banner rather than the OS picker's own showAlert
+  // path or a second <Modal> - the global alert renders outside any Modal's
+  // portal, so it (and any other stacked <Modal>) ends up invisible behind
+  // whichever <Modal> is already open until that one is manually closed.
+  const handleReplaceSupplierBill = async (purchaseId: string) => {
+    const picked = await pickBillFileAsDataUri((opts) => {
+      setBillActionStatus({ type: 'error', message: typeof opts === 'string' ? opts : opts.message });
+    });
+    if (!picked) return;
+    try {
+      await purchasesApi.updateBillFile(purchaseId, { bill_file_url: picked.dataUri, bill_file_name: picked.name, bill_file_type: picked.mimeType });
+      await refreshData();
+      setViewingPurchase(prev => (prev && prev.id === purchaseId ? { ...prev, bill_file_url: picked.dataUri, bill_file_name: picked.name, bill_file_type: picked.mimeType } : prev));
+      setBillActionStatus({ type: 'success', message: 'Supplier bill updated.' });
+    } catch (e: any) {
+      setBillActionStatus({ type: 'error', message: e.message ?? 'Unable to replace the supplier bill.' });
+    }
+  };
+
+  const handleConfirmRemoveSupplierBill = async (purchaseId: string) => {
+    setConfirmRemoveBill(false);
+    try {
+      await purchasesApi.updateBillFile(purchaseId, { bill_file_url: null, bill_file_name: null, bill_file_type: null });
+      await refreshData();
+      setViewingPurchase(prev => (prev && prev.id === purchaseId ? { ...prev, bill_file_url: undefined, bill_file_name: undefined, bill_file_type: undefined } : prev));
+      setBillActionStatus({ type: 'success', message: 'Supplier bill removed.' });
+    } catch (e: any) {
+      setBillActionStatus({ type: 'error', message: e.message ?? 'Unable to remove the supplier bill.' });
+    }
+  };
+
   const [storeForm, setStoreForm] = useState({
     name: '', owner_name: '', phone: '', alt_phone: '', address: '', area: 'Kothrud',
     city: 'Pune', state: 'Maharashtra', pincode: '411001', gst_number: '',
@@ -256,18 +564,6 @@ export default function AdminSales({ data, setData, addNotification, currentUser
   });
 
   useEffect(() => {
-    if (!initialPaymentStoreId) return;
-    const store = data.stores.find(s => s.id === initialPaymentStoreId);
-    if (store) {
-      setPaymentForm({ store_id: store.id, invoice_id: 'general', amount: store.outstanding_balance > 0 ? store.outstanding_balance : 0, method: 'UPI' });
-      setSalesTab('credit');
-      setActiveForm('add_payment');
-    }
-    onConsumeInitialPaymentStore?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialPaymentStoreId]);
-
-  useEffect(() => {
     if (!initialPreBookingTodayFilter) return;
     setSalesTab('prebookings');
     setPreBookingStatusFilter('All');
@@ -279,9 +575,13 @@ export default function AdminSales({ data, setData, addNotification, currentUser
 
   const resetPreBookingForm = () => {
     setPreBookingItems({});
+    setPreBookingItemOrder([]);
+    setPendingPreBooking(null);
     setPreBookingNotes('');
     setPreBookingDate(new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0]);
     setPreBookingPricingMode('wholesale');
+    setPreBookingGstMode('with_gst');
+    setPreBookingProductSearch('');
     setEditingPreBookingId(null);
   };
 
@@ -292,9 +592,12 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     const items: Record<string, number> = {};
     booking.items.forEach(item => { items[item.product_id] = item.quantity; });
     setPreBookingItems(items);
+    setPreBookingItemOrder(booking.items.map(item => item.product_id));
     const firstItem = booking.items[0];
     const firstProduct = firstItem ? data.products.find(p => p.id === firstItem.product_id) : null;
-    setPreBookingPricingMode(firstProduct && firstItem.unit_price === firstProduct.wholesale_price ? 'wholesale' : 'retail');
+    const firstWholesaleRate = firstProduct ? getEffectiveProductPrice(firstProduct, 'wholesale', booking.store_id, data.storePricing) : 0;
+    setPreBookingPricingMode(firstProduct && firstItem.unit_price === firstWholesaleRate ? 'wholesale' : 'retail');
+    setPreBookingGstMode(firstItem && firstItem.tax_pct <= 0 ? 'without_gst' : 'with_gst');
     setEditingPreBookingId(booking.id);
     setActiveForm('add_prebooking');
   };
@@ -307,17 +610,27 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     return liveAvailable + alreadyHeld;
   };
 
+  // Built from preBookingItemOrder (selection order), not Object.entries, so
+  // the saved booking - and every downstream bill/delivery view - shows
+  // items in the order they were actually picked.
   const buildPreBookingItemsList = (): PreBookingItem[] => {
-    return Object.entries(preBookingItems)
-      .filter(([_, qty]) => Number(qty) > 0)
-      .map(([prodId, qty]) => {
+    return preBookingItemOrder
+      .map(prodId => {
+        const qty = preBookingItems[prodId] || 0;
+        if (qty <= 0) return null;
         const prod = data.products.find(p => p.id === prodId);
-        const unit_price = preBookingPricingMode === 'wholesale' ? (prod?.wholesale_price || 0) : (prod?.selling_price || 0);
-        return { product_id: prodId, quantity: Number(qty), unit_price, tax_pct: prod?.tax_pct || 18 };
-      });
+        const unit_price = prod ? getEffectiveProductPrice(prod, effectivePreBookingPricingMode, preBookingStoreId, data.storePricing) : 0;
+        const tax_pct = preBookingGstMode === 'without_gst' ? 0 : (prod?.tax_pct ?? 0);
+        return { product_id: prodId, quantity: qty, unit_price, tax_pct };
+      })
+      .filter((item): item is PreBookingItem => item !== null);
   };
 
-  const handleSavePreBooking = async () => {
+  // Only builds the pre-booking draft and navigates to the Pre-Booking
+  // Confirmation page — nothing is sent to the backend yet. The API call
+  // only happens once the user reviews the bill there and hits "Confirm
+  // Pre-Booking" (handleConfirmPreBooking).
+  const handleSavePreBooking = () => {
     if (!preBookingStoreId) {
       showAlert('Please select a store for the pre-booking order.');
       return;
@@ -334,25 +647,47 @@ export default function AdminSales({ data, setData, addNotification, currentUser
       return;
     }
 
+    const { grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(itemsList);
+    setPendingPreBooking({
+      items: itemsList, storeId: preBookingStoreId, storeName: selectedStoreObj.name,
+      scheduledDate: preBookingDate, notes: preBookingNotes.trim() || undefined, grandTotal, roundOff,
+    });
+    setActiveForm('prebooking_confirmation');
+  };
+
+  // Discards the draft entirely and returns to the picker — the already
+  // chosen quantities are still sitting in preBookingItems/preBookingItemOrder,
+  // so nothing needs to be re-picked.
+  const handleBackFromPreBookingConfirmation = () => {
+    setPendingPreBooking(null);
+    setActiveForm('add_prebooking');
+  };
+
+  const handleConfirmPreBooking = async () => {
+    if (!pendingPreBooking) return;
+    const { items, storeId, storeName, scheduledDate, notes } = pendingPreBooking;
     try {
       if (editingPreBookingId) {
         await preBookingsApi.update(editingPreBookingId, {
-          store_id: preBookingStoreId, scheduled_delivery_date: preBookingDate,
-          items: itemsList, notes: preBookingNotes.trim() || undefined,
+          store_id: storeId, scheduled_delivery_date: scheduledDate,
+          items, notes,
         });
         await refreshData();
-        addNotification('order_update', `Pre-booking updated for ${selectedStoreObj.name}.`);
+        notifyResourceChanged('prebookings');
+        addNotification('order_update', `Pre-booking updated for ${storeName}.`, 'prebooking', editingPreBookingId);
         showAlert('Pre-booking updated successfully.');
       } else {
-        await preBookingsApi.create({
-          store_id: preBookingStoreId, salesperson_id: currentUser?.id || 'admin', scheduled_delivery_date: preBookingDate,
-          items: itemsList, notes: preBookingNotes.trim() || undefined,
+        const created = await preBookingsApi.create({
+          store_id: storeId, salesperson_id: currentUser?.id || 'admin', scheduled_delivery_date: scheduledDate,
+          items, notes,
         });
         await refreshData();
-        addNotification('new_order', `Pre-booking saved for ${selectedStoreObj.name} and stock reserved in warehouse.`);
+        notifyResourceChanged('prebookings');
+        addNotification('new_order', `Pre-booking saved for ${storeName} and stock reserved in warehouse.`, 'prebooking', created.id);
         showAlert('Pre-booking saved successfully.');
       }
       resetPreBookingForm();
+      setPendingPreBooking(null);
       setActiveForm('list');
       setSalesTab('prebookings');
     } catch (e: any) {
@@ -364,10 +699,14 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     try {
       const result = await preBookingsApi.deliver(preBookingOrderId, { method: preBookingSettleMethod, amount: preBookingSettleAmount });
       await refreshData();
-      addNotification('delivery', `Pre-booking order ${preBookingOrderId} completed. Payment status: ${result.payment_status}.`);
+      notifyResourceChanged('prebookings');
+      addNotification('delivery', `Pre-booking order ${preBookingOrderId} completed. Payment status: ${result.payment_status}.`, 'prebooking', preBookingOrderId);
       showAlert(`Pre-booking delivery completed. Payment status: ${result.payment_status}.`);
       setPreBookingConfirmAction(null);
     } catch (e: any) {
+      // Close first - a still-open Deliver Pre-Booking Modal would otherwise
+      // hide the shared alert, which renders outside any Modal's portal.
+      setPreBookingConfirmAction(null);
       showAlert(e.message ?? 'Unable to deliver pre-booking.');
     }
   };
@@ -376,26 +715,516 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     try {
       await preBookingsApi.cancel(preBookingOrderId);
       await refreshData();
-      addNotification('partner_update', `Pre-booking order ${preBookingOrderId} cancelled.`);
+      notifyResourceChanged('prebookings');
+      addNotification('partner_update', `Pre-booking order ${preBookingOrderId} cancelled.`, 'prebooking', preBookingOrderId);
       showAlert('Pre-booking cancelled and warehouse stock released.');
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to cancel pre-booking.');
     }
   };
 
+  // Admin-only: correcting a Delivered pre-booking after the fact - operates
+  // on the real order it produced (fulfilled_order_id), same as editing an
+  // ordinary Confirmed/Delivered order. Seeds the editable quantity map from
+  // the booking's current items so unchanged lines don't need re-picking.
+  const handleOpenEditDeliveredPreBooking = (booking: PreBookingOrder) => {
+    const seeded: Record<string, number> = {};
+    booking.items.forEach(item => { seeded[item.product_id] = item.quantity; });
+    setEditDeliveredPreBookingItems(seeded);
+    setEditDeliveredPreBookingSearch('');
+    setEditingDeliveredPreBookingId(booking.id);
+    setViewingPreBooking(null);
+    setActiveForm('edit_delivered_prebooking');
+  };
+
+  const handleSaveEditDeliveredPreBooking = async (booking: PreBookingOrder) => {
+    const items = Object.entries(editDeliveredPreBookingItems)
+      .filter(([, qty]) => qty > 0)
+      .map(([productId, qty]) => {
+        // Keep the originally-billed rate for lines that already existed on
+        // this booking; only a newly added line gets a fresh rate looked up.
+        const originalItem = booking.items.find(i => i.product_id === productId);
+        if (originalItem) return { product_id: productId, quantity: qty, unit_price: originalItem.unit_price, tax_pct: originalItem.tax_pct };
+        const product = data.products.find(p => p.id === productId)!;
+        return { product_id: productId, quantity: qty, unit_price: getEffectiveProductPrice(product, 'wholesale', booking.store_id, data.storePricing), tax_pct: product.tax_pct };
+      });
+    if (items.length === 0) {
+      showAlert('A pre-booking must have at least one item.');
+      return;
+    }
+    try {
+      await preBookingsApi.editDelivered(booking.id, { items });
+      await refreshData();
+      notifyResourceChanged('prebookings');
+      notifyResourceChanged('orders');
+      // A shrunk total can claw back an already-collected payment (see
+      // editOrder) - nudge the Payments tab/Total Collections so they
+      // reflect the recalculated collection amount immediately.
+      notifyResourceChanged('payments');
+      addNotification('order_update', `Delivered pre-booking ${booking.id} was edited by an admin. Stock and totals were recalculated.`, 'prebooking', booking.id);
+      setEditingDeliveredPreBookingId(null);
+      setActiveForm('list');
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to save changes to this pre-booking.');
+    }
+  };
+
+  const handleDeleteDeliveredPreBooking = (bookingId: string) => setDeletePreBookingConfirmId(bookingId);
+
+  const executeDeleteDeliveredPreBooking = async (bookingId: string) => {
+    try {
+      await preBookingsApi.removeDelivered(bookingId);
+      await refreshData();
+      notifyResourceChanged('prebookings');
+      notifyResourceChanged('orders');
+      // Deleting the linked order also removes its Payment row(s) (see
+      // deleteOrder) - nudge the Payments tab/Total Collections so they don't
+      // keep showing money tied to a now-deleted order.
+      notifyResourceChanged('payments');
+      addNotification('order_update', `Delivered pre-booking ${bookingId} was deleted by an admin. Warehouse stock and balances were reversed.`, 'prebooking', bookingId);
+      setViewingPreBooking(null);
+      setActiveForm('list');
+    } catch (e: any) {
+      // Close first - the shared alert renders outside any Modal's portal,
+      // so it stays hidden behind this still-open Pre-Booking Bill Modal
+      // otherwise (same reasoning as the confirmRemoveBill comment above).
+      setViewingPreBooking(null);
+      showAlert(e.message ?? 'Unable to delete this pre-booking.');
+    }
+  };
+
   const filteredStores = data.stores.filter(s =>
-    s.name.toLowerCase().includes(storeSearch.toLowerCase()) ||
-    s.area.toLowerCase().includes(storeSearch.toLowerCase()) ||
-    s.owner_name.toLowerCase().includes(storeSearch.toLowerCase())
+    (storeListTab === 'inactive' ? s.status === 'Inactive' : s.status === 'Active') && (
+      s.name.toLowerCase().includes(storeSearch.toLowerCase()) ||
+      s.area.toLowerCase().includes(storeSearch.toLowerCase()) ||
+      s.owner_name.toLowerCase().includes(storeSearch.toLowerCase())
+    )
   );
 
   const handleOpenAddStore = () => {
     setStoreForm({
-      name: '', owner_name: '', phone: '', alt_phone: '', address: '', area: 'Kothrud',
+      name: '', owner_name: '', phone: '', alt_phone: '', address: '', area: data.areas[0]?.name || '',
       city: 'Pune', state: 'Maharashtra', pincode: '411001', gst_number: '',
       credit_limit: 2000, refill_frequency: 'Weekly', custom_days: 7, ranking: 'Silver'
     });
     setActiveForm('add_store');
+  };
+
+  const handleOpenManageAreas = () => {
+    setNewAreaName('');
+    setEditingAreaId(null);
+    setActiveForm('manage_areas');
+  };
+
+  const handleAddArea = async () => {
+    const name = newAreaName.trim();
+    if (!name) {
+      showAlert('Please enter a district area name.');
+      return;
+    }
+    if (data.areas.some(a => a.name.toLowerCase() === name.toLowerCase())) {
+      showAlert(`A district area named "${name}" already exists.`);
+      return;
+    }
+    try {
+      await areasApi.create(name);
+      await refreshData();
+      addNotification('partner_update', `New district area added: ${name}.`);
+      setNewAreaName('');
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to create district area.');
+    }
+  };
+
+  const handleStartEditArea = (areaId: string, currentName: string) => {
+    setEditingAreaId(areaId);
+    setEditingAreaName(currentName);
+  };
+
+  const handleSaveEditArea = async () => {
+    const newName = editingAreaName.trim();
+    const area = data.areas.find(a => a.id === editingAreaId);
+    if (!area) { setEditingAreaId(null); return; }
+    if (!newName) {
+      showAlert('District area name cannot be empty.');
+      return;
+    }
+    if (data.areas.some(a => a.id !== area.id && a.name.toLowerCase() === newName.toLowerCase())) {
+      showAlert(`A district area named "${newName}" already exists.`);
+      return;
+    }
+    const oldName = area.name;
+    try {
+      await areasApi.rename(area.id, newName);
+      await refreshData();
+      addNotification('partner_update', `District area "${oldName}" renamed to "${newName}".`);
+      setEditingAreaId(null);
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to rename district area.');
+    }
+  };
+
+  const handleConfirmDeleteArea = async () => {
+    const areaId = deleteAreaConfirmId;
+    const area = data.areas.find(a => a.id === areaId);
+    if (!area || !areaId) { setDeleteAreaConfirmId(null); return; }
+
+    const storesInArea = data.stores.filter(s => s.area === area.name).length;
+    if (storesInArea > 0) {
+      setDeleteAreaConfirmId(null);
+      showAlert(`Cannot delete "${area.name}": ${storesInArea} partner outlet(s) still use this area. Move those outlets to a different area first.`);
+      return;
+    }
+
+    try {
+      await areasApi.remove(areaId);
+      await refreshData();
+      addNotification('partner_update', `District area "${area.name}" was deleted.`);
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to delete district area.');
+    } finally {
+      setDeleteAreaConfirmId(null);
+    }
+  };
+
+  const handleOpenStoreReport = (store: Store) => {
+    const todayNow = new Date().toISOString().split('T')[0];
+    setStoreReportDateMode('today');
+    setStoreReportFrom(todayNow);
+    setStoreReportTo(todayNow);
+    setReportingStore(store);
+  };
+
+  const handleOpenOrderFromReport = (order: Order) => {
+    setSelectedOrder(order);
+    setReturnToStoreReport(reportingStore);
+    setReportingStore(null);
+    setActiveForm('order_details');
+  };
+
+  const handleBackFromOrderDetails = () => {
+    setActiveForm('list');
+    if (returnToStoreReport) {
+      setReportingStore(returnToStoreReport);
+      setReturnToStoreReport(null);
+    }
+  };
+
+  const dateRangeLabel = (mode: DateFilterMode, from: string, to: string) => {
+    if (mode === 'today') return 'Today';
+    if (mode === 'yesterday') return 'Yesterday';
+    if (mode === 'week') return 'This Week';
+    if (mode === 'month') return 'This Month';
+    if (mode === 'custom') return `${from} to ${to}`;
+    return 'All Time (Start to End)';
+  };
+
+  const handleExportStoreReport = async () => {
+    if (!reportingStore) return;
+    const storeOrders = data.orders
+      .filter(o => o.store_id === reportingStore.id && isWithinDateFilterUtil(o.created_at, storeReportDateMode, storeReportFrom, storeReportTo))
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    let totalUnits = 0, totalPurchaseValue = 0, totalOutstanding = 0;
+    const rows = storeOrders.map(o => {
+      const inv = data.invoices.find(i => i.order_id === o.id);
+      const units = o.items.reduce((sum, item) => sum + item.quantity, 0);
+      const grandTotal = inv ? inv.grand_total : computeInvoiceTotals(o.items).grand_total;
+      const due = inv ? Math.max(0, inv.grand_total - (inv.paid_amount || 0)) : 0;
+      totalUnits += units;
+      totalPurchaseValue += grandTotal;
+      totalOutstanding += due;
+      return `<tr>
+          <td>${o.id}</td>
+          <td>${new Date(o.created_at).toLocaleDateString('en-IN')}</td>
+          <td style="text-align:center">${units}</td>
+          <td>${o.status}</td>
+          <td style="text-align:right">Rs ${grandTotal.toFixed(2)}</td>
+          <td style="text-align:right">Rs ${due.toFixed(2)}</td>
+        </tr>`;
+    }).join('');
+
+    const html = renderPdfDocument({
+      title: 'PARTNER SHOP PURCHASE REPORT',
+      subtitle: `${reportingStore.name} - ${dateRangeLabel(storeReportDateMode, storeReportFrom, storeReportTo)}`,
+      bodyHtml: `
+        ${renderSummaryLine([
+          { label: 'Orders', value: String(storeOrders.length) },
+          { label: 'Units Purchased', value: totalUnits.toLocaleString('en-IN') },
+          { label: 'Total Purchase Value', value: `Rs ${totalPurchaseValue.toFixed(2)}`, accent: true },
+          { label: 'Outstanding Balance', value: `Rs ${totalOutstanding.toFixed(2)}` },
+        ])}
+        <div class="section-title">Order Details</div>
+        <table><thead><tr><th>Order ID</th><th>Date</th><th style="text-align:center">Units</th><th>Status</th><th style="text-align:right">Bill Total</th><th style="text-align:right">Due</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="6" style="text-align:center;padding:20px;color:#94a3b8">No orders in this date range.</td></tr>'}</tbody></table>`,
+      footerNote: 'This is a computer-generated partner purchase report and requires no physical signature.',
+    });
+    const fileName = buildPdfFileName('Partner_Purchase_Report', freshReportRef('PSR'));
+    await exportHtmlReport(html, fileName, showAlert);
+  };
+
+  const handleOpenSupplierReport = (supplier: Supplier) => {
+    const todayNow = new Date().toISOString().split('T')[0];
+    setSupplierReportDateMode('today');
+    setSupplierReportFrom(todayNow);
+    setSupplierReportTo(todayNow);
+    setReportingSupplier(supplier);
+  };
+
+  // Supplier purchases (stock inwards) have no payment/due tracking in this
+  // app - unlike store orders there's no invoice/paid_amount on a Purchase -
+  // so this report only ever shows receipt count/units/spend, never a
+  // paid/partial/unpaid status.
+  const handleExportSupplierReport = async () => {
+    if (!reportingSupplier) return;
+    const supplierPurchases = data.purchases
+      .filter(p => p.supplier_id === reportingSupplier.id && isWithinDateFilterUtil(p.date, supplierReportDateMode, supplierReportFrom, supplierReportTo))
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    let totalUnits = 0, totalSpendVal = 0;
+    const rows = supplierPurchases.map(p => {
+      const units = p.items.reduce((sum, item) => sum + item.quantity, 0);
+      const value = p.items.reduce((sum, item) => sum + item.quantity * item.purchase_price, 0);
+      totalUnits += units;
+      totalSpendVal += value;
+      return `<tr>
+          <td>${p.invoice_number}</td>
+          <td>${new Date(p.date).toLocaleDateString('en-IN')}</td>
+          <td style="text-align:center">${p.items.length}</td>
+          <td style="text-align:center">${units}</td>
+          <td style="text-align:right">Rs ${value.toFixed(2)}</td>
+        </tr>`;
+    }).join('');
+
+    const html = renderPdfDocument({
+      title: 'SUPPLY PARTNER PURCHASE REPORT',
+      subtitle: `${reportingSupplier.name} - ${dateRangeLabel(supplierReportDateMode, supplierReportFrom, supplierReportTo)}`,
+      bodyHtml: `
+        ${renderSummaryLine([
+          { label: 'Receipts', value: String(supplierPurchases.length) },
+          { label: 'Units Received', value: totalUnits.toLocaleString('en-IN') },
+          { label: 'Total Spend', value: `Rs ${totalSpendVal.toFixed(2)}`, accent: true },
+        ])}
+        <div class="section-title">Stock Inward Receipts</div>
+        <table><thead><tr><th>Invoice #</th><th>Date</th><th style="text-align:center">SKUs</th><th style="text-align:center">Units</th><th style="text-align:right">Value</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" style="text-align:center;padding:20px;color:#94a3b8">No stock inwards in this date range.</td></tr>'}</tbody></table>`,
+      footerNote: 'This is a computer-generated supplier purchase report and requires no physical signature.',
+    });
+    const fileName = buildPdfFileName('Supplier_Purchase_Report', freshReportRef('SPR'));
+    await exportHtmlReport(html, fileName, showAlert);
+  };
+
+  // Rebuilds the local edit state (the table/grid's source of truth) for a
+  // store from a given data snapshot. Takes an explicit snapshot rather than
+  // reading the `data` prop directly so callers that just awaited
+  // refreshData() can pass its freshly-resolved result straight in - the
+  // `data` prop closure inside an async handler is still the pre-refresh
+  // snapshot until this component re-renders with new props.
+  const syncPricingEditState = (store: Store, snapshot: ERPData) => {
+    const overrides = snapshot.storePricing.filter(sp => sp.store_id === store.id);
+    const edits: Record<string, { wholesale: string; retail: string; wholesalePrice: string; retailPrice: string }> = {};
+    overrides.forEach(sp => {
+      const product = snapshot.products.find(p => p.id === sp.product_id);
+      if (!product) return;
+      const wholesalePct = getEffectiveDiscountPct(product, 'wholesale', sp);
+      const retailPct = getEffectiveDiscountPct(product, 'retail', sp);
+      edits[sp.product_id] = {
+        wholesale: String(wholesalePct),
+        retail: String(retailPct),
+        wholesalePrice: priceFromDiscount(product.mrp, wholesalePct).toFixed(2),
+        retailPrice: priceFromDiscount(product.mrp, retailPct).toFixed(2),
+      };
+    });
+    setStorePricingEdits(edits);
+    setPricingProductIds(overrides.map(sp => sp.product_id));
+  };
+
+  const handleOpenStorePricing = (store: Store) => {
+    setPricingStore(store);
+    setProductPricingSearch('');
+    syncPricingEditState(store, data);
+    setActiveForm('store_pricing');
+  };
+
+  const handleAddPricingProductRow = () => {
+    const nextProduct = data.products.filter(p => p.status === 'Active').find(p => !pricingProductIds.includes(p.id));
+    if (!nextProduct) {
+      showAlert('Every active product already has custom pricing for this outlet.');
+      return;
+    }
+    setStorePricingEdits(prev => ({
+      ...prev,
+      [nextProduct.id]: {
+        wholesale: String(nextProduct.wholesale_discount_pct), retail: String(nextProduct.retail_discount_pct),
+        wholesalePrice: nextProduct.wholesale_price.toFixed(2), retailPrice: nextProduct.selling_price.toFixed(2),
+      },
+    }));
+    setPricingProductIds(prev => [...prev, nextProduct.id]);
+  };
+
+  const handleChangePricingProduct = (oldProductId: string, newProductId: string) => {
+    if (oldProductId === newProductId) return;
+    const newProduct = data.products.find(p => p.id === newProductId);
+    setStorePricingEdits(prev => {
+      const { [oldProductId]: _removed, ...rest } = prev;
+      return {
+        ...rest,
+        [newProductId]: newProduct
+          ? { wholesale: String(newProduct.wholesale_discount_pct), retail: String(newProduct.retail_discount_pct), wholesalePrice: newProduct.wholesale_price.toFixed(2), retailPrice: newProduct.selling_price.toFixed(2) }
+          : emptyPricingEdit,
+      };
+    });
+    setPricingProductIds(prev => prev.map(id => (id === oldProductId ? newProductId : id)));
+  };
+
+  const handleRemovePricingProduct = async (productId: string) => {
+    if (!pricingStore) return;
+    const hasOverride = data.storePricing.some(sp => sp.store_id === pricingStore.id && sp.product_id === productId);
+    if (hasOverride) {
+      await handleResetStorePricingRow(productId);
+    }
+    setPricingProductIds(prev => prev.filter(id => id !== productId));
+  };
+
+  const isPricingRowDirty = (product: Product): boolean => {
+    if (!pricingStore) return false;
+    const override = data.storePricing.find(sp => sp.store_id === pricingStore.id && sp.product_id === product.id);
+    // A row with no saved override yet is a brand-new addition - it has
+    // nothing to compare against, so it's always unsaved until the user
+    // saves it, even if they haven't touched the pre-filled catalog %.
+    if (!override) return true;
+    const edit = storePricingEdits[product.id] || emptyPricingEdit;
+    const baselineWholesale = String(getEffectiveDiscountPct(product, 'wholesale', override));
+    if (edit.wholesale.trim() !== baselineWholesale) return true;
+    if (retailEnabled) {
+      const baselineRetail = String(getEffectiveDiscountPct(product, 'retail', override));
+      if (edit.retail.trim() !== baselineRetail) return true;
+    }
+    return false;
+  };
+
+  const getDirtyPricingProductIds = (): string[] =>
+    pricingProductIds.filter(id => {
+      const product = data.products.find(p => p.id === id);
+      return product ? isPricingRowDirty(product) : false;
+    });
+
+  const leaveStorePricing = () => {
+    setShowUnsavedPricingModal(false);
+    setActiveForm('list');
+    setPricingStore(null);
+  };
+
+  const handleBackFromStorePricing = () => {
+    if (getDirtyPricingProductIds().length > 0) {
+      setShowUnsavedPricingModal(true);
+      return;
+    }
+    leaveStorePricing();
+  };
+
+  const saveAllDirtyPricingRows = async () => {
+    for (const productId of getDirtyPricingProductIds()) {
+      await handleSaveStorePricingRow(productId);
+    }
+  };
+
+  const handleSaveAllPricingAndLeave = async () => {
+    await saveAllDirtyPricingRows();
+    leaveStorePricing();
+  };
+
+  const handleSaveStorePricingRow = async (productId: string) => {
+    if (!pricingStore) return;
+    const product = data.products.find(p => p.id === productId);
+    if (!product) return;
+    const edit = storePricingEdits[productId] || emptyPricingEdit;
+    const wholesalePct = edit.wholesale.trim() === '' ? null : Math.max(0, Math.min(100, parseFloat(edit.wholesale)));
+    const retailPct = edit.retail.trim() === '' ? null : Math.max(0, Math.min(100, parseFloat(edit.retail)));
+    if ((edit.wholesale.trim() !== '' && isNaN(wholesalePct as number)) || (edit.retail.trim() !== '' && isNaN(retailPct as number))) {
+      showAlert('Please enter valid discount percentages (0-100).');
+      return;
+    }
+    try {
+      await storePricingApi.upsert({ store_id: pricingStore.id, product_id: productId, wholesale_discount_pct: wholesalePct, retail_discount_pct: retailPct });
+      await refreshData();
+      addNotification('partner_update', `Custom pricing updated for ${product.name} at ${pricingStore.name}.`, 'store', pricingStore.id);
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to save custom pricing.');
+    }
+  };
+
+  const handleResetStorePricingRow = async (productId: string) => {
+    if (!pricingStore) return;
+    const existing = data.storePricing.find(sp => sp.store_id === pricingStore.id && sp.product_id === productId);
+    const product = data.products.find(p => p.id === productId);
+    setStorePricingEdits(prev => ({
+      ...prev,
+      [productId]: product
+        ? { wholesale: String(product.wholesale_discount_pct), retail: String(product.retail_discount_pct), wholesalePrice: product.wholesale_price.toFixed(2), retailPrice: product.selling_price.toFixed(2) }
+        : emptyPricingEdit,
+    }));
+    if (!existing) return;
+    try {
+      await storePricingApi.remove(existing.id);
+      await refreshData();
+      addNotification('partner_update', `Custom pricing reset to catalog rate for ${product?.name || 'product'} at ${pricingStore.name}.`, 'store', pricingStore.id);
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to reset custom pricing.');
+    }
+  };
+
+  const handleOpenClonePricing = () => {
+    setCloneTargetStoreIds([]);
+    setCloneStoreSearch('');
+    setShowClonePricingModal(true);
+  };
+
+  const toggleClonePricingTarget = (storeId: string) => {
+    setCloneTargetStoreIds(prev => (prev.includes(storeId) ? prev.filter(id => id !== storeId) : [...prev, storeId]));
+  };
+
+  const handleConfirmClonePricing = async () => {
+    if (!pricingStore) return;
+    if (cloneTargetStoreIds.length === 0) {
+      showAlert('Select at least one destination store to clone this pricing to.');
+      return;
+    }
+    try {
+      await storePricingApi.clone({ source_store_id: pricingStore.id, target_store_ids: cloneTargetStoreIds });
+      await refreshData();
+      setShowClonePricingModal(false);
+      const targetNames = data.stores.filter(s => cloneTargetStoreIds.includes(s.id)).map(s => s.name).join(', ');
+      addNotification('partner_update', `Cloned ${pricingStore.name}'s custom pricing to: ${targetNames}.`, 'store', pricingStore.id);
+      showAlert({ type: 'success', message: `Custom pricing cloned to ${cloneTargetStoreIds.length} store(s).` });
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to clone custom pricing.');
+    }
+  };
+
+  const handleOpenCloneFromPricing = () => {
+    setCloneSourceStoreId('');
+    setCloneFromStoreSearch('');
+    setShowCloneFromModal(true);
+  };
+
+  const handleConfirmCloneFromPricing = async () => {
+    if (!pricingStore) return;
+    if (!cloneSourceStoreId) {
+      showAlert('Select a store to clone custom pricing from.');
+      return;
+    }
+    const sourceStore = data.stores.find(s => s.id === cloneSourceStoreId);
+    try {
+      await storePricingApi.clone({ source_store_id: cloneSourceStoreId, target_store_ids: [pricingStore.id] });
+      const fresh = await refreshData();
+      syncPricingEditState(pricingStore, fresh);
+      setShowCloneFromModal(false);
+      addNotification('partner_update', `Cloned ${sourceStore?.name || 'store'}'s custom pricing into ${pricingStore.name}.`, 'store', pricingStore.id);
+      showAlert({ type: 'success', message: `Custom pricing cloned from ${sourceStore?.name || 'the selected store'}.` });
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to clone custom pricing.');
+    }
   };
 
   const handleSaveStore = async () => {
@@ -407,13 +1236,13 @@ export default function AdminSales({ data, setData, addNotification, currentUser
 
     try {
       if (isNew) {
-        await storesApi.create(storeForm);
+        const created = await storesApi.create(storeForm);
         await refreshData();
-        addNotification('partner_update', `New client store registered: ${storeForm.name}`);
+        addNotification('partner_update', `New client store registered: ${storeForm.name}`, 'store', created.id);
       } else {
         await storesApi.update(selectedStore!.id, storeForm);
         await refreshData();
-        addNotification('partner_update', `Store details updated for ${storeForm.name}.`);
+        addNotification('partner_update', `Store details updated for ${storeForm.name}.`, 'store', selectedStore!.id);
       }
       setActiveForm('list');
     } catch (e: any) {
@@ -427,7 +1256,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     try {
       await storesApi.setStatus(storeId, 'Active');
       await refreshData();
-      addNotification('partner_update', `Partner store "${store.name}" has been reactivated.`);
+      addNotification('partner_update', `Partner store "${store.name}" has been reactivated.`, 'store', storeId);
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to reactivate store.');
     }
@@ -439,7 +1268,8 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     try {
       await ordersApi.cancel(orderId);
       await refreshData();
-      addNotification('order_update', `Order ID ${orderId} has been CANCELLED.`);
+      notifyResourceChanged('orders');
+      addNotification('order_update', `Order ID ${orderId} has been CANCELLED.`, 'order', orderId);
       setActiveForm('list');
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to cancel order.');
@@ -450,7 +1280,8 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     try {
       await ordersApi.confirmDraft(orderId);
       await refreshData();
-      addNotification('order_update', `Order ID ${orderId} has been CONFIRMED & stock reserved.`);
+      notifyResourceChanged('orders');
+      addNotification('order_update', `Order ID ${orderId} has been CONFIRMED & stock reserved.`, 'order', orderId);
       setActiveForm('list');
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to confirm order.');
@@ -461,57 +1292,210 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     try {
       await ordersApi.deliverConfirmed(orderId);
       await refreshData();
-      addNotification('delivery', `Order ID ${orderId} marked as Delivered.`);
+      notifyResourceChanged('orders');
+      addNotification('delivery', `Order ID ${orderId} marked as Delivered.`, 'order', orderId);
       setActiveForm('list');
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to deliver order.');
     }
   };
 
+  // Admin-only: correcting a Confirmed/Delivered order after the fact.
+  // Seeds the editable quantity map from the order's current items so
+  // unchanged lines don't need to be re-picked.
+  const handleOpenEditOrder = (order: Order) => {
+    const seeded: Record<string, number> = {};
+    order.items.forEach(item => { seeded[item.product_id] = item.quantity; });
+    setEditOrderItems(seeded);
+    setEditOrderProductSearch('');
+    setActiveForm('edit_order');
+  };
+
+  const handleSaveEditOrder = async () => {
+    if (!selectedOrder) return;
+    const items = Object.entries(editOrderItems)
+      .filter(([, qty]) => qty > 0)
+      .map(([productId, qty]) => {
+        // Keep the originally-billed rate for lines that already existed on
+        // this order (editing quantity shouldn't silently re-price it against
+        // whatever the catalog rate happens to be today); only a newly added
+        // line gets a fresh rate looked up.
+        const originalItem = selectedOrder.items.find(i => i.product_id === productId);
+        if (originalItem) return { product_id: productId, quantity: qty, unit_price: originalItem.unit_price, tax_pct: originalItem.tax_pct };
+        const product = data.products.find(p => p.id === productId)!;
+        return { product_id: productId, quantity: qty, unit_price: getEffectiveProductPrice(product, 'wholesale', selectedOrder.store_id, data.storePricing), tax_pct: product.tax_pct };
+      });
+    if (items.length === 0) {
+      showAlert('An order must have at least one item.');
+      return;
+    }
+    try {
+      await ordersApi.edit(selectedOrder.id, { items });
+      await refreshData();
+      notifyResourceChanged('orders');
+      // A shrunk total can claw back an already-collected payment (see
+      // editOrder) - nudge the Payments tab/Total Collections so they
+      // reflect the recalculated collection amount immediately.
+      notifyResourceChanged('payments');
+      addNotification('order_update', `Order ID ${selectedOrder.id} was edited by an admin. Stock and totals were recalculated.`, 'order', selectedOrder.id);
+      setActiveForm('list');
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to save changes to this order.');
+    }
+  };
+
+  const handleDeleteOrder = (orderId: string) => setDeleteOrderConfirmId(orderId);
+
+  const executeDeleteOrder = async (orderId: string) => {
+    try {
+      await ordersApi.remove(orderId);
+      await refreshData();
+      notifyResourceChanged('orders');
+      // Deleting the order also removes its Payment row(s) (see deleteOrder)
+      // - nudge the Payments tab/Total Collections so they don't keep
+      // showing money tied to a now-deleted order.
+      notifyResourceChanged('payments');
+      addNotification('order_update', `Order ID ${orderId} was deleted by an admin. Warehouse stock and balances were reversed.`, 'order', orderId);
+      setActiveForm('list');
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to delete this order.');
+    }
+  };
+
   const resetNewOrderForm = () => {
     setNewOrderItems({});
+    setNewOrderItemOrder([]);
+    setShowNewOrderPaymentModal(false);
+    setShowConfirmOrderDialog(false);
     setNewOrderPricingMode('wholesale');
+    setNewOrderGstMode('with_gst');
+    setNewOrderProductSearch('');
   };
 
   const handleOpenCreateOrder = () => {
     setNewOrderStoreId(data.stores.find(s => s.status === 'Active')?.id || '');
-    setNewOrderTruckId(data.trucks.find(t => t.status === 'Active')?.id || '');
     resetNewOrderForm();
     setActiveForm('create_order');
   };
 
-  const handleCreateNewOrder = async () => {
+  // Only builds the order draft and navigates to the Order Confirmation
+  // page — nothing is sent to the backend yet, and the payment modal
+  // doesn't open until the admin reviews the bill there and hits "Confirm
+  // Order" (handleProceedToPayment). The order is only actually created
+  // once a payment outcome is confirmed in handleSettleNewOrder(), so
+  // backing out anywhere in this review flow truly cancels the order
+  // instead of leaving a dangling unpaid one behind.
+  // Built from newOrderItemOrder (selection order), not Object.entries, so
+  // the bill/invoice/payment steps all show items in the order the admin
+  // actually picked them rather than alphabetically or by object-key order.
+  // Reads newOrderGstMode live, so both the picker's running estimate and
+  // the final order/invoice always reflect the current GST toggle state.
+  const buildNewOrderItemsList = () => {
+    return newOrderItemOrder
+      .map(productId => {
+        const qty = newOrderItems[productId] || 0;
+        if (qty <= 0) return null;
+        const p = data.products.find(prod => prod.id === productId)!;
+        const unit_price = getEffectiveProductPrice(p, effectiveNewOrderPricingMode, newOrderStoreId, data.storePricing);
+        const tax_pct = newOrderGstMode === 'without_gst' ? 0 : p.tax_pct;
+        return { product_id: productId, quantity: qty, unit_price, tax_pct };
+      })
+      .filter((item): item is { product_id: string; quantity: number; unit_price: number; tax_pct: number } => item !== null);
+  };
+
+  const handleCreateNewOrder = () => {
     if (!newOrderStoreId) {
       showAlert('Please select a store for this order.');
       return;
     }
-    if (!newOrderTruckId) {
-      showAlert('Please select a truck to dispatch this order from.');
-      return;
-    }
-    const activeItems = Object.entries(newOrderItems)
-      .filter(([, qty]) => qty > 0)
-      .map(([productId, qty]) => {
-        const p = data.products.find(prod => prod.id === productId)!;
-        const unit_price = newOrderPricingMode === 'wholesale' ? p.wholesale_price : p.selling_price;
-        return { product_id: productId, quantity: qty, unit_price, tax_pct: p.tax_pct };
-      });
+    const activeItems = buildNewOrderItemsList();
     if (activeItems.length === 0) {
       showAlert('Please add at least one ice cream item to create an order.');
       return;
     }
     const store = data.stores.find(s => s.id === newOrderStoreId);
+    // Same total/tax/grand-total/round-off math the backend uses, so the
+    // bill total shown here matches what actually gets created.
+    const { grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(activeItems);
+
+    setPendingNewOrder({ items: activeItems, storeId: newOrderStoreId, grandTotal, roundOff, storeName: store?.name || 'Store' });
+    setNewOrderSettleAmount(grandTotal);
+    setNewOrderSettleMethod('UPI');
+    setActiveForm('order_confirmation');
+  };
+
+  // Discards the draft entirely and returns to the picker — the already
+  // chosen quantities are still sitting in newOrderItems/newOrderItemOrder,
+  // so nothing needs to be re-picked.
+  const handleBackFromOrderConfirmation = () => {
+    setPendingNewOrder(null);
+    setActiveForm('create_order');
+  };
+
+  // Only reached once the admin has reviewed the full bill on the Order
+  // Confirmation page — opens the payment-collection modal on top of it.
+  const handleProceedToPayment = () => {
+    setShowNewOrderPaymentModal(true);
+  };
+
+  const handleSettleNewOrder = async () => {
+    if (!pendingNewOrder) return;
+    const { items, storeId, grandTotal, storeName } = pendingNewOrder;
+    const isUnpaid = newOrderSettleMethod === 'Credit' || newOrderSettleAmount <= 0;
+    const isPartial = !isUnpaid && newOrderSettleAmount < grandTotal - 0.05;
+    const paymentSummary = isUnpaid
+      ? 'No payment collected — full amount added to store credit.'
+      : isPartial
+        ? `Partially paid Rs${newOrderSettleAmount.toFixed(2)} of Rs${formatWholeRupees(grandTotal)} via ${newOrderSettleMethod} — balance added to store credit.`
+        : `Fully paid Rs${newOrderSettleAmount.toFixed(2)} via ${newOrderSettleMethod}.`;
+
+    let createdOrderId: string | null = null;
     try {
-      const result = await ordersApi.create({ store_id: newOrderStoreId, salesperson_id: currentUser?.id || 'admin', truck_id: newOrderTruckId, items: activeItems });
+      // Admin orders are sourced directly from warehouse stock (no truck_id),
+      // unlike the Salesperson/Driver flow which always sells out of their
+      // assigned truck's loaded cargo. The order is only created here, once
+      // the payment outcome is confirmed.
+      const result = await ordersApi.create({ store_id: storeId, salesperson_id: currentUser?.id || 'admin', items });
+      createdOrderId = result.order.id;
+      await ordersApi.settle(result.order.id, { method: newOrderSettleMethod, amount: newOrderSettleAmount });
       await refreshData();
-      addNotification('new_order', `Order created for ${store?.name}. Grand Total: Rs${result.invoice.grand_total.toFixed(2)}`);
-      showAlert(`Order created successfully! Grand Total: Rs${result.invoice.grand_total.toFixed(2)}`);
+      notifyResourceChanged('orders');
+      // Single combined notification (order + payment outcome) fired only
+      // once settlement is decided, instead of an earlier "order created"
+      // notification plus a separate un-tracked alert for the payment.
+      addNotification('new_order', `Order created for ${storeName}. Grand Total: Rs${formatWholeRupees(grandTotal)}. ${paymentSummary}`, 'order', createdOrderId!);
+      showAlert(`Order created for ${storeName}. Grand Total: Rs${formatWholeRupees(grandTotal)}. Payment recorded successfully!`);
       resetNewOrderForm();
-      setSelectedOrder(result.order);
-      setActiveForm('order_details');
+      setPendingNewOrder(null);
+      setActiveForm('list');
     } catch (e: any) {
-      showAlert(e.message ?? 'Unable to create order.');
+      if (createdOrderId) {
+        // Order creation succeeded but recording the payment failed — the
+        // order already exists, so surface that rather than pretending
+        // nothing happened.
+        await refreshData();
+        notifyResourceChanged('orders');
+        addNotification('new_order', `Order created for ${storeName}. Grand Total: Rs${formatWholeRupees(grandTotal)}. Payment recording failed — left as outstanding credit.`, 'order', createdOrderId);
+        showAlert(e.message ?? 'Order created, but recording the payment failed. You can settle it later from Credit.');
+        resetNewOrderForm();
+        setPendingNewOrder(null);
+        setActiveForm('list');
+      } else {
+        // Close first - a still-open payment Modal would otherwise hide the
+        // shared alert, which renders outside any Modal's portal. The cart
+        // itself (pendingNewOrder) is kept so the user can retry, same as
+        // handleSkipNewOrderPayment's Back behavior.
+        setShowNewOrderPaymentModal(false);
+        showAlert(e.message ?? 'Unable to create the order. Please try again.');
+      }
     }
+  };
+
+  // Nothing has been sent to the backend yet at this point, so Back simply
+  // closes the payment modal and drops back to the Order Confirmation page
+  // (the draft itself is untouched) — no order is left behind.
+  const handleSkipNewOrderPayment = () => {
+    setShowNewOrderPaymentModal(false);
   };
 
   const handleSavePayment = async () => {
@@ -536,7 +1520,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
         amount: payAmount, method: paymentForm.method,
       });
       await refreshData();
-      addNotification('payment_received', `Payment of Rs${result.actualCollection.toFixed(2)} received from ${store.name}.`);
+      addNotification('payment_received', `Payment of Rs${result.actualCollection.toFixed(2)} received from ${store.name}.`, 'store', store.id);
       setActiveForm('list');
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to record payment.');
@@ -545,6 +1529,13 @@ export default function AdminSales({ data, setData, addNotification, currentUser
 
   const downloadInvoicePDF = async (order: Order, invoice: Invoice, store: Store) => {
     const { html, fileName } = buildOrderInvoicePdf(order, invoice, store, data.products);
+    await exportHtmlReport(html, fileName, showAlert);
+  };
+
+  const handleDownloadPreBookingPdf = async (booking: PreBookingOrder) => {
+    const store = data.stores.find(s => s.id === booking.store_id);
+    if (!store) { showAlert('Unable to find the partner store for this pre-booking.'); return; }
+    const { html, fileName } = buildPreBookingBillPdf(booking, store, data.products);
     await exportHtmlReport(html, fileName, showAlert);
   };
 
@@ -561,7 +1552,8 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     const paidVal = inv.paid_amount || 0;
     const dueVal = Math.max(0, inv.grand_total - paidVal);
     const paymentStatusText = inv.payment_status === 'Paid' ? 'FULLY PAID' : inv.payment_status === 'Partial' ? `PARTIAL PAID (Paid: Rs. ${paidVal.toFixed(2)})` : 'UNPAID / CREDIT';
-    const text = `*FROSTFLOW ICE CREAMS - DISPATCH INVOICE*\n\nHello *${store.owner_name}* (${store.name}), your invoice *${inv.invoice_number}* is ready and dispatched.${itemDetails}\n\n*Billing Summary:*\n- Total: Rs. ${inv.total.toFixed(2)}\n- GST Tax: Rs. ${inv.tax.toFixed(2)}\n- *Grand Total: Rs. ${inv.grand_total.toFixed(2)}*\n- Settlement Status: *${paymentStatusText}*\n- Balance Outstanding: *Rs. ${dueVal.toFixed(2)}*\n\nThank you for choosing FrostFlow Ice Creams!`;
+    const roundOffLine = `\n- Round Off: ${(inv.round_off || 0) > 0 ? '+' : ''}Rs. ${(inv.round_off || 0).toFixed(2)}`;
+    const text = `*FROSTFLOW ICE CREAMS - DISPATCH INVOICE*\n\nHello *${store.owner_name}* (${store.name}), your invoice *${inv.invoice_number}* is ready and dispatched.${itemDetails}\n\n*Billing Summary:*\n- Total: Rs. ${inv.total.toFixed(2)}\n- GST Tax: Rs. ${inv.tax.toFixed(2)}${roundOffLine}\n- *Grand Total: Rs. ${inv.grand_total.toFixed(2)}*\n- Settlement Status: *${paymentStatusText}*\n- Balance Outstanding: *Rs. ${dueVal.toFixed(2)}*\n\nThank you for choosing FrostFlow Ice Creams!`;
     const url = `https://wa.me/${phoneWithCountry}?text=${encodeURIComponent(text)}`;
     Linking.openURL(url).catch(() => showAlert('Could not open WhatsApp. Please ensure it is installed.'));
   };
@@ -604,9 +1596,10 @@ export default function AdminSales({ data, setData, addNotification, currentUser
   const preBookingStoreOptions = storeOptions.some(o => o.value === preBookingStoreId)
     ? storeOptions
     : [...storeOptions, ...data.stores.filter(s => s.id === preBookingStoreId).map(s => ({ label: `${s.name} (${s.owner_name})`, value: s.id }))];
-  const newOrderTruckOptions = data.trucks.filter(t => t.status === 'Active').map(t => ({ label: `${t.vehicle_number} (${t.area})`, value: t.id }));
-  const getTruckStock = (productId: string) => data.truck_inventory.find(ti => ti.truck_id === newOrderTruckId && ti.product_id === productId)?.quantity || 0;
-  const areaOptions = ['Deccan Gymkhana', 'Kothrud', 'Hinjewadi Phase 1', 'Viman Nagar', 'Karve Nagar', 'Bund Garden', 'Alibaug Beach Road'].map(a => ({ label: a, value: a }));
+  const getWarehouseStock = (productId: string) => data.warehouse_inventory.find(inv => inv.product_id === productId)?.available_qty || 0;
+  const areaOptions = data.areas.some(a => a.name === storeForm.area)
+    ? data.areas.map(a => ({ label: a.name, value: a.name }))
+    : [...data.areas.map(a => ({ label: a.name, value: a.name })), ...(storeForm.area ? [{ label: storeForm.area, value: storeForm.area }] : [])];
   const rankingOptions = [
     { label: 'Platinum (High)', value: 'Platinum' }, { label: 'Gold (Medium)', value: 'Gold' },
     { label: 'Silver (Regular)', value: 'Silver' }, { label: 'Bronze (Low)', value: 'Bronze' },
@@ -618,13 +1611,32 @@ export default function AdminSales({ data, setData, addNotification, currentUser
   const paymentMethodOptions = ['Cash', 'UPI', 'Google Pay', 'PhonePe', 'Paytm', 'Bank Transfer'].map(m => ({ label: m, value: m }));
   const preBookingMethodOptions = ['Cash', 'UPI', 'Google Pay', 'PhonePe', 'Paytm', 'Bank Transfer', 'Credit'].map(m => ({ label: m === 'Credit' ? 'Pay on Credit (Outstanding)' : m, value: m }));
 
+  // Switching the in-page tab strip (as opposed to the sidebar/activeScreen,
+  // handled above) still needs to drop any popup left open from the
+  // previous tab - these are all rendered independently of salesTab, so
+  // they'd otherwise stay visible on top of whichever tab was just picked.
+  const handleSalesTabSelect = (tab: typeof salesTab) => {
+    setViewingStore(null);
+    setReportingStore(null);
+    setViewingSupplier(null);
+    setReportingSupplier(null);
+    setViewingPreBooking(null);
+    setDeleteStoreConfirmId(null);
+    setDeleteSupplierConfirmId(null);
+    setDeleteOrderConfirmId(null);
+    setDeletePreBookingConfirmId(null);
+    setCancelOrderConfirmId(null);
+    setPreBookingConfirmAction(null);
+    setSalesTab(tab);
+  };
+
   return (
     <View className="gap-4">
       {activeForm === 'list' && !hideAdminControls && (
         <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
           {(['stores', 'suppliers', 'orders', 'prebookings', 'payments', 'credit', 'refill', 'inactive'] as const).map(tab => (
-            <Pressable key={tab} onPress={() => setSalesTab(tab)} className={`py-1 px-2.5 rounded-lg ${salesTab === tab ? 'bg-white' : ''}`}>
-              <Text className={`text-[10px] font-extrabold capitalize ${salesTab === tab ? 'text-slate-800' : 'text-slate-500'}`}>
+            <Pressable key={tab} onPress={() => handleSalesTabSelect(tab)} className={`py-1 px-2.5 rounded-lg ${salesTab === tab ? 'bg-indigo-600' : ''}`}>
+              <Text className={`text-[10px] font-extrabold capitalize ${salesTab === tab ? 'text-white' : 'text-slate-500'}`}>
                 {tab === 'inactive' ? 'Inactive Partners' : tab === 'stores' ? 'Partner Shops' : tab === 'suppliers' ? 'Supply Partners' : tab === 'prebookings' ? 'Pre-Bookings' : tab}
               </Text>
             </Pressable>
@@ -643,7 +1655,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Owner Name</Text><TextInput value={storeForm.owner_name} onChangeText={v => setStoreForm({ ...storeForm, owner_name: v })} placeholder="e.g. Rajesh Kumar" placeholderTextColor="#94a3b8" className={inputClass} /></View>
           </View>
           <View className="flex-row gap-2">
-            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Primary Phone</Text><TextInput value={storeForm.phone} onChangeText={v => setStoreForm({ ...storeForm, phone: v })} placeholder="+91 98765 43210" placeholderTextColor="#94a3b8" className={inputClass} /></View>
+            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Primary Phone</Text><TextInput value={storeForm.phone} onChangeText={v => setStoreForm({ ...storeForm, phone: v })} placeholder="+91 7373674757" placeholderTextColor="#94a3b8" className={inputClass} /></View>
             <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">GST/TAX Reg Number</Text><TextInput value={storeForm.gst_number} onChangeText={v => setStoreForm({ ...storeForm, gst_number: v })} placeholder="27AAAAA0000A1Z5" placeholderTextColor="#94a3b8" className={inputClass} /></View>
           </View>
           <View>
@@ -651,21 +1663,359 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             <TextInput value={storeForm.address} onChangeText={v => setStoreForm({ ...storeForm, address: v })} className={inputClass} />
           </View>
           <View className="flex-row gap-2">
-            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">District Area</Text><SelectField value={storeForm.area} onValueChange={v => setStoreForm({ ...storeForm, area: v })} options={areaOptions} title="Select Area" className={inputClass + ' flex-row items-center justify-between'} /></View>
-            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Credit Limit (Rs)</Text><TextInput keyboardType="number-pad" value={String(storeForm.credit_limit)} onChangeText={v => setStoreForm({ ...storeForm, credit_limit: Number(v) || 0 })} className={inputClass} /></View>
+            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">District Area</Text><SelectField value={storeForm.area} onValueChange={v => setStoreForm({ ...storeForm, area: v })} options={areaOptions} title="Select Area" searchable className={inputClass + ' flex-row items-center justify-between'} /></View>
+            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Credit Limit (Rs)</Text><TextInput keyboardType="number-pad" value={storeForm.credit_limit === 0 ? '' : String(storeForm.credit_limit)} onChangeText={v => setStoreForm({ ...storeForm, credit_limit: Number(v) || 0 })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} /></View>
             <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Ranking</Text><SelectField value={storeForm.ranking} onValueChange={v => setStoreForm({ ...storeForm, ranking: v as any })} options={rankingOptions} title="Select Ranking" className={inputClass + ' flex-row items-center justify-between'} /></View>
           </View>
           <View className="flex-row gap-2">
             <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Refill Interval</Text><SelectField value={storeForm.refill_frequency} onValueChange={v => setStoreForm({ ...storeForm, refill_frequency: v as any })} options={refillOptions} title="Select Interval" className={inputClass + ' flex-row items-center justify-between'} /></View>
             {storeForm.refill_frequency === 'Custom' && (
-              <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Interval Days</Text><TextInput keyboardType="number-pad" value={String(storeForm.custom_days)} onChangeText={v => setStoreForm({ ...storeForm, custom_days: Number(v) || 0 })} className={inputClass + ' text-center'} /></View>
+              <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Interval Days</Text><TextInput keyboardType="number-pad" value={storeForm.custom_days === 0 ? '' : String(storeForm.custom_days)} onChangeText={v => setStoreForm({ ...storeForm, custom_days: Number(v) || 0 })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass + ' text-center'} /></View>
             )}
           </View>
           <Pressable onPress={handleSaveStore} className="w-full py-2.5 bg-rose-500 rounded-xl items-center active:bg-rose-600">
             <Text className="text-white font-bold text-xs">Save Partner Store Specs</Text>
           </Pressable>
         </View>
-      ) : activeForm === 'add_supplier' ? (
+      ) : activeForm === 'manage_areas' ? (
+        <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-4 w-full lg:max-w-4xl lg:self-center">
+          <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+            <Text className="font-extrabold text-slate-800 text-sm">Manage District Areas</Text>
+            <Pressable onPress={() => setActiveForm('list')} className="bg-slate-100 px-2.5 py-1 rounded-lg active:bg-slate-200">
+              <Text className="text-slate-500 font-bold text-xs">Back to Partner Outlets</Text>
+            </Pressable>
+          </View>
+
+          <View className="flex-row gap-2">
+            <TextInput
+              value={newAreaName}
+              onChangeText={setNewAreaName}
+              placeholder="New district area name..."
+              placeholderTextColor="#94a3b8"
+              className={inputClass + ' flex-1'}
+            />
+            <Pressable onPress={handleAddArea} className="bg-rose-500 px-4 rounded-lg items-center justify-center active:bg-rose-600">
+              <Text className="text-white font-bold text-xs">Add</Text>
+            </Pressable>
+          </View>
+
+          <View className="gap-2 md:flex-row md:flex-wrap">
+            {data.areas.map(area => {
+              const storeCount = data.stores.filter(s => s.area === area.name).length;
+              const isEditing = editingAreaId === area.id;
+              return (
+                <View key={area.id} className="w-full md:w-[48%] xl:w-[32%] flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+                  {isEditing ? (
+                    <>
+                      <TextInput
+                        value={editingAreaName}
+                        onChangeText={setEditingAreaName}
+                        autoFocus
+                        className="flex-1 bg-white border border-indigo-200 rounded-lg p-1.5 text-xs text-slate-800"
+                      />
+                      <Pressable onPress={handleSaveEditArea} className="p-1.5 bg-emerald-50 rounded-lg active:bg-emerald-100">
+                        <Check size={16} color="#059669" />
+                      </Pressable>
+                      <Pressable onPress={() => setEditingAreaId(null)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                        <X size={16} color="#64748b" />
+                      </Pressable>
+                    </>
+                  ) : (
+                    <>
+                      <View className="flex-1">
+                        <Text className="font-bold text-slate-800 text-xs">{area.name}</Text>
+                        <Text className="text-[9px] text-slate-400">{storeCount} outlet{storeCount === 1 ? '' : 's'}</Text>
+                      </View>
+                      <Pressable onPress={() => handleStartEditArea(area.id, area.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                        <Edit size={14} color="#475569" />
+                      </Pressable>
+                      <Pressable onPress={() => setDeleteAreaConfirmId(area.id)} className="p-1.5 bg-rose-50 rounded-lg active:bg-rose-100">
+                        <Trash2 size={14} color="#e11d48" />
+                      </Pressable>
+                    </>
+                  )}
+                </View>
+              );
+            })}
+            {data.areas.length === 0 && (
+              <Text className="text-[10px] text-slate-400 italic py-2 text-center">No district areas yet. Add one above.</Text>
+            )}
+          </View>
+        </View>
+      ) : activeForm === 'store_pricing' && pricingStore ? (() => {
+        const activeProducts = data.products.filter(p => p.status === 'Active');
+        const overriddenProductIds = new Set(data.storePricing.filter(sp => sp.store_id === pricingStore.id).map(sp => sp.product_id));
+        const addableOptions = activeProducts.filter(p => !pricingProductIds.includes(p.id)).map(p => ({ label: p.name, value: p.id }));
+        const customProducts = pricingProductIds
+          .map(id => data.products.find(p => p.id === id))
+          .filter((p): p is Product => !!p);
+        const visibleProducts = customProducts.filter(p => p.name.toLowerCase().includes(productPricingSearch.trim().toLowerCase()));
+
+        const isRowDirty = isPricingRowDirty;
+        const dirtyCount = customProducts.filter(isRowDirty).length;
+
+        return (
+        <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-4 w-full lg:max-w-4xl lg:self-center">
+          <View className="gap-2 border-b border-slate-100 pb-2 sm:flex-row sm:items-center sm:justify-between">
+            <View className="sm:flex-1 sm:mr-2">
+              <Text className="font-extrabold text-slate-800 text-sm">Custom Pricing</Text>
+              <Text className="text-[10px] text-slate-400">{pricingStore.name} - most products stay at the catalog rate. Tap "Add Custom Price" to give this outlet its own negotiated rate on a product.</Text>
+            </View>
+            <View className="flex-row flex-wrap items-center gap-1.5">
+              {overriddenProductIds.size > 0 && (
+                <Pressable onPress={handleOpenClonePricing} className="bg-emerald-50 border border-emerald-100 px-2.5 py-1 rounded-lg active:bg-emerald-100 flex-row items-center gap-1">
+                  <Copy size={12} color="#059669" />
+                  <Text className="text-emerald-600 font-bold text-xs">Clone to Other Stores</Text>
+                </Pressable>
+              )}
+              {data.stores.some(s => s.status === 'Active' && s.id !== pricingStore.id) && (
+                <Pressable onPress={handleOpenCloneFromPricing} className="bg-indigo-50 border border-indigo-100 px-2.5 py-1 rounded-lg active:bg-indigo-100 flex-row items-center gap-1">
+                  <Copy size={12} color="#4f46e5" />
+                  <Text className="text-indigo-600 font-bold text-xs">Clone from Another Store</Text>
+                </Pressable>
+              )}
+              <Pressable onPress={handleBackFromStorePricing} className="bg-slate-100 px-2.5 py-1 rounded-lg active:bg-slate-200">
+                <Text className="text-slate-500 font-bold text-xs">Back to Partner Outlets</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <View className="flex-row items-center gap-2 flex-wrap">
+            <Pressable
+              onPress={handleAddPricingProductRow}
+              disabled={addableOptions.length === 0}
+              className={`flex-row items-center justify-center gap-1 px-3 py-2 rounded-xl ${addableOptions.length === 0 ? 'bg-slate-100' : 'bg-indigo-600 active:bg-indigo-700'}`}
+            >
+              <Plus size={14} color={addableOptions.length === 0 ? '#94a3b8' : '#ffffff'} />
+              <Text className={`font-bold text-xs ${addableOptions.length === 0 ? 'text-slate-400' : 'text-white'}`}>Add</Text>
+            </Pressable>
+            {pricingProductIds.length > 0 && (
+              <View className="flex-1 min-w-[140px] flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3">
+                <Search size={14} color="#94a3b8" />
+                <TextInput
+                  value={productPricingSearch}
+                  onChangeText={setProductPricingSearch}
+                  placeholder="Search custom-priced products..."
+                  placeholderTextColor="#94a3b8"
+                  className="flex-1 text-xs text-slate-800 py-2"
+                  style={{ outlineStyle: 'none' } as any}
+                />
+                {productPricingSearch.length > 0 && (
+                  <Pressable onPress={() => setProductPricingSearch('')} hitSlop={8}>
+                    <X size={14} color="#94a3b8" />
+                  </Pressable>
+                )}
+              </View>
+            )}
+          </View>
+          {addableOptions.length === 0 && (
+            <Text className="text-[10px] text-slate-400 italic -mt-2">Every active product already has custom pricing for this outlet.</Text>
+          )}
+
+          <View className="gap-2">
+            <View className="flex-row items-center justify-between flex-wrap gap-2">
+              <Text className="font-extrabold text-slate-500 text-xs">
+                {pricingProductIds.length} Custom-Priced Product{pricingProductIds.length === 1 ? '' : 's'}
+              </Text>
+              <View className="flex-row items-center gap-1.5">
+                {dirtyCount > 1 && (
+                  <Pressable onPress={saveAllDirtyPricingRows} className="flex-row items-center gap-1 bg-emerald-600 px-2.5 py-1 rounded-lg active:bg-emerald-700">
+                    <Check size={12} color="#ffffff" />
+                    <Text className="text-white font-bold text-xs">Save All ({dirtyCount})</Text>
+                  </Pressable>
+                )}
+                {pricingProductIds.length > 0 && <ViewToggle />}
+              </View>
+            </View>
+
+            {pricingProductIds.length === 0 ? (
+              <Text className="text-[10px] text-slate-400 italic py-2 text-center">No custom pricing set for this outlet yet - it sells everything at catalog rates. Tap "Add Custom Price" above to add one.</Text>
+            ) : visibleProducts.length === 0 ? (
+              <Text className="text-[10px] text-slate-400 italic py-2 text-center">No custom-priced products match your search.</Text>
+            ) : viewMode === 'table' ? (
+              <DataTable
+                data={visibleProducts}
+                keyExtractor={p => p.id}
+                columns={([
+                  {
+                    key: 'product', label: 'Product', width: 200,
+                    render: (product: Product) => (
+                      <SelectField
+                        value={product.id}
+                        onValueChange={v => handleChangePricingProduct(product.id, v)}
+                        options={activeProducts.filter(p => p.id === product.id || !pricingProductIds.includes(p.id)).map(p => ({ label: p.name, value: p.id }))}
+                        title="Select Product"
+                        searchable
+                        className="bg-white border border-slate-200 rounded-lg p-1.5 flex-row items-center justify-between"
+                      />
+                    ),
+                  },
+                  {
+                    key: 'reference', label: 'MRP / Wholesale', width: 150, grow: false,
+                    render: (product: Product) => (
+                      <View>
+                        <Text className="text-[10px] text-slate-600 font-bold">MRP Rs {product.mrp.toFixed(2)}</Text>
+                        <Text className="text-[9px] text-slate-400">Catalog WS Rs {product.wholesale_price.toFixed(2)}</Text>
+                      </View>
+                    ),
+                  },
+                  {
+                    key: 'wholesale', label: 'Wholesale % / Rs', width: 110, grow: false,
+                    render: (product: Product) => {
+                      const edit = storePricingEdits[product.id] || emptyPricingEdit;
+                      return (
+                        <View className="gap-1">
+                          <TextInput
+                            keyboardType="decimal-pad"
+                            value={edit.wholesale}
+                            onChangeText={v => updateStorePricingPct(product.id, 'wholesale', v, product.mrp)}
+                            placeholder={`${product.wholesale_discount_pct}`}
+                            placeholderTextColor="#94a3b8"
+                            className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs text-center"
+                            style={{ outlineStyle: 'none' } as any}
+                          />
+                          <TextInput
+                            keyboardType="decimal-pad"
+                            value={edit.wholesalePrice}
+                            onChangeText={v => updateStorePricingPrice(product.id, 'wholesale', v, product.mrp)}
+                            placeholder={product.wholesale_price.toFixed(2)}
+                            placeholderTextColor="#94a3b8"
+                            className="bg-slate-50 border border-slate-200 rounded-lg p-1 text-[10px] text-center text-slate-500"
+                            style={{ outlineStyle: 'none' } as any}
+                          />
+                        </View>
+                      );
+                    },
+                  },
+                  retailEnabled ? {
+                    key: 'retail', label: 'Selling % / Rs', width: 110, grow: false,
+                    render: (product: Product) => {
+                      const edit = storePricingEdits[product.id] || emptyPricingEdit;
+                      return (
+                        <View className="gap-1">
+                          <TextInput
+                            keyboardType="decimal-pad"
+                            value={edit.retail}
+                            onChangeText={v => updateStorePricingPct(product.id, 'retail', v, product.mrp)}
+                            placeholder={`${product.retail_discount_pct}`}
+                            placeholderTextColor="#94a3b8"
+                            className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs text-center"
+                            style={{ outlineStyle: 'none' } as any}
+                          />
+                          <TextInput
+                            keyboardType="decimal-pad"
+                            value={edit.retailPrice}
+                            onChangeText={v => updateStorePricingPrice(product.id, 'retail', v, product.mrp)}
+                            placeholder={product.selling_price.toFixed(2)}
+                            placeholderTextColor="#94a3b8"
+                            className="bg-slate-50 border border-slate-200 rounded-lg p-1 text-[10px] text-center text-slate-500"
+                            style={{ outlineStyle: 'none' } as any}
+                          />
+                        </View>
+                      );
+                    },
+                  } : null,
+                  {
+                    key: 'actions', label: '', width: 80, align: 'center', grow: false,
+                    render: (product: Product) => {
+                      const dirty = isRowDirty(product);
+                      return (
+                      <View className="flex-row items-center justify-center gap-1.5">
+                        <Pressable onPress={() => dirty && handleSaveStorePricingRow(product.id)} disabled={!dirty} className={`p-1.5 rounded-lg ${dirty ? 'bg-emerald-50 active:bg-emerald-100' : 'bg-slate-50'}`}>
+                          <Check size={14} color={dirty ? '#059669' : '#cbd5e1'} />
+                        </Pressable>
+                        <Pressable onPress={() => handleRemovePricingProduct(product.id)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                          <Trash2 size={14} color="#e11d48" />
+                        </Pressable>
+                      </View>
+                      );
+                    },
+                  },
+                ].filter(Boolean)) as DataTableColumn<Product>[]}
+              />
+            ) : (
+              <View className="gap-2 md:flex-row md:flex-wrap">
+                {visibleProducts.map(product => {
+                  const edit = storePricingEdits[product.id] || emptyPricingEdit;
+                  const isCustom = overriddenProductIds.has(product.id);
+                  const dirty = isRowDirty(product);
+                  return (
+                    <View key={product.id} className={`w-full md:w-[48%] p-2.5 rounded-xl border gap-2 ${isCustom ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-200'}`}>
+                      <View className="flex-row items-center gap-1.5">
+                        <View className="flex-1">
+                          <SelectField
+                            value={product.id}
+                            onValueChange={v => handleChangePricingProduct(product.id, v)}
+                            options={activeProducts.filter(p => p.id === product.id || !pricingProductIds.includes(p.id)).map(p => ({ label: p.name, value: p.id }))}
+                            title="Select Product"
+                            searchable
+                            className="bg-white border border-slate-200 rounded-lg p-1.5 flex-row items-center justify-between"
+                          />
+                        </View>
+                        {isCustom && <Text className="text-[9px] font-black text-indigo-600 bg-indigo-100 px-1.5 py-0.5 rounded uppercase">Custom</Text>}
+                      </View>
+                      <Text className="text-[9px] text-slate-400">MRP: Rs {product.mrp.toFixed(2)} · Catalog Wholesale: Rs {product.wholesale_price.toFixed(2)}</Text>
+                      <View className="flex-row items-center gap-2">
+                        <View className="flex-1">
+                          <Text className="text-[9px] font-bold text-slate-500 mb-1 uppercase">Wholesale % / Rs</Text>
+                          <TextInput
+                            keyboardType="decimal-pad"
+                            value={edit.wholesale}
+                            onChangeText={v => updateStorePricingPct(product.id, 'wholesale', v, product.mrp)}
+                            placeholder={`${product.wholesale_discount_pct}`}
+                            placeholderTextColor="#94a3b8"
+                            className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs text-center"
+                            style={{ outlineStyle: 'none' } as any}
+                          />
+                          <TextInput
+                            keyboardType="decimal-pad"
+                            value={edit.wholesalePrice}
+                            onChangeText={v => updateStorePricingPrice(product.id, 'wholesale', v, product.mrp)}
+                            placeholder={product.wholesale_price.toFixed(2)}
+                            placeholderTextColor="#94a3b8"
+                            className="bg-slate-50 border border-slate-200 rounded-lg p-1 text-[10px] text-center text-slate-500 mt-1"
+                            style={{ outlineStyle: 'none' } as any}
+                          />
+                        </View>
+                        {retailEnabled && (
+                          <View className="flex-1">
+                            <Text className="text-[9px] font-bold text-slate-500 mb-1 uppercase">Selling % / Rs</Text>
+                            <TextInput
+                              keyboardType="decimal-pad"
+                              value={edit.retail}
+                              onChangeText={v => updateStorePricingPct(product.id, 'retail', v, product.mrp)}
+                              placeholder={`${product.retail_discount_pct}`}
+                              placeholderTextColor="#94a3b8"
+                              className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs text-center"
+                              style={{ outlineStyle: 'none' } as any}
+                            />
+                            <TextInput
+                              keyboardType="decimal-pad"
+                              value={edit.retailPrice}
+                              onChangeText={v => updateStorePricingPrice(product.id, 'retail', v, product.mrp)}
+                              placeholder={product.selling_price.toFixed(2)}
+                              placeholderTextColor="#94a3b8"
+                              className="bg-slate-50 border border-slate-200 rounded-lg p-1 text-[10px] text-center text-slate-500 mt-1"
+                              style={{ outlineStyle: 'none' } as any}
+                            />
+                          </View>
+                        )}
+                        <Pressable onPress={() => dirty && handleSaveStorePricingRow(product.id)} disabled={!dirty} className={`p-2 rounded-lg mt-3.5 ${dirty ? 'bg-emerald-50 active:bg-emerald-100' : 'bg-slate-50'}`}>
+                          <Check size={16} color={dirty ? '#059669' : '#cbd5e1'} />
+                        </Pressable>
+                        <Pressable onPress={() => handleRemovePricingProduct(product.id)} className="p-2 bg-slate-100 rounded-lg active:bg-slate-200 mt-3.5">
+                          <Trash2 size={16} color="#e11d48" />
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+          </View>
+        </View>
+        );
+      })() : activeForm === 'add_supplier' ? (
         <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
           <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
             <Text className="font-extrabold text-slate-800 text-sm">{editingSupplierId ? 'Edit Supply Partner Details' : 'Register Cold-Chain Supply Partner'}</Text>
@@ -676,7 +2026,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Contact Person</Text><TextInput value={supplierForm.contact_person} onChangeText={v => setSupplierForm({ ...supplierForm, contact_person: v })} placeholder="e.g. Ramesh Iyer" placeholderTextColor="#94a3b8" className={inputClass} /></View>
           </View>
           <View className="flex-row gap-2">
-            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Phone Number</Text><TextInput value={supplierForm.phone} onChangeText={v => setSupplierForm({ ...supplierForm, phone: v })} placeholder="e.g. +91 98765 43210" placeholderTextColor="#94a3b8" className={inputClass} /></View>
+            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Phone Number</Text><TextInput value={supplierForm.phone} onChangeText={v => setSupplierForm({ ...supplierForm, phone: v })} placeholder="e.g. +91 7373674757" placeholderTextColor="#94a3b8" className={inputClass} /></View>
             <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Email Address</Text><TextInput value={supplierForm.email} onChangeText={v => setSupplierForm({ ...supplierForm, email: v })} placeholder="e.g. contact@konkandairy.in" placeholderTextColor="#94a3b8" className={inputClass} /></View>
           </View>
           <View><Text className="font-bold text-slate-500 mb-1 text-xs">Address Location</Text><TextInput value={supplierForm.address} onChangeText={v => setSupplierForm({ ...supplierForm, address: v })} placeholder="e.g. Plot No. 24, Industrial Area Phase II" placeholderTextColor="#94a3b8" className={inputClass} /></View>
@@ -695,8 +2045,9 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             <SelectField
               value={paymentForm.store_id}
               onValueChange={v => setPaymentForm({ ...paymentForm, store_id: v, invoice_id: 'general' })}
-              options={data.stores.filter(s => s.status === 'Active').map(s => ({ label: `${s.name} (Outstanding: Rs${s.outstanding_balance})`, value: s.id }))}
+              options={data.stores.filter(s => s.status === 'Active').map(s => ({ label: `${s.name} (Outstanding: Rs${s.outstanding_balance.toFixed(2)})`, value: s.id }))}
               title="Select Store"
+              searchable
               className={inputClass + ' flex-row items-center justify-between'}
             />
           </View>
@@ -718,7 +2069,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   }}
                   options={[
                     { label: 'General Credit Recovery (No specific invoice)', value: 'general' },
-                    ...unpaidInvoices.map(inv => ({ label: `${inv.invoice_number} (Due: Rs${(inv.grand_total - (inv.paid_amount || 0)).toFixed(2)} of Rs${inv.grand_total.toFixed(2)})`, value: inv.id })),
+                    ...unpaidInvoices.map(inv => ({ label: `${inv.invoice_number} (Due: Rs${formatWholeRupees(inv.grand_total - (inv.paid_amount || 0))} of Rs${formatWholeRupees(inv.grand_total)})`, value: inv.id })),
                   ]}
                   title="Select Invoice"
                   className={inputClass + ' flex-row items-center justify-between'}
@@ -727,7 +2078,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             );
           })()}
           <View className="flex-row gap-2">
-            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Collected Amount (Rs)</Text><TextInput keyboardType="decimal-pad" value={String(paymentForm.amount)} onChangeText={v => setPaymentForm({ ...paymentForm, amount: Number(v) || 0 })} className={inputClass + ' font-bold text-emerald-600'} /></View>
+            <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Collected Amount (Rs)</Text><TextInput keyboardType="decimal-pad" value={paymentForm.amount === 0 ? '' : String(paymentForm.amount)} onChangeText={v => setPaymentForm({ ...paymentForm, amount: Number(v) || 0 })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass + ' font-bold text-emerald-600'} /></View>
             <View className="flex-1"><Text className="font-bold text-slate-500 mb-1 text-xs">Settlement Method</Text><SelectField value={paymentForm.method} onValueChange={v => setPaymentForm({ ...paymentForm, method: v as any })} options={paymentMethodOptions} title="Select Method" className={inputClass + ' flex-row items-center justify-between'} /></View>
           </View>
           <Pressable onPress={handleSavePayment} className="w-full py-2.5 bg-emerald-500 rounded-xl items-center active:bg-emerald-600">
@@ -742,7 +2093,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
           </View>
           <View>
             <Text className="text-[10px] font-bold text-slate-500 uppercase mb-1">Select Partner Store</Text>
-            <SelectField value={preBookingStoreId} onValueChange={setPreBookingStoreId} options={preBookingStoreOptions} title="Select Store" className={inputClass + ' rounded-xl flex-row items-center justify-between'} />
+            <SelectField value={preBookingStoreId} onValueChange={setPreBookingStoreId} options={preBookingStoreOptions} title="Select Store" searchable className={inputClass + ' rounded-xl flex-row items-center justify-between'} />
           </View>
           <View>
             <Text className="text-[10px] font-bold text-slate-500 uppercase mb-1">Scheduled Delivery Date</Text>
@@ -752,42 +2103,77 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             <Text className="text-[10px] font-bold text-slate-500 uppercase mb-1">Notes (Optional)</Text>
             <TextInput value={preBookingNotes} onChangeText={setPreBookingNotes} multiline numberOfLines={2} placeholder="Enter special delivery instructions or notes..." placeholderTextColor="#94a3b8" className={inputClass + ' rounded-xl'} style={{ minHeight: 60, textAlignVertical: 'top' }} />
           </View>
-          <View className="flex-row items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-2.5">
-            <Text className="text-[10px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
-            <View className="flex-row bg-white p-1 rounded-lg border border-slate-200">
-              <Pressable onPress={() => setPreBookingPricingMode('wholesale')} className={`px-3 py-1.5 rounded-md ${preBookingPricingMode === 'wholesale' ? 'bg-indigo-600' : ''}`}>
-                <Text className={`text-xs font-bold ${preBookingPricingMode === 'wholesale' ? 'text-white' : 'text-slate-500'}`}>Wholesale</Text>
+          {retailEnabled && (
+            <View className="flex-row items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-2">
+              <Text className="text-[9px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
+              <View className="flex-row bg-white p-0.5 rounded-lg border border-slate-200">
+                <Pressable onPress={() => setPreBookingPricingMode('wholesale')} className={`px-2 py-1 rounded-md ${preBookingPricingMode === 'wholesale' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${preBookingPricingMode === 'wholesale' ? 'text-white' : 'text-slate-500'}`}>Wholesale</Text>
+                </Pressable>
+                <Pressable onPress={() => setPreBookingPricingMode('retail')} className={`px-2 py-1 rounded-md ${preBookingPricingMode === 'retail' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${preBookingPricingMode === 'retail' ? 'text-white' : 'text-slate-500'}`}>Selling</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+          <View className="flex-row items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-2">
+            <Text className="text-[9px] font-bold text-slate-500 uppercase">GST</Text>
+            <View className="flex-row bg-white p-0.5 rounded-lg border border-slate-200">
+              <Pressable onPress={() => setPreBookingGstMode('with_gst')} className={`px-2 py-1 rounded-md ${preBookingGstMode === 'with_gst' ? 'bg-indigo-600' : ''}`}>
+                <Text className={`text-[10px] font-bold ${preBookingGstMode === 'with_gst' ? 'text-white' : 'text-slate-500'}`}>With GST</Text>
               </Pressable>
-              <Pressable onPress={() => setPreBookingPricingMode('retail')} className={`px-3 py-1.5 rounded-md ${preBookingPricingMode === 'retail' ? 'bg-indigo-600' : ''}`}>
-                <Text className={`text-xs font-bold ${preBookingPricingMode === 'retail' ? 'text-white' : 'text-slate-500'}`}>Selling</Text>
+              <Pressable onPress={() => setPreBookingGstMode('without_gst')} className={`px-2 py-1 rounded-md ${preBookingGstMode === 'without_gst' ? 'bg-indigo-600' : ''}`}>
+                <Text className={`text-[10px] font-bold ${preBookingGstMode === 'without_gst' ? 'text-white' : 'text-slate-500'}`}>No GST</Text>
               </Pressable>
             </View>
           </View>
           <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-2">
-            <Text className="font-bold text-slate-500 text-[10px] uppercase">Select Products & Pre-book Quantities:</Text>
-            {data.products.filter(product => product.status === 'Active' && getEffectiveAvailableForBooking(product.id) > 0).length === 0 && (
-              <Text className="text-[10px] text-slate-400 italic py-2 text-center">No products currently have warehouse stock available to pre-book.</Text>
-            )}
-            <View className="gap-2 md:flex-row md:flex-wrap">
-            {data.products.filter(product => product.status === 'Active' && getEffectiveAvailableForBooking(product.id) > 0).map(product => {
-              const available = getEffectiveAvailableForBooking(product.id);
-              const qty = preBookingItems[product.id] || 0;
-              const rate = preBookingPricingMode === 'wholesale' ? product.wholesale_price : product.selling_price;
-              const warnStockLimit = (nextQty: number) => {
-                if (nextQty <= available) return true;
-                showAlert(available === 0
-                  ? `${product.name} is out of stock in the warehouse. It cannot be added to this pre-booking.`
-                  : `Only ${available} units of ${product.name} are available in the warehouse right now.`);
-                return false;
-              };
-              return (
-                <View key={product.id} className="w-full md:w-[48%] flex-row items-center justify-between gap-2 bg-white border border-slate-200 rounded-xl p-2">
-                  <View className="flex-1">
-                    <Text className="font-bold text-slate-800 text-[11px]">{product.name}</Text>
-                    <Text className="text-slate-400 text-[9px]">Rs{rate.toFixed(2)} ({preBookingPricingMode === 'wholesale' ? 'Wholesale' : 'Selling'}) - Stock: {available} units available</Text>
-                  </View>
+            <View className="flex-row items-center justify-between flex-wrap gap-2">
+              <Text className="font-bold text-slate-500 text-[10px] uppercase">Select Products & Pre-book Quantities:</Text>
+              <ViewToggle />
+            </View>
+            <View className="flex-row items-center gap-2 bg-white border border-slate-200 rounded-xl px-3">
+              <Search size={14} color="#94a3b8" />
+              <TextInput
+                value={preBookingProductSearch}
+                onChangeText={setPreBookingProductSearch}
+                placeholder="Search products..."
+                placeholderTextColor="#94a3b8"
+                className="flex-1 text-xs text-slate-800 py-2"
+                style={{ outlineStyle: 'none' } as any}
+              />
+              {preBookingProductSearch.length > 0 && (
+                <Pressable onPress={() => setPreBookingProductSearch('')} hitSlop={8}>
+                  <X size={14} color="#94a3b8" />
+                </Pressable>
+              )}
+            </View>
+            {(() => {
+              const basePreBookingProducts = data.products.filter(product => product.status === 'Active' && getEffectiveAvailableForBooking(product.id) > 0 && product.name.toLowerCase().includes(preBookingProductSearch.trim().toLowerCase()));
+
+              if (basePreBookingProducts.length === 0) {
+                return <Text className="text-[10px] text-slate-400 italic py-2 text-center">{preBookingProductSearch.trim() ? 'No products match your search.' : 'No products currently have warehouse stock available to pre-book.'}</Text>;
+              }
+
+              // Deliberately NOT reordered by selection - a product keeps its
+              // normal catalog position (and scroll position stays put) no
+              // matter how its quantity is changed, so picking multiple items
+              // stays predictable instead of the list jumping around.
+              const filteredPreBookingProducts = basePreBookingProducts;
+
+              const renderPreBookingQtyStepper = (product: Product) => {
+                const available = getEffectiveAvailableForBooking(product.id);
+                const qty = preBookingItems[product.id] || 0;
+                const warnStockLimit = (nextQty: number) => {
+                  if (nextQty <= available) return true;
+                  showAlert(available === 0
+                    ? `${product.name} is out of stock in the warehouse. It cannot be added to this pre-booking.`
+                    : `Only ${available} units of ${product.name} are available in the warehouse right now.`);
+                  return false;
+                };
+                return (
                   <View className="flex-row items-center gap-1.5">
-                    <Pressable onPress={() => setPreBookingItems(prev => ({ ...prev, [product.id]: Math.max(0, qty - 1) }))} className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200">
+                    <Pressable onPress={() => { const next = Math.max(0, qty - 1); setPreBookingItems(prev => ({ ...prev, [product.id]: next })); updatePreBookingItemOrder(product.id, next); }} className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200">
                       <Text className="font-extrabold text-slate-800 text-xs">-</Text>
                     </Pressable>
                     <TextInput
@@ -796,32 +2182,136 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                       onChangeText={v => {
                         const num = Math.max(0, parseInt(v) || 0);
                         warnStockLimit(num);
-                        setPreBookingItems(prev => ({ ...prev, [product.id]: Math.min(available, num) }));
+                        const next = Math.min(available, num);
+                        setPreBookingItems(prev => ({ ...prev, [product.id]: next }));
+                        updatePreBookingItemOrder(product.id, next);
                       }}
                       placeholder="0"
                       placeholderTextColor="#94a3b8"
                       className="w-10 text-center text-xs font-bold text-slate-800 border border-slate-200 rounded-lg p-1"
                     />
                     <Pressable
-                      onPress={() => { if (warnStockLimit(qty + 1)) setPreBookingItems(prev => ({ ...prev, [product.id]: qty + 1 })); }}
+                      onPress={() => { if (warnStockLimit(qty + 1)) { setPreBookingItems(prev => ({ ...prev, [product.id]: qty + 1 })); updatePreBookingItemOrder(product.id, qty + 1); } }}
                       className={`w-7 h-7 rounded-lg items-center justify-center ${qty >= available ? 'bg-slate-50' : 'bg-slate-100 active:bg-slate-200'}`}
                     >
                       <Text className={`font-extrabold text-xs ${qty >= available ? 'text-slate-300' : 'text-slate-800'}`}>+</Text>
                     </Pressable>
                   </View>
+                );
+              };
+
+              if (viewMode === 'table') {
+                return (
+                  <DataTable
+                    data={filteredPreBookingProducts}
+                    keyExtractor={p => p.id}
+                    emptyText="No products currently have warehouse stock available to pre-book."
+                    columns={[
+                      { key: 'product', label: 'Product', width: 170, render: p => <Text numberOfLines={1} className="font-bold text-slate-800 text-[11px]">{p.name}</Text> },
+                      {
+                        key: 'price', label: 'Price', width: 130,
+                        render: p => {
+                          const rate = getEffectiveProductPrice(p, effectivePreBookingPricingMode, preBookingStoreId, data.storePricing);
+                          return <Text className="text-slate-600 text-[11px] font-bold">Rs{rate.toFixed(2)}{retailEnabled ? ` (${effectivePreBookingPricingMode === 'wholesale' ? 'Wholesale' : 'Selling'})` : ''}</Text>;
+                        },
+                      },
+                      { key: 'stock', label: 'Stock', width: 70, align: 'center', grow: false, render: p => <Text className="text-center text-[11px] font-black text-slate-800">{getEffectiveAvailableForBooking(p.id)}</Text> },
+                      { key: 'qty', label: 'Quantity', width: 140, grow: false, render: renderPreBookingQtyStepper },
+                    ] as DataTableColumn<Product>[]}
+                  />
+                );
+              }
+
+              return (
+                <View className="gap-2 md:flex-row md:flex-wrap">
+                  {filteredPreBookingProducts.map(product => {
+                    const available = getEffectiveAvailableForBooking(product.id);
+                    const rate = getEffectiveProductPrice(product, effectivePreBookingPricingMode, preBookingStoreId, data.storePricing);
+                    return (
+                      <View key={product.id} className="w-full md:w-[48%] flex-row items-center justify-between gap-2 bg-white border border-slate-200 rounded-xl p-2">
+                        <View className="flex-1">
+                          <Text className="font-bold text-slate-800 text-[11px]">{product.name}</Text>
+                          <Text className="text-slate-400 text-[9px]">Rs{rate.toFixed(2)}{retailEnabled ? ` (${effectivePreBookingPricingMode === 'wholesale' ? 'Wholesale' : 'Selling'})` : ''} - Stock: {available} units available</Text>
+                        </View>
+                        {renderPreBookingQtyStepper(product)}
+                      </View>
+                    );
+                  })}
                 </View>
               );
-            })}
-            </View>
+            })()}
           </View>
           <View className="bg-slate-100 p-2.5 rounded-xl flex-row justify-between items-center">
-            <Text className="font-bold text-slate-500 text-xs">Estimated Total Value:</Text>
+            <Text className="font-bold text-slate-500 text-xs">Estimated Total Value{preBookingGstMode === 'with_gst' ? ' (Incl. GST)' : ''}:</Text>
             <Text className="font-black text-slate-800 text-sm">
-              Rs {Object.entries(preBookingItems).reduce((sum, [pId, qty]) => { const prod = data.products.find(p => p.id === pId); const rate = prod ? (preBookingPricingMode === 'wholesale' ? prod.wholesale_price : prod.selling_price) : 0; return sum + (Number(qty) * rate); }, 0).toFixed(2)}
+              Rs {formatWholeRupees(computeInvoiceTotals(buildPreBookingItemsList()).grand_total)}
             </Text>
           </View>
           <Pressable onPress={handleSavePreBooking} className="w-full py-2.5 bg-blue-600 rounded-xl items-center active:bg-blue-700">
             <Text className="text-white font-bold text-xs">{editingPreBookingId ? 'Update Pre-booking & Adjust Reservation' : 'Save Pre-booking & Reserve Stock'}</Text>
+          </Pressable>
+        </View>
+      ) : activeForm === 'prebooking_confirmation' && pendingPreBooking ? (
+        <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
+          <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+            <View>
+              <Text className="font-extrabold text-slate-800 text-sm">Pre-Booking Confirmation</Text>
+              <Text className="text-[10px] text-slate-400">Review the full details before reserving stock</Text>
+            </View>
+            <Pressable onPress={handleBackFromPreBookingConfirmation}><Text className="text-slate-400 text-xs">Back</Text></Pressable>
+          </View>
+
+          <View className="gap-1.5">
+            <View className="flex-row justify-between bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+              <Text className="text-slate-400 font-bold uppercase text-[9px]">Partner Store</Text>
+              <Text className="font-extrabold text-slate-800 text-xs">{pendingPreBooking.storeName}</Text>
+            </View>
+            <View className="flex-row justify-between bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+              <Text className="text-slate-400 font-bold uppercase text-[9px]">Scheduled Delivery Date</Text>
+              <Text className="font-extrabold text-slate-800 text-xs">{new Date(pendingPreBooking.scheduledDate).toLocaleDateString()}</Text>
+            </View>
+            {!!pendingPreBooking.notes && (
+              <View className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                <Text className="text-slate-400 font-bold uppercase text-[9px] mb-0.5">Notes</Text>
+                <Text className="text-slate-700 text-xs">{pendingPreBooking.notes}</Text>
+              </View>
+            )}
+          </View>
+
+          {/* Same product order as the picker (selection order), never alphabetical. */}
+          <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-1.5">
+            <Text className="font-bold text-slate-500 text-[10px] uppercase mb-0.5">Selected Products & Quantities</Text>
+            {pendingPreBooking.items.map(item => {
+              const p = data.products.find(prod => prod.id === item.product_id);
+              return (
+                <View key={item.product_id} className="flex-row justify-between items-center border-b border-slate-100 pb-1.5 last:border-0 last:pb-0">
+                  <View className="flex-1 pr-2">
+                    <Text numberOfLines={1} className="font-bold text-slate-800 text-[11px]">{p?.name || 'Unknown'}</Text>
+                    <Text className="text-slate-400 text-[9px]">{item.quantity} units x Rs{item.unit_price.toFixed(2)}{item.tax_pct > 0 ? ` (+${item.tax_pct}% GST)` : ''}</Text>
+                  </View>
+                  <Text className="font-bold text-slate-700 text-[11px]">Rs{(item.quantity * item.unit_price).toFixed(2)}</Text>
+                </View>
+              );
+            })}
+          </View>
+
+          <View className="bg-slate-100 p-3 rounded-xl gap-1">
+            <View className="flex-row justify-between items-center">
+              <Text className="text-slate-500 font-semibold text-[10px] uppercase">Total (Before Round Off)</Text>
+              <Text className="font-bold text-slate-600 text-xs">Rs {(pendingPreBooking.grandTotal - pendingPreBooking.roundOff).toFixed(2)}</Text>
+            </View>
+            <View className="flex-row justify-between items-center">
+              <Text className="text-slate-500 font-semibold text-[10px] uppercase">Round Off</Text>
+              <Text className="font-bold text-slate-600 text-xs">{pendingPreBooking.roundOff > 0 ? '+' : ''}Rs {pendingPreBooking.roundOff.toFixed(2)}</Text>
+            </View>
+            <View className="flex-row justify-between items-center pt-1 border-t border-slate-200">
+              <Text className="font-extrabold text-slate-700 text-xs uppercase">Estimated Value</Text>
+              <Text className="font-black text-indigo-600 text-sm">Rs {formatWholeRupees(pendingPreBooking.grandTotal)}</Text>
+            </View>
+          </View>
+
+          <Pressable onPress={handleConfirmPreBooking} className="w-full py-2.5 bg-emerald-600 rounded-xl items-center active:bg-emerald-700">
+            <Text className="text-white font-bold text-xs uppercase">{editingPreBookingId ? 'Confirm Update' : 'Confirm Pre-Booking'}</Text>
           </Pressable>
         </View>
       ) : activeForm === 'create_order' ? (
@@ -832,93 +2322,214 @@ export default function AdminSales({ data, setData, addNotification, currentUser
           </View>
           <View>
             <Text className="text-[10px] font-bold text-slate-500 uppercase mb-1">Select Partner Store</Text>
-            <SelectField value={newOrderStoreId} onValueChange={setNewOrderStoreId} options={storeOptions} title="Select Store" className={inputClass + ' rounded-xl flex-row items-center justify-between'} />
+            <SelectField value={newOrderStoreId} onValueChange={setNewOrderStoreId} options={storeOptions} title="Select Store" searchable className={inputClass + ' rounded-xl flex-row items-center justify-between'} />
           </View>
-          <View>
-            <Text className="text-[10px] font-bold text-slate-500 uppercase mb-1">Dispatch From Truck</Text>
-            <SelectField value={newOrderTruckId} onValueChange={setNewOrderTruckId} options={newOrderTruckOptions} title="Select Truck" className={inputClass + ' rounded-xl flex-row items-center justify-between'} />
-          </View>
-          <View className="flex-row items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-2.5">
-            <Text className="text-[10px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
-            <View className="flex-row bg-white p-1 rounded-lg border border-slate-200">
-              <Pressable onPress={() => setNewOrderPricingMode('wholesale')} className={`px-3 py-1.5 rounded-md ${newOrderPricingMode === 'wholesale' ? 'bg-indigo-600' : ''}`}>
-                <Text className={`text-xs font-bold ${newOrderPricingMode === 'wholesale' ? 'text-white' : 'text-slate-500'}`}>Wholesale</Text>
-              </Pressable>
-              <Pressable onPress={() => setNewOrderPricingMode('retail')} className={`px-3 py-1.5 rounded-md ${newOrderPricingMode === 'retail' ? 'bg-indigo-600' : ''}`}>
-                <Text className={`text-xs font-bold ${newOrderPricingMode === 'retail' ? 'text-white' : 'text-slate-500'}`}>Selling</Text>
-              </Pressable>
-            </View>
-          </View>
-          {!newOrderTruckId ? (
-            <Text className="text-[10px] text-slate-400 italic py-2 text-center">Select a truck to see its loaded stock.</Text>
-          ) : (
-            <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-2">
-              <Text className="font-bold text-slate-500 text-[10px] uppercase">Select Products & Quantities:</Text>
-              {data.products.filter(product => product.status === 'Active' && getTruckStock(product.id) > 0).length === 0 && (
-                <Text className="text-[10px] text-slate-400 italic py-2 text-center">This truck has no ice cream stock loaded right now.</Text>
-              )}
-              <View className="gap-2 md:flex-row md:flex-wrap">
-                {data.products.filter(product => product.status === 'Active' && getTruckStock(product.id) > 0).map(product => {
-                  const available = getTruckStock(product.id);
-                  const qty = newOrderItems[product.id] || 0;
-                  const rate = newOrderPricingMode === 'wholesale' ? product.wholesale_price : product.selling_price;
-                  const warnStockLimit = (nextQty: number) => {
-                    if (nextQty <= available) return true;
-                    showAlert(available === 0
-                      ? `${product.name} is out of stock on this truck. It cannot be added to this order.`
-                      : `Only ${available} units of ${product.name} are available on this truck right now.`);
-                    return false;
-                  };
-                  return (
-                    <View key={product.id} className="w-full md:w-[48%] flex-row items-center justify-between gap-2 bg-white border border-slate-200 rounded-xl p-2">
-                      <View className="flex-1">
-                        <Text className="font-bold text-slate-800 text-[11px]">{product.name}</Text>
-                        <Text className="text-slate-400 text-[9px]">Rs{rate.toFixed(2)} ({newOrderPricingMode === 'wholesale' ? 'Wholesale' : 'Selling'}) - Stock: {available} units available</Text>
-                      </View>
-                      <View className="flex-row items-center gap-1.5">
-                        <Pressable onPress={() => setNewOrderItems(prev => ({ ...prev, [product.id]: Math.max(0, qty - 1) }))} className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200">
-                          <Text className="font-extrabold text-slate-800 text-xs">-</Text>
-                        </Pressable>
-                        <TextInput
-                          keyboardType="number-pad"
-                          value={qty ? String(qty) : ''}
-                          onChangeText={v => {
-                            const num = Math.max(0, parseInt(v) || 0);
-                            warnStockLimit(num);
-                            setNewOrderItems(prev => ({ ...prev, [product.id]: Math.min(available, num) }));
-                          }}
-                          placeholder="0"
-                          placeholderTextColor="#94a3b8"
-                          className="w-10 text-center text-xs font-bold text-slate-800 border border-slate-200 rounded-lg p-1"
-                        />
-                        <Pressable
-                          onPress={() => { if (warnStockLimit(qty + 1)) setNewOrderItems(prev => ({ ...prev, [product.id]: qty + 1 })); }}
-                          className={`w-7 h-7 rounded-lg items-center justify-center ${qty >= available ? 'bg-slate-50' : 'bg-slate-100 active:bg-slate-200'}`}
-                        >
-                          <Text className={`font-extrabold text-xs ${qty >= available ? 'text-slate-300' : 'text-slate-800'}`}>+</Text>
-                        </Pressable>
-                      </View>
-                    </View>
-                  );
-                })}
+          <View className="gap-2 sm:flex-row sm:flex-wrap">
+            {retailEnabled && (
+              <View className="sm:flex-1 flex-row items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-2">
+                <Text className="text-[9px] font-bold text-slate-500 uppercase">Pricing Mode</Text>
+                <View className="flex-row bg-white p-0.5 rounded-lg border border-slate-200">
+                  <Pressable onPress={() => setNewOrderPricingMode('wholesale')} className={`px-2 py-1 rounded-md ${newOrderPricingMode === 'wholesale' ? 'bg-indigo-600' : ''}`}>
+                    <Text className={`text-[10px] font-bold ${newOrderPricingMode === 'wholesale' ? 'text-white' : 'text-slate-500'}`}>Wholesale</Text>
+                  </Pressable>
+                  <Pressable onPress={() => setNewOrderPricingMode('retail')} className={`px-2 py-1 rounded-md ${newOrderPricingMode === 'retail' ? 'bg-indigo-600' : ''}`}>
+                    <Text className={`text-[10px] font-bold ${newOrderPricingMode === 'retail' ? 'text-white' : 'text-slate-500'}`}>Selling</Text>
+                  </Pressable>
+                </View>
+              </View>
+            )}
+            <View className="sm:flex-1 flex-row items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-2">
+              <Text className="text-[9px] font-bold text-slate-500 uppercase">GST</Text>
+              <View className="flex-row bg-white p-0.5 rounded-lg border border-slate-200">
+                <Pressable onPress={() => setNewOrderGstMode('with_gst')} className={`px-2 py-1 rounded-md ${newOrderGstMode === 'with_gst' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${newOrderGstMode === 'with_gst' ? 'text-white' : 'text-slate-500'}`}>With GST</Text>
+                </Pressable>
+                <Pressable onPress={() => setNewOrderGstMode('without_gst')} className={`px-2 py-1 rounded-md ${newOrderGstMode === 'without_gst' ? 'bg-indigo-600' : ''}`}>
+                  <Text className={`text-[10px] font-bold ${newOrderGstMode === 'without_gst' ? 'text-white' : 'text-slate-500'}`}>No GST</Text>
+                </Pressable>
               </View>
             </View>
-          )}
+          </View>
+          <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-2">
+            <View className="flex-row items-center justify-between flex-wrap gap-2">
+              <Text className="font-bold text-slate-500 text-[10px] uppercase">Select Products & Quantities (Warehouse Stock):</Text>
+              <ViewToggle />
+            </View>
+            <View className="flex-row items-center gap-2 bg-white border border-slate-200 rounded-xl px-3">
+              <Search size={14} color="#94a3b8" />
+              <TextInput
+                value={newOrderProductSearch}
+                onChangeText={setNewOrderProductSearch}
+                placeholder="Search products..."
+                placeholderTextColor="#94a3b8"
+                className="flex-1 text-xs text-slate-800 py-2"
+                style={{ outlineStyle: 'none' } as any}
+              />
+              {newOrderProductSearch.length > 0 && (
+                <Pressable onPress={() => setNewOrderProductSearch('')} hitSlop={8}>
+                  <X size={14} color="#94a3b8" />
+                </Pressable>
+              )}
+            </View>
+            {(() => {
+              const baseNewOrderProducts = data.products.filter(product => product.status === 'Active' && getWarehouseStock(product.id) > 0 && product.name.toLowerCase().includes(newOrderProductSearch.trim().toLowerCase()));
+
+              if (baseNewOrderProducts.length === 0) {
+                return <Text className="text-[10px] text-slate-400 italic py-2 text-center">{newOrderProductSearch.trim() ? 'No products match your search.' : 'No products currently have warehouse stock available.'}</Text>;
+              }
+
+              // Deliberately NOT reordered by selection - a product keeps its
+              // normal catalog position (and scroll position stays put) no
+              // matter how its quantity is changed, so picking multiple items
+              // stays predictable instead of the list jumping around.
+              const filteredNewOrderProducts = baseNewOrderProducts;
+
+              const renderQtyStepper = (product: Product) => {
+                const available = getWarehouseStock(product.id);
+                const qty = newOrderItems[product.id] || 0;
+                const warnStockLimit = (nextQty: number) => {
+                  if (nextQty <= available) return true;
+                  showAlert(available === 0
+                    ? `${product.name} is out of stock in the warehouse. It cannot be added to this order.`
+                    : `Only ${available} units of ${product.name} are available in the warehouse right now.`);
+                  return false;
+                };
+                return (
+                  <View className="flex-row items-center gap-1.5">
+                    <Pressable onPress={() => { const next = Math.max(0, qty - 1); setNewOrderItems(prev => ({ ...prev, [product.id]: next })); updateNewOrderItemOrder(product.id, next); }} className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200">
+                      <Text className="font-extrabold text-slate-800 text-xs">-</Text>
+                    </Pressable>
+                    <TextInput
+                      keyboardType="number-pad"
+                      value={qty ? String(qty) : ''}
+                      onChangeText={v => {
+                        const num = Math.max(0, parseInt(v) || 0);
+                        warnStockLimit(num);
+                        const next = Math.min(available, num);
+                        setNewOrderItems(prev => ({ ...prev, [product.id]: next }));
+                        updateNewOrderItemOrder(product.id, next);
+                      }}
+                      placeholder="0"
+                      placeholderTextColor="#94a3b8"
+                      className="w-10 text-center text-xs font-bold text-slate-800 border border-slate-200 rounded-lg p-1"
+                    />
+                    <Pressable
+                      onPress={() => { if (warnStockLimit(qty + 1)) { setNewOrderItems(prev => ({ ...prev, [product.id]: qty + 1 })); updateNewOrderItemOrder(product.id, qty + 1); } }}
+                      className={`w-7 h-7 rounded-lg items-center justify-center ${qty >= available ? 'bg-slate-50' : 'bg-slate-100 active:bg-slate-200'}`}
+                    >
+                      <Text className={`font-extrabold text-xs ${qty >= available ? 'text-slate-300' : 'text-slate-800'}`}>+</Text>
+                    </Pressable>
+                  </View>
+                );
+              };
+
+              if (viewMode === 'table') {
+                return (
+                  <DataTable
+                    data={filteredNewOrderProducts}
+                    keyExtractor={p => p.id}
+                    emptyText="No products currently have warehouse stock available."
+                    columns={[
+                      { key: 'product', label: 'Product', width: 170, render: p => <Text numberOfLines={1} className="font-bold text-slate-800 text-[11px]">{p.name}</Text> },
+                      {
+                        key: 'price', label: 'Price', width: 130,
+                        render: p => {
+                          const rate = getEffectiveProductPrice(p, effectiveNewOrderPricingMode, newOrderStoreId, data.storePricing);
+                          return <Text className="text-slate-600 text-[11px] font-bold">Rs{rate.toFixed(2)}{retailEnabled ? ` (${effectiveNewOrderPricingMode === 'wholesale' ? 'Wholesale' : 'Selling'})` : ''}</Text>;
+                        },
+                      },
+                      { key: 'stock', label: 'Stock', width: 70, align: 'center', grow: false, render: p => <Text className="text-center text-[11px] font-black text-slate-800">{getWarehouseStock(p.id)}</Text> },
+                      { key: 'qty', label: 'Quantity', width: 140, grow: false, render: renderQtyStepper },
+                    ] as DataTableColumn<Product>[]}
+                  />
+                );
+              }
+
+              return (
+                <View className="gap-2 md:flex-row md:flex-wrap">
+                  {filteredNewOrderProducts.map(product => {
+                    const available = getWarehouseStock(product.id);
+                    const rate = getEffectiveProductPrice(product, effectiveNewOrderPricingMode, newOrderStoreId, data.storePricing);
+                    return (
+                      <View key={product.id} className="w-full md:w-[48%] flex-row items-center justify-between gap-2 bg-white border border-slate-200 rounded-xl p-2">
+                        <View className="flex-1">
+                          <Text className="font-bold text-slate-800 text-[11px]">{product.name}</Text>
+                          <Text className="text-slate-400 text-[9px]">Rs{rate.toFixed(2)}{retailEnabled ? ` (${effectiveNewOrderPricingMode === 'wholesale' ? 'Wholesale' : 'Selling'})` : ''} - Stock: {available} units available</Text>
+                        </View>
+                        {renderQtyStepper(product)}
+                      </View>
+                    );
+                  })}
+                </View>
+              );
+            })()}
+          </View>
           <View className="bg-slate-100 p-2.5 rounded-xl flex-row justify-between items-center">
-            <Text className="font-bold text-slate-500 text-xs">Estimated Total Value:</Text>
+            <Text className="font-bold text-slate-500 text-xs">Estimated Total Value{newOrderGstMode === 'with_gst' ? ' (Incl. GST)' : ''}:</Text>
             <Text className="font-black text-slate-800 text-sm">
-              Rs {Object.entries(newOrderItems).reduce((sum, [pId, qty]) => { const prod = data.products.find(p => p.id === pId); const rate = prod ? (newOrderPricingMode === 'wholesale' ? prod.wholesale_price : prod.selling_price) : 0; return sum + (Number(qty) * rate); }, 0).toFixed(2)}
+              Rs {formatWholeRupees(computeInvoiceTotals(buildNewOrderItemsList()).grand_total)}
             </Text>
           </View>
           <Pressable onPress={handleCreateNewOrder} className="w-full py-2.5 bg-blue-600 rounded-xl items-center active:bg-blue-700">
             <Text className="text-white font-bold text-xs">Create Order & Generate Invoice</Text>
           </Pressable>
         </View>
+      ) : activeForm === 'order_confirmation' && pendingNewOrder ? (
+        <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
+          <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+            <View>
+              <Text className="font-extrabold text-slate-800 text-sm">Order Confirmation</Text>
+              <Text className="text-[10px] text-slate-400">Review the full bill before proceeding to payment</Text>
+            </View>
+            <Pressable onPress={handleBackFromOrderConfirmation}><Text className="text-slate-400 text-xs">Back</Text></Pressable>
+          </View>
+
+          <View className="flex-row justify-between bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+            <Text className="text-slate-400 font-bold uppercase text-[9px]">Partner Store</Text>
+            <Text className="font-extrabold text-slate-800 text-xs">{pendingNewOrder.storeName}</Text>
+          </View>
+
+          {/* Same product order as the picker (selection order), never alphabetical. */}
+          <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-1.5">
+            <Text className="font-bold text-slate-500 text-[10px] uppercase mb-0.5">Selected Products & Quantities</Text>
+            {pendingNewOrder.items.map(item => {
+              const p = data.products.find(prod => prod.id === item.product_id);
+              return (
+                <View key={item.product_id} className="flex-row justify-between items-center border-b border-slate-100 pb-1.5 last:border-0 last:pb-0">
+                  <View className="flex-1 pr-2">
+                    <Text numberOfLines={1} className="font-bold text-slate-800 text-[11px]">{p?.name || 'Unknown'}</Text>
+                    <Text className="text-slate-400 text-[9px]">{item.quantity} units x Rs{item.unit_price.toFixed(2)}{item.tax_pct > 0 ? ` (+${item.tax_pct}% GST)` : ''}</Text>
+                  </View>
+                  <Text className="font-bold text-slate-700 text-[11px]">Rs{(item.quantity * item.unit_price).toFixed(2)}</Text>
+                </View>
+              );
+            })}
+          </View>
+
+          <View className="bg-slate-100 p-3 rounded-xl gap-1">
+            <View className="flex-row justify-between items-center">
+              <Text className="text-slate-500 font-semibold text-[10px] uppercase">Total (Before Round Off)</Text>
+              <Text className="font-bold text-slate-600 text-xs">Rs {(pendingNewOrder.grandTotal - pendingNewOrder.roundOff).toFixed(2)}</Text>
+            </View>
+            <View className="flex-row justify-between items-center">
+              <Text className="text-slate-500 font-semibold text-[10px] uppercase">Round Off</Text>
+              <Text className="font-bold text-slate-600 text-xs">{pendingNewOrder.roundOff > 0 ? '+' : ''}Rs {pendingNewOrder.roundOff.toFixed(2)}</Text>
+            </View>
+            <View className="flex-row justify-between items-center pt-1 border-t border-slate-200">
+              <Text className="font-extrabold text-slate-700 text-xs uppercase">Grand Total (Invoice Amount)</Text>
+              <Text className="font-black text-indigo-600 text-sm">Rs {formatWholeRupees(pendingNewOrder.grandTotal)}</Text>
+            </View>
+          </View>
+
+          <Pressable onPress={() => setShowConfirmOrderDialog(true)} className="w-full py-2.5 bg-emerald-600 rounded-xl items-center active:bg-emerald-700">
+            <Text className="text-white font-bold text-xs uppercase">Confirm Order</Text>
+          </Pressable>
+        </View>
       ) : activeForm === 'order_details' && selectedOrder ? (
         <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
           <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
             <Text className="font-extrabold text-slate-800 text-sm">Order Cargo Manifest Details</Text>
-            <Pressable onPress={() => setActiveForm('list')}><Text className="text-slate-400 text-xs">Back</Text></Pressable>
+            <Pressable onPress={handleBackFromOrderDetails}><Text className="text-slate-400 text-xs">Back</Text></Pressable>
           </View>
           <View className="gap-1.5">
             <View className="flex-row justify-between"><Text className="text-slate-400 text-[10px]">Order ID:</Text><Text className="font-bold text-slate-700 uppercase font-mono text-[10px]">{selectedOrder.id}</Text></View>
@@ -963,6 +2574,23 @@ export default function AdminSales({ data, setData, addNotification, currentUser
               )}
             </View>
 
+            {/* Admin-only override: a Confirmed/Delivered order normally can't be
+                changed once it's past that point in the pipeline - this lets an
+                Admin correct a mistake, automatically reversing/reapplying
+                warehouse stock and recalculating the invoice/balance either way. */}
+            {currentUser?.role === 'Admin' && (selectedOrder.status === 'Confirmed' || selectedOrder.status === 'Delivered') && (
+              <View className="flex-row gap-2 pt-2 border-t border-slate-100">
+                <Pressable onPress={() => handleOpenEditOrder(selectedOrder)} className="flex-1 py-2 bg-slate-100 rounded-xl flex-row items-center justify-center gap-1.5 border border-slate-200 active:bg-slate-200">
+                  <Edit size={13} color="#475569" />
+                  <Text className="text-slate-700 font-bold text-xs">Edit Order (Admin)</Text>
+                </Pressable>
+                <Pressable onPress={() => handleDeleteOrder(selectedOrder.id)} className="flex-1 py-2 bg-rose-50 rounded-xl flex-row items-center justify-center gap-1.5 border border-rose-200 active:bg-rose-100">
+                  <Trash2 size={13} color="#e11d48" />
+                  <Text className="text-rose-600 font-bold text-xs">Delete Order (Admin)</Text>
+                </Pressable>
+              </View>
+            )}
+
             {selectedOrder.status === 'Delivered' && (() => {
               const inv = data.invoices.find(i => i.order_id === selectedOrder.id);
               if (!inv) return null;
@@ -978,12 +2606,12 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                     <Text className={`px-2 py-0.5 font-bold rounded-full text-[8px] uppercase ${isPaid ? 'bg-emerald-100 text-emerald-800' : isPartial ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>{inv.payment_status || 'Unpaid / Credit'}</Text>
                   </View>
                   <View className="flex-row justify-between pt-1">
-                    <View><Text className="text-slate-400 font-bold text-[10px]">Bill Total</Text><Text className="font-black text-slate-800 text-sm">Rs{inv.grand_total.toFixed(2)}</Text></View>
+                    <View><Text className="text-slate-400 font-bold text-[10px]">Bill Total</Text><Text className="font-black text-slate-800 text-sm">Rs{formatWholeRupees(inv.grand_total)}</Text></View>
                     <View><Text className="text-slate-400 font-bold text-[10px]">Payment Method</Text><Text className="font-black text-slate-800 text-sm uppercase">{inv.payment_method || 'Credit'}</Text></View>
                   </View>
                   <View className="flex-row justify-between pt-1 border-t border-slate-200 pb-2">
-                    <View><Text className="text-slate-400 font-bold text-[10px]">Paid Amount</Text><Text className="font-black text-emerald-600">Rs{paidVal.toFixed(2)}</Text></View>
-                    <View><Text className="text-slate-400 font-bold text-[10px]">Due Outstanding</Text><Text className={`font-black ${remainingVal > 0 ? 'text-rose-600' : 'text-slate-500'}`}>Rs{remainingVal.toFixed(2)}</Text></View>
+                    <View><Text className="text-slate-400 font-bold text-[10px]">Paid Amount</Text><Text className="font-black text-emerald-600">Rs{formatWholeRupees(paidVal)}</Text></View>
+                    <View><Text className="text-slate-400 font-bold text-[10px]">Due Outstanding</Text><Text className={`font-black ${remainingVal > 0 ? 'text-rose-600' : 'text-slate-500'}`}>Rs{formatWholeRupees(remainingVal)}</Text></View>
                   </View>
                   <View className="pt-2 border-t border-slate-200 gap-1.5">
                     <Text className="font-extrabold text-slate-700 text-[9px] uppercase">Partial Payments History</Text>
@@ -1037,7 +2665,414 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             )}
           </View>
         </View>
-      ) : (
+      ) : activeForm === 'edit_order' && selectedOrder ? (() => {
+        const orderStore = data.stores.find(s => s.id === selectedOrder.store_id);
+        const editItemsList = Object.entries(editOrderItems).filter(([, qty]) => qty > 0);
+        const previewItems = editItemsList.map(([productId, qty]) => {
+          const originalItem = selectedOrder.items.find(i => i.product_id === productId);
+          const product = data.products.find(p => p.id === productId);
+          const unit_price = originalItem ? originalItem.unit_price : (product ? getEffectiveProductPrice(product, 'wholesale', selectedOrder.store_id, data.storePricing) : 0);
+          const tax_pct = originalItem ? originalItem.tax_pct : (product?.tax_pct ?? 0);
+          return { product_id: productId, quantity: qty, unit_price, tax_pct };
+        });
+        const { grand_total: previewGrandTotal } = computeInvoiceTotals(previewItems);
+        const filteredEditProducts = data.products.filter(p =>
+          p.status === 'Active' &&
+          p.name.toLowerCase().includes(editOrderProductSearch.trim().toLowerCase()) &&
+          !(editOrderItems[p.id] > 0)
+        );
+
+        return (
+          <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
+            <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+              <Text className="font-extrabold text-slate-800 text-sm">Edit Order (Admin)</Text>
+              <Pressable onPress={() => setActiveForm('order_details')}><Text className="text-slate-400 text-xs">Back</Text></Pressable>
+            </View>
+            <View className="p-2.5 bg-amber-50 border border-amber-200 rounded-xl">
+              <Text className="text-amber-700 text-[10px] font-semibold leading-relaxed">
+                This order is {selectedOrder.status}. Changing quantities here automatically returns or consumes warehouse stock and recalculates the invoice total and store balance.
+              </Text>
+            </View>
+            <View className="gap-1.5">
+              <View className="flex-row justify-between"><Text className="text-slate-400 text-[10px]">Order ID:</Text><Text className="font-bold text-slate-700 uppercase font-mono text-[10px]">{selectedOrder.id}</Text></View>
+              <View className="flex-row justify-between"><Text className="text-slate-400 text-[10px]">Partner Store:</Text><Text className="font-bold text-slate-800 text-[10px]">{orderStore?.name}</Text></View>
+            </View>
+
+            <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-2">
+              <Text className="font-bold text-slate-500 text-[10px] uppercase">Items</Text>
+              {editItemsList.length === 0 ? (
+                <Text className="text-[10px] text-slate-400 italic py-2 text-center">No items - add at least one product below.</Text>
+              ) : (
+                editItemsList.map(([productId, qty]) => {
+                  const product = data.products.find(p => p.id === productId);
+                  const originalItem = selectedOrder.items.find(i => i.product_id === productId);
+                  const unitPrice = originalItem ? originalItem.unit_price : (product ? getEffectiveProductPrice(product, 'wholesale', selectedOrder.store_id, data.storePricing) : 0);
+                  // Headroom = what's currently free in the warehouse plus
+                  // whatever this line already holds (already committed to
+                  // this order, so it isn't "extra" demand on top of itself).
+                  const available = getWarehouseStock(productId) + (originalItem?.quantity ?? 0);
+                  return (
+                    <View key={productId} className="flex-row items-center justify-between border-b border-slate-100 pb-1.5 last:border-0">
+                      <View className="flex-1 pr-2">
+                        <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{product?.name}</Text>
+                        <Text className="text-slate-400 text-[9px]">Rs{unitPrice.toFixed(2)} / unit - Rs{(unitPrice * qty).toFixed(2)}</Text>
+                      </View>
+                      <View className="flex-row items-center gap-1.5">
+                        <Pressable onPress={() => setEditOrderItems(prev => ({ ...prev, [productId]: Math.max(0, qty - 1) }))} className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200">
+                          <Text className="font-extrabold text-slate-800 text-xs">-</Text>
+                        </Pressable>
+                        <TextInput
+                          keyboardType="number-pad"
+                          value={String(qty)}
+                          onChangeText={v => {
+                            const n = Math.max(0, parseInt(v) || 0);
+                            if (n > available) showAlert(`Only ${available} unit(s) of ${product?.name ?? 'this product'} can be allocated to this order.`);
+                            setEditOrderItems(prev => ({ ...prev, [productId]: Math.min(available, n) }));
+                          }}
+                          className="w-10 text-center text-xs font-bold text-slate-800 border border-slate-200 rounded-lg p-1"
+                        />
+                        <Pressable
+                          onPress={() => {
+                            if (qty + 1 > available) { showAlert(`Only ${available} unit(s) of ${product?.name ?? 'this product'} are available.`); return; }
+                            setEditOrderItems(prev => ({ ...prev, [productId]: qty + 1 }));
+                          }}
+                          className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200"
+                        >
+                          <Text className="font-extrabold text-slate-800 text-xs">+</Text>
+                        </Pressable>
+                        <Pressable onPress={() => setEditOrderItems(prev => { const next = { ...prev }; delete next[productId]; return next; })} className="w-7 h-7 bg-rose-50 rounded-lg items-center justify-center active:bg-rose-100 ml-1">
+                          <Trash2 size={13} color="#e11d48" />
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })
+              )}
+            </View>
+
+            <View className="gap-2">
+              <Text className="font-bold text-slate-500 text-[10px] uppercase">Add A Product</Text>
+              <View className="flex-row items-center gap-2 bg-white border border-slate-200 rounded-xl px-3">
+                <Search size={14} color="#94a3b8" />
+                <TextInput
+                  value={editOrderProductSearch}
+                  onChangeText={setEditOrderProductSearch}
+                  placeholder="Search products to add..."
+                  placeholderTextColor="#94a3b8"
+                  className="flex-1 text-xs text-slate-800 py-2"
+                  style={{ outlineStyle: 'none' } as any}
+                />
+                {editOrderProductSearch.length > 0 && (
+                  <Pressable onPress={() => setEditOrderProductSearch('')} hitSlop={8}>
+                    <X size={14} color="#94a3b8" />
+                  </Pressable>
+                )}
+              </View>
+              {editOrderProductSearch.trim().length > 0 && (
+                <View className="border border-slate-100 rounded-xl bg-white" style={{ maxHeight: 160 }}>
+                  <ScrollView>
+                    {filteredEditProducts.slice(0, 20).map(product => (
+                      <Pressable
+                        key={product.id}
+                        onPress={() => { setEditOrderItems(prev => ({ ...prev, [product.id]: 1 })); setEditOrderProductSearch(''); }}
+                        className="flex-row items-center justify-between px-3 py-2 border-b border-slate-50 active:bg-slate-50"
+                      >
+                        <Text className="text-slate-700 text-xs flex-1" numberOfLines={1}>{product.name}</Text>
+                        <Text className="text-slate-400 text-[10px]">{getWarehouseStock(product.id)} in stock</Text>
+                      </Pressable>
+                    ))}
+                    {filteredEditProducts.length === 0 && (
+                      <Text className="text-[10px] text-slate-400 italic py-2 text-center">No matching products.</Text>
+                    )}
+                  </ScrollView>
+                </View>
+              )}
+            </View>
+
+            <View className="bg-slate-100 p-3 rounded-xl gap-1">
+              <View className="flex-row justify-between items-center">
+                <Text className="font-extrabold text-slate-700 text-xs uppercase">New Grand Total</Text>
+                <Text className="font-black text-indigo-600 text-sm">Rs {formatWholeRupees(previewGrandTotal)}</Text>
+              </View>
+            </View>
+
+            <Pressable onPress={handleSaveEditOrder} className="w-full py-2.5 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
+              <Text className="text-white font-bold text-xs uppercase">Save Changes</Text>
+            </Pressable>
+          </View>
+        );
+      })() : activeForm === 'edit_delivered_prebooking' && data.preBookingOrders.find(b => b.id === editingDeliveredPreBookingId) ? (() => {
+        const booking = data.preBookingOrders.find(b => b.id === editingDeliveredPreBookingId)!;
+        const bookingStore = data.stores.find(s => s.id === booking.store_id);
+        const editItemsList = Object.entries(editDeliveredPreBookingItems).filter(([, qty]) => qty > 0);
+        const previewItems = editItemsList.map(([productId, qty]) => {
+          const originalItem = booking.items.find(i => i.product_id === productId);
+          const product = data.products.find(p => p.id === productId);
+          const unit_price = originalItem ? originalItem.unit_price : (product ? getEffectiveProductPrice(product, 'wholesale', booking.store_id, data.storePricing) : 0);
+          const tax_pct = originalItem ? originalItem.tax_pct : (product?.tax_pct ?? 0);
+          return { product_id: productId, quantity: qty, unit_price, tax_pct };
+        });
+        const { grand_total: previewGrandTotal } = computeInvoiceTotals(previewItems);
+        const filteredEditProducts = data.products.filter(p =>
+          p.status === 'Active' &&
+          p.name.toLowerCase().includes(editDeliveredPreBookingSearch.trim().toLowerCase()) &&
+          !(editDeliveredPreBookingItems[p.id] > 0)
+        );
+
+        return (
+          <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
+            <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+              <Text className="font-extrabold text-slate-800 text-sm">Edit Delivered Pre-Booking (Admin)</Text>
+              <Pressable onPress={() => { setEditingDeliveredPreBookingId(null); setActiveForm('list'); }}><Text className="text-slate-400 text-xs">Back</Text></Pressable>
+            </View>
+            <View className="p-2.5 bg-amber-50 border border-amber-200 rounded-xl">
+              <Text className="text-amber-700 text-[10px] font-semibold leading-relaxed">
+                This pre-booking has already been delivered. Changing quantities here edits the real order/invoice it produced ({booking.fulfilled_order_id}), automatically returning or consuming warehouse stock and recalculating the invoice total and store balance.
+              </Text>
+            </View>
+            <View className="gap-1.5">
+              <View className="flex-row justify-between"><Text className="text-slate-400 text-[10px]">Pre-Booking ID:</Text><Text className="font-bold text-slate-700 uppercase font-mono text-[10px]">{booking.id}</Text></View>
+              <View className="flex-row justify-between"><Text className="text-slate-400 text-[10px]">Partner Store:</Text><Text className="font-bold text-slate-800 text-[10px]">{bookingStore?.name}</Text></View>
+            </View>
+
+            <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-2">
+              <Text className="font-bold text-slate-500 text-[10px] uppercase">Items</Text>
+              {editItemsList.length === 0 ? (
+                <Text className="text-[10px] text-slate-400 italic py-2 text-center">No items - add at least one product below.</Text>
+              ) : (
+                editItemsList.map(([productId, qty]) => {
+                  const product = data.products.find(p => p.id === productId);
+                  const originalItem = booking.items.find(i => i.product_id === productId);
+                  const unitPrice = originalItem ? originalItem.unit_price : (product ? getEffectiveProductPrice(product, 'wholesale', booking.store_id, data.storePricing) : 0);
+                  // Headroom = what's currently free in the warehouse plus
+                  // whatever this line already holds (already committed to
+                  // this booking's order, so it isn't "extra" demand on top
+                  // of itself).
+                  const available = getWarehouseStock(productId) + (originalItem?.quantity ?? 0);
+                  return (
+                    <View key={productId} className="flex-row items-center justify-between border-b border-slate-100 pb-1.5 last:border-0">
+                      <View className="flex-1 pr-2">
+                        <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{product?.name}</Text>
+                        <Text className="text-slate-400 text-[9px]">Rs{unitPrice.toFixed(2)} / unit - Rs{(unitPrice * qty).toFixed(2)}</Text>
+                      </View>
+                      <View className="flex-row items-center gap-1.5">
+                        <Pressable onPress={() => setEditDeliveredPreBookingItems(prev => ({ ...prev, [productId]: Math.max(0, qty - 1) }))} className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200">
+                          <Text className="font-extrabold text-slate-800 text-xs">-</Text>
+                        </Pressable>
+                        <TextInput
+                          keyboardType="number-pad"
+                          value={String(qty)}
+                          onChangeText={v => {
+                            const n = Math.max(0, parseInt(v) || 0);
+                            if (n > available) showAlert(`Only ${available} unit(s) of ${product?.name ?? 'this product'} can be allocated to this pre-booking.`);
+                            setEditDeliveredPreBookingItems(prev => ({ ...prev, [productId]: Math.min(available, n) }));
+                          }}
+                          className="w-10 text-center text-xs font-bold text-slate-800 border border-slate-200 rounded-lg p-1"
+                        />
+                        <Pressable
+                          onPress={() => {
+                            if (qty + 1 > available) { showAlert(`Only ${available} unit(s) of ${product?.name ?? 'this product'} are available.`); return; }
+                            setEditDeliveredPreBookingItems(prev => ({ ...prev, [productId]: qty + 1 }));
+                          }}
+                          className="w-7 h-7 bg-slate-100 rounded-lg items-center justify-center active:bg-slate-200"
+                        >
+                          <Text className="font-extrabold text-xs text-slate-800">+</Text>
+                        </Pressable>
+                        <Pressable onPress={() => setEditDeliveredPreBookingItems(prev => { const next = { ...prev }; delete next[productId]; return next; })} className="w-7 h-7 bg-rose-50 rounded-lg items-center justify-center active:bg-rose-100 ml-1">
+                          <Trash2 size={13} color="#e11d48" />
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })
+              )}
+            </View>
+
+            <View className="gap-2">
+              <Text className="font-bold text-slate-500 text-[10px] uppercase">Add A Product</Text>
+              <View className="flex-row items-center gap-2 bg-white border border-slate-200 rounded-xl px-3">
+                <Search size={14} color="#94a3b8" />
+                <TextInput
+                  value={editDeliveredPreBookingSearch}
+                  onChangeText={setEditDeliveredPreBookingSearch}
+                  placeholder="Search products to add..."
+                  placeholderTextColor="#94a3b8"
+                  className="flex-1 text-xs text-slate-800 py-2"
+                  style={{ outlineStyle: 'none' } as any}
+                />
+                {editDeliveredPreBookingSearch.length > 0 && (
+                  <Pressable onPress={() => setEditDeliveredPreBookingSearch('')} hitSlop={8}>
+                    <X size={14} color="#94a3b8" />
+                  </Pressable>
+                )}
+              </View>
+              {editDeliveredPreBookingSearch.trim().length > 0 && (
+                <View className="border border-slate-100 rounded-xl bg-white" style={{ maxHeight: 160 }}>
+                  <ScrollView>
+                    {filteredEditProducts.slice(0, 20).map(product => (
+                      <Pressable
+                        key={product.id}
+                        onPress={() => { setEditDeliveredPreBookingItems(prev => ({ ...prev, [product.id]: 1 })); setEditDeliveredPreBookingSearch(''); }}
+                        className="flex-row items-center justify-between px-3 py-2 border-b border-slate-50 active:bg-slate-50"
+                      >
+                        <Text className="text-slate-700 text-xs flex-1" numberOfLines={1}>{product.name}</Text>
+                        <Text className="text-slate-400 text-[10px]">{getWarehouseStock(product.id)} in stock</Text>
+                      </Pressable>
+                    ))}
+                    {filteredEditProducts.length === 0 && (
+                      <Text className="text-[10px] text-slate-400 italic py-2 text-center">No matching products.</Text>
+                    )}
+                  </ScrollView>
+                </View>
+              )}
+            </View>
+
+            <View className="bg-slate-100 p-3 rounded-xl gap-1">
+              <View className="flex-row justify-between items-center">
+                <Text className="font-extrabold text-slate-700 text-xs uppercase">New Grand Total</Text>
+                <Text className="font-black text-indigo-600 text-sm">Rs {formatWholeRupees(previewGrandTotal)}</Text>
+              </View>
+            </View>
+
+            <Pressable onPress={() => handleSaveEditDeliveredPreBooking(booking)} className="w-full py-2.5 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
+              <Text className="text-white font-bold text-xs uppercase">Save Changes</Text>
+            </Pressable>
+          </View>
+        );
+      })() : activeForm === 'purchase_details' && viewingPurchase ? (() => {
+        const supplier = data.suppliers.find(s => s.id === viewingPurchase.supplier_id) || reportingSupplier;
+        const units = viewingPurchase.items.reduce((sum, item) => sum + item.quantity, 0);
+        const value = viewingPurchase.items.reduce((sum, item) => sum + item.quantity * item.purchase_price, 0);
+        return (
+          <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-3 w-full lg:max-w-2xl lg:self-center">
+            <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+              <View>
+                <Text className="font-extrabold text-slate-800 text-sm">Stock Inward Invoice</Text>
+                <Text className="text-[10px] text-slate-400 mt-0.5">Invoice: {viewingPurchase.invoice_number}</Text>
+              </View>
+              <Pressable onPress={closePurchaseViewer}><Text className="text-slate-400 text-xs">Back</Text></Pressable>
+            </View>
+
+            <View className="gap-1 bg-slate-50 p-3 rounded-2xl">
+              <Text className="text-slate-700 text-xs"><Text className="font-bold">Supplier:</Text> {supplier?.name || 'Unknown'}</Text>
+              <Text className="text-slate-700 text-xs"><Text className="font-bold">Date Received:</Text> {new Date(viewingPurchase.date).toLocaleDateString('en-IN', { year: 'numeric', month: 'long', day: 'numeric' })}</Text>
+              <Text className="text-slate-700 text-xs"><Text className="font-bold">GRN ID:</Text> {viewingPurchase.id}</Text>
+            </View>
+
+            <View className="flex-row gap-2">
+              <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">SKUs</Text><Text className="text-xs font-black text-slate-800">{viewingPurchase.items.length}</Text></View>
+              <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Units</Text><Text className="text-xs font-black text-slate-800">{units}</Text></View>
+              <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Total Value</Text><Text className="text-xs font-black text-emerald-600">Rs{formatWholeRupees(value)}</Text></View>
+            </View>
+
+            <View className="border border-slate-100 rounded-xl p-3 bg-slate-50 gap-2">
+              <Text className="font-bold text-slate-500 text-[10px]">LINE ITEMS ({viewingPurchase.items.length}):</Text>
+              {viewingPurchase.items.map((item, idx) => {
+                const product = data.products.find(p => p.id === item.product_id);
+                const lineTotal = item.quantity * item.purchase_price;
+                return (
+                  <View key={idx} className="flex-row justify-between items-center border-b border-slate-100 pb-1.5 last:border-0">
+                    <View className="flex-1 mr-2">
+                      <Text className="font-bold text-slate-800 text-[11px]">{product?.name || 'Unknown Product'}</Text>
+                      <Text className="text-slate-400 text-[9px]">{item.quantity} units x Rs{item.purchase_price.toFixed(2)} - Mfg: {item.mfg_date || 'N/A'} - Exp: {item.expiry_date || 'N/A'}</Text>
+                    </View>
+                    <Text className="font-bold text-slate-700 text-[11px]">Rs{lineTotal.toFixed(2)}</Text>
+                  </View>
+                );
+              })}
+            </View>
+
+            <View className="gap-1.5">
+              <Text className="font-bold text-slate-700 text-[9px] uppercase">Supplier Bill (Invoice #{viewingPurchase.invoice_number})</Text>
+
+              {billActionStatus && (
+                <View className={`flex-row items-center justify-between p-2 rounded-lg border ${billActionStatus.type === 'success' ? 'bg-emerald-50 border-emerald-100' : 'bg-rose-50 border-rose-100'}`}>
+                  <Text className={`flex-1 text-[10px] font-bold ${billActionStatus.type === 'success' ? 'text-emerald-700' : 'text-rose-700'}`}>{billActionStatus.message}</Text>
+                  <Pressable onPress={() => setBillActionStatus(null)} hitSlop={8}>
+                    <X size={12} color={billActionStatus.type === 'success' ? '#059669' : '#e11d48'} />
+                  </Pressable>
+                </View>
+              )}
+
+              {confirmRemoveBill ? (
+                <View className="gap-2 p-3 bg-rose-50 border border-rose-100 rounded-xl">
+                  <Text className="text-rose-700 text-[10px] font-bold">Remove this supplier bill? You can attach the correct photo, PDF, or Excel sheet afterward.</Text>
+                  <View className="flex-row gap-2">
+                    <Pressable
+                      onPress={() => handleConfirmRemoveSupplierBill(viewingPurchase.id)}
+                      className="flex-1 py-1.5 bg-rose-600 rounded-lg items-center active:bg-rose-700"
+                    >
+                      <Text className="text-white font-bold text-[10px]">Yes, Remove</Text>
+                    </Pressable>
+                    <Pressable onPress={() => setConfirmRemoveBill(false)} className="flex-1 py-1.5 bg-white border border-slate-200 rounded-lg items-center active:bg-slate-100">
+                      <Text className="text-slate-700 font-bold text-[10px]">No, Keep</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ) : viewingPurchase.bill_file_url ? (() => {
+                const billFileName = buildAttachmentFileName(
+                  'Supplier_Bill',
+                  viewingPurchase.invoice_number,
+                  viewingPurchase.bill_file_name || 'bill',
+                  viewingPurchase.bill_file_type
+                );
+                return (
+                  <View className="gap-1.5">
+                    {(viewingPurchase.bill_file_type || '').startsWith('image/') ? (
+                      <Pressable onPress={() => viewOrDownloadDataUriFile(viewingPurchase.bill_file_url!, billFileName, viewingPurchase.bill_file_type || 'application/octet-stream', showAlert)}>
+                        <Image source={{ uri: viewingPurchase.bill_file_url }} className="w-full h-40 rounded-xl bg-slate-100" resizeMode="contain" />
+                      </Pressable>
+                    ) : (
+                      <Pressable
+                        onPress={() => viewOrDownloadDataUriFile(viewingPurchase.bill_file_url!, billFileName, viewingPurchase.bill_file_type || 'application/octet-stream', showAlert)}
+                        className="flex-row items-center gap-1.5 py-2 px-3 bg-indigo-50 border border-indigo-100 rounded-xl active:bg-indigo-100"
+                      >
+                        <Download size={13} color="#4f46e5" />
+                        <Text className="text-indigo-600 font-bold text-[11px]" numberOfLines={1}>{billFileName}</Text>
+                      </Pressable>
+                    )}
+                    <View className="flex-row gap-2">
+                      <Pressable
+                        onPress={() => handleReplaceSupplierBill(viewingPurchase.id)}
+                        className="flex-1 flex-row items-center justify-center gap-1 py-1.5 bg-slate-100 border border-slate-200 rounded-lg active:bg-slate-200"
+                      >
+                        <Edit size={11} color="#475569" />
+                        <Text className="text-slate-600 font-bold text-[9px]">Wrong file? Replace</Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={() => setConfirmRemoveBill(true)}
+                        className="flex-1 flex-row items-center justify-center gap-1 py-1.5 bg-rose-50 border border-rose-100 rounded-lg active:bg-rose-100"
+                      >
+                        <Trash2 size={11} color="#e11d48" />
+                        <Text className="text-rose-600 font-bold text-[9px]">Remove</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                );
+              })() : (
+                <Pressable
+                  onPress={() => handleReplaceSupplierBill(viewingPurchase.id)}
+                  className="flex-row items-center justify-center gap-1.5 py-2 bg-white border border-dashed border-slate-300 rounded-lg active:bg-slate-100"
+                >
+                  <Download size={13} color="#475569" />
+                  <Text className="text-slate-600 font-bold text-[11px]">Attach Supplier Bill (Photo / PDF / Excel)</Text>
+                </Pressable>
+              )}
+            </View>
+
+            <View className="flex-row gap-2">
+              <Pressable
+                onPress={() => supplier && handleDownloadStockReceiptPdf(viewingPurchase, supplier)}
+                className="flex-1 py-2.5 bg-emerald-50 border border-emerald-100 rounded-2xl items-center active:bg-emerald-100 flex-row justify-center gap-1.5"
+              >
+                <Download size={14} color="#059669" />
+                <Text className="text-emerald-600 font-bold text-xs">Download PDF</Text>
+              </Pressable>
+              <Pressable onPress={closePurchaseViewer} className="flex-1 py-2.5 bg-slate-100 rounded-2xl items-center active:bg-slate-200"><Text className="text-slate-700 font-bold text-xs">Close</Text></Pressable>
+            </View>
+          </View>
+        );
+      })() : (
         <View className="gap-4">
           {salesTab === 'suppliers' && (
             <View className="gap-3">
@@ -1049,88 +3084,167 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                 <Pressable onPress={handleOpenAddSupplier} className="bg-rose-500 p-2.5 rounded-xl active:bg-rose-600"><Plus size={20} color="#fff" /></Pressable>
               </View>
 
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {data.suppliers.length === 0 ? (
-                  <View className="p-8 items-center bg-white border border-dashed border-slate-200 rounded-3xl gap-2">
-                    <View className="w-12 h-12 bg-slate-50 rounded-full items-center justify-center border border-slate-100"><Truck size={20} color="#94a3b8" /></View>
-                    <Text className="text-xs font-black text-slate-800">No suppliers registered yet</Text>
-                    <Text className="text-[10px] text-slate-500 font-bold text-center">Register your first supplier to start receiving stock into the warehouse silos.</Text>
-                    <Pressable onPress={handleOpenAddSupplier} className="py-1.5 px-3 bg-rose-500 rounded-lg active:bg-rose-600"><Text className="text-white text-[10px] font-bold">+ Register First Supplier</Text></Pressable>
-                  </View>
-                ) : (
-                  data.suppliers
-                    .filter(s => s.name.toLowerCase().includes(supplierSearchQuery.toLowerCase()) || s.contact_person.toLowerCase().includes(supplierSearchQuery.toLowerCase()) || s.phone.includes(supplierSearchQuery) || s.email.toLowerCase().includes(supplierSearchQuery.toLowerCase()))
-                    .map(s => {
-                      const supplierPurchases = data.purchases.filter(p => p.supplier_id === s.id);
-                      const isExpanded = expandedSupplierId === s.id;
-                      const isInactive = s.status === 'Inactive';
-                      return (
-                        <View key={s.id} className={`w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 relative ${isInactive ? 'opacity-60' : ''}`}>
-                          <Text className={`absolute top-3 right-3 text-[9px] font-black px-1.5 py-0.5 rounded-full ${isInactive ? 'bg-red-50 text-red-600' : 'bg-emerald-50 text-emerald-600'}`}>{isInactive ? 'Inactive' : 'Active'}</Text>
-                          <View className="flex-row items-start gap-2 pr-16">
-                            <View className="p-2 bg-emerald-50 rounded-xl mt-0.5"><Truck size={16} color="#10b981" /></View>
-                            <View className="flex-1">
-                              <Text className="font-bold text-slate-800 text-xs">{s.name}</Text>
-                              <Text className="text-[10px] text-slate-400 mt-0.5">Contact: {s.contact_person || 'N/A'} - Phone: {s.phone}</Text>
+              <FilterBar hideSearch>
+                <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
+                  <Pressable onPress={() => setSupplierListTab('active')} className={`py-1.5 px-3 rounded-lg items-center justify-center ${supplierListTab === 'active' ? 'bg-indigo-600' : ''}`}>
+                    <Text className={`text-[10px] font-extrabold ${supplierListTab === 'active' ? 'text-white' : 'text-slate-500'}`}>Supply Partners</Text>
+                  </Pressable>
+                  <Pressable onPress={() => setSupplierListTab('inactive')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${supplierListTab === 'inactive' ? 'bg-indigo-600' : ''}`}>
+                    <RotateCcw size={13} color={supplierListTab === 'inactive' ? '#ffffff' : '#64748b'} />
+                    <Text className={`text-[10px] font-extrabold ${supplierListTab === 'inactive' ? 'text-white' : 'text-slate-500'}`}>Removed Partners</Text>
+                    {data.suppliers.filter(s => s.status === 'Inactive').length > 0 && (
+                      <View className="bg-red-500 rounded-full px-1.5 py-0.5">
+                        <Text className="text-white font-extrabold text-[8px]">{data.suppliers.filter(s => s.status === 'Inactive').length}</Text>
+                      </View>
+                    )}
+                  </Pressable>
+                </View>
+              </FilterBar>
+
+              {(() => {
+                const filteredSuppliers = data.suppliers
+                  .filter(s => supplierListTab === 'inactive' ? s.status === 'Inactive' : s.status === 'Active')
+                  .filter(s => s.name.toLowerCase().includes(supplierSearchQuery.toLowerCase()) || s.contact_person.toLowerCase().includes(supplierSearchQuery.toLowerCase()) || s.phone.includes(supplierSearchQuery) || s.email.toLowerCase().includes(supplierSearchQuery.toLowerCase()));
+                const emptySupplierText = supplierListTab === 'inactive' ? 'No removed supply partners. Anything you remove will show up here for restoring.' : 'No suppliers match your search query.';
+
+                if (data.suppliers.length === 0) {
+                  return (
+                    <View className="p-8 items-center bg-white border border-dashed border-slate-200 rounded-3xl gap-2">
+                      <View className="w-12 h-12 bg-slate-50 rounded-full items-center justify-center border border-slate-100"><Truck size={20} color="#94a3b8" /></View>
+                      <Text className="text-xs font-black text-slate-800">No suppliers registered yet</Text>
+                      <Text className="text-[10px] text-slate-500 font-bold text-center">Register your first supplier to start receiving stock into the warehouse silos.</Text>
+                      <Pressable onPress={handleOpenAddSupplier} className="py-1.5 px-3 bg-rose-500 rounded-lg active:bg-rose-600"><Text className="text-white text-[10px] font-bold">+ Register First Supplier</Text></Pressable>
+                    </View>
+                  );
+                }
+
+                if (viewMode === 'table') {
+                  return (
+                    <DataTable
+                      data={filteredSuppliers}
+                      keyExtractor={s => s.id}
+                      emptyText={emptySupplierText}
+                      columns={[
+                        {
+                          key: 'name', label: 'Supplier', width: 170,
+                          render: (s: Supplier) => (
+                            <View className="flex-row items-center gap-1">
+                              <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text>
+                              {s.status === 'Inactive' && <Text className="text-[8px] font-black px-1 rounded-full bg-red-50 text-red-600">Inactive</Text>}
                             </View>
-                          </View>
-                          <View className="flex-row justify-between mt-3 pt-2 border-t border-slate-50">
-                            <View><Text className="text-slate-400 text-[9px]">Supplier Email</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.email || 'N/A'}</Text></View>
-                            <View className="items-end"><Text className="text-slate-400 text-[9px]">Receipts/Logs</Text><Text className="font-bold text-slate-700 text-[10px]">{supplierPurchases.length} Inwards</Text></View>
-                          </View>
-                          <View className="flex-row flex-wrap gap-1.5 mt-2 pt-2 border-t border-slate-50 justify-end">
-                            <Pressable onPress={() => setViewingSupplier(s)} className="py-1 px-2.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[9px]">View Info</Text></Pressable>
-                            <Pressable onPress={() => handleOpenEditSupplier(s)} className="py-1 px-2.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"><Text className="text-slate-600 font-bold text-[9px]">Edit</Text></Pressable>
-                            {isInactive ? (
-                              <Pressable onPress={() => handleReactivateSupplier(s.id)} className="py-1 px-2.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Reactivate</Text></Pressable>
-                            ) : (
-                              <Pressable onPress={() => setDeleteSupplierConfirmId(s.id)} className="py-1 px-2.5 bg-rose-50 rounded-lg border border-rose-100 active:bg-rose-100"><Text className="text-rose-600 font-bold text-[9px]">Delete</Text></Pressable>
-                            )}
-                            <Pressable onPress={() => setExpandedSupplierId(isExpanded ? null : s.id)} className={`py-1 px-2.5 rounded-lg border ${isExpanded ? 'bg-rose-500 border-rose-600' : 'bg-white border-slate-200'}`}>
-                              <Text className={`font-bold text-[9px] ${isExpanded ? 'text-white' : 'text-slate-600'}`}>{isExpanded ? 'Close' : 'View Receipts'}</Text>
-                            </Pressable>
-                          </View>
-                          {isExpanded && (
-                            <View className="mt-3 bg-slate-50 border-t border-slate-100 p-3 rounded-xl gap-2">
-                              <Text className="font-extrabold text-slate-700 text-[10px]">Recent Cold-Chain Stock Inwards</Text>
-                              {supplierPurchases.length === 0 ? (
-                                <Text className="text-[10px] text-slate-400 font-semibold italic">No stock inward dispatches registered from this supplier yet.</Text>
+                          ),
+                        },
+                        { key: 'contact', label: 'Contact', width: 120, render: (s: Supplier) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.contact_person || 'N/A'}</Text> },
+                        { key: 'phone', label: 'Phone', width: 100, render: (s: Supplier) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.phone}</Text> },
+                        { key: 'email', label: 'Email', width: 150, render: (s: Supplier) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.email || 'N/A'}</Text> },
+                        { key: 'receipts', label: 'Receipts', width: 70, align: 'center' as const, render: (s: Supplier) => <Text className="text-[10px] font-bold text-slate-700 text-center">{data.purchases.filter(p => p.supplier_id === s.id).length}</Text> },
+                        {
+                          key: 'actions', label: 'Actions', width: 170, grow: false,
+                          render: (s: Supplier) => {
+                            const isInactive = s.status === 'Inactive';
+                            return (
+                              <View className="flex-row flex-wrap items-center gap-1">
+                                <Pressable onPress={() => setViewingSupplier(s)} className="py-0.5 px-1.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[8px]">View Info</Text></Pressable>
+                                <Pressable onPress={() => handleOpenSupplierReport(s)} className="py-0.5 px-1.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[8px]">Report</Text></Pressable>
+                                <Pressable onPress={() => handleOpenEditSupplier(s)} className="py-0.5 px-1.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"><Text className="text-slate-600 font-bold text-[8px]">Edit</Text></Pressable>
+                                {isInactive ? (
+                                  <Pressable onPress={() => handleReactivateSupplier(s.id)} className="py-0.5 px-1.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[8px]">Reactivate</Text></Pressable>
+                                ) : (
+                                  <Pressable onPress={() => setDeleteSupplierConfirmId(s.id)} className="py-0.5 px-1.5 bg-rose-50 rounded-lg border border-rose-100 active:bg-rose-100"><Text className="text-rose-600 font-bold text-[8px]">Delete</Text></Pressable>
+                                )}
+                              </View>
+                            );
+                          },
+                        },
+                      ] as DataTableColumn<Supplier>[]}
+                    />
+                  );
+                }
+
+                return (
+                  <View className="gap-2.5 md:flex-row md:flex-wrap">
+                    {filteredSuppliers.length === 0 ? (
+                      <Text className="py-6 text-center text-slate-400 italic bg-white rounded-2xl border border-slate-200 text-xs">
+                        {emptySupplierText}
+                      </Text>
+                    ) : (
+                      filteredSuppliers.map(s => {
+                        const supplierPurchases = data.purchases.filter(p => p.supplier_id === s.id);
+                        const isExpanded = expandedSupplierId === s.id;
+                        const isInactive = s.status === 'Inactive';
+                        return (
+                          <View key={s.id} className={`w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 relative ${isInactive ? 'opacity-60' : ''}`}>
+                            <Text className={`absolute top-3 right-3 text-[9px] font-black px-1.5 py-0.5 rounded-full ${isInactive ? 'bg-red-50 text-red-600' : 'bg-emerald-50 text-emerald-600'}`}>{isInactive ? 'Inactive' : 'Active'}</Text>
+                            <View className="flex-row items-start gap-2 pr-16">
+                              <View className="p-2 bg-emerald-50 rounded-xl mt-0.5"><Truck size={16} color="#10b981" /></View>
+                              <View className="flex-1">
+                                <Text className="font-bold text-slate-800 text-xs">{s.name}</Text>
+                                <Text className="text-[10px] text-slate-400 mt-0.5">Contact: {s.contact_person || 'N/A'} - Phone: {s.phone}</Text>
+                              </View>
+                            </View>
+                            <View className="flex-row justify-between mt-3 pt-2 border-t border-slate-50">
+                              <View><Text className="text-slate-400 text-[9px]">Supplier Email</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.email || 'N/A'}</Text></View>
+                              <View className="items-end"><Text className="text-slate-400 text-[9px]">Receipts/Logs</Text><Text className="font-bold text-slate-700 text-[10px]">{supplierPurchases.length} Inwards</Text></View>
+                            </View>
+                            <View className="flex-row flex-wrap gap-1.5 mt-2 pt-2 border-t border-slate-50 justify-end">
+                              <Pressable onPress={() => setViewingSupplier(s)} className="py-1 px-2.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[9px]">View Info</Text></Pressable>
+                              <Pressable onPress={() => handleOpenSupplierReport(s)} className="py-1 px-2.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Report</Text></Pressable>
+                              <Pressable onPress={() => handleOpenEditSupplier(s)} className="py-1 px-2.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"><Text className="text-slate-600 font-bold text-[9px]">Edit</Text></Pressable>
+                              {isInactive ? (
+                                <Pressable onPress={() => handleReactivateSupplier(s.id)} className="py-1 px-2.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Reactivate</Text></Pressable>
                               ) : (
-                                supplierPurchases.map(p => {
-                                  const totalQty = p.items.reduce((sum, item) => sum + item.quantity, 0);
-                                  const totalCost = p.items.reduce((sum, item) => sum + (item.quantity * item.purchase_price), 0);
-                                  return (
-                                    <View key={p.id} className="bg-white border border-slate-200 p-2.5 rounded-xl gap-1.5">
-                                      <View className="flex-row justify-between border-b border-slate-100 pb-1"><Text className="text-slate-700 font-bold text-[10px]">Invoice: {p.invoice_number}</Text><Text className="text-slate-400 text-[10px]">{new Date(p.date).toLocaleDateString()}</Text></View>
-                                      {p.items.map((item, idx) => {
-                                        const prod = data.products.find(prod => prod.id === item.product_id);
-                                        return (
-                                          <View key={idx} className="bg-slate-50 p-1.5 rounded-lg">
-                                            <View className="flex-row justify-between"><Text className="font-semibold text-slate-700 text-[10px]">{prod?.name || 'Unknown'}</Text><Text className="text-[10px] text-slate-600">{item.quantity} units (Rs{item.purchase_price}/u)</Text></View>
+                                <Pressable onPress={() => setDeleteSupplierConfirmId(s.id)} className="py-1 px-2.5 bg-rose-50 rounded-lg border border-rose-100 active:bg-rose-100"><Text className="text-rose-600 font-bold text-[9px]">Delete</Text></Pressable>
+                              )}
+                              {/* <Pressable onPress={() => setExpandedSupplierId(isExpanded ? null : s.id)} className={`py-1 px-2.5 rounded-lg border ${isExpanded ? 'bg-rose-500 border-rose-600' : 'bg-white border-slate-200'}`}>
+                                <Text className={`font-bold text-[9px] ${isExpanded ? 'text-white' : 'text-slate-600'}`}>{isExpanded ? 'Close' : 'View Receipts'}</Text>
+                              </Pressable> */}
+                            </View>
+                            {isExpanded && (
+                              <View className="mt-3 bg-slate-50 border-t border-slate-100 p-3 rounded-xl gap-2">
+                                <Text className="font-extrabold text-slate-700 text-[10px]">Recent Cold-Chain Stock Inwards</Text>
+                                {supplierPurchases.length === 0 ? (
+                                  <Text className="text-[10px] text-slate-400 font-semibold italic">No stock inward dispatches registered from this supplier yet.</Text>
+                                ) : (
+                                  supplierPurchases.map(p => {
+                                    const totalQty = p.items.reduce((sum, item) => sum + item.quantity, 0);
+                                    const totalCost = p.items.reduce((sum, item) => sum + (item.quantity * item.purchase_price), 0);
+                                    return (
+                                      <View key={p.id} className="bg-white border border-slate-200 p-2.5 rounded-xl gap-1.5">
+                                        <View className="flex-row justify-between border-b border-slate-100 pb-1"><Text className="text-slate-700 font-bold text-[10px]">Invoice: {p.invoice_number}</Text><Text className="text-slate-400 text-[10px]">{new Date(p.date).toLocaleDateString()}</Text></View>
+                                        {p.items.map((item, idx) => {
+                                          const prod = data.products.find(prod => prod.id === item.product_id);
+                                          return (
+                                            <View key={idx} className="bg-slate-50 p-1.5 rounded-lg">
+                                              <View className="flex-row justify-between"><Text className="font-semibold text-slate-700 text-[10px]">{prod?.name || 'Unknown'}</Text><Text className="text-[10px] text-slate-600">{item.quantity} units (Rs{item.purchase_price.toFixed(2)}/u)</Text></View>
+                                            </View>
+                                          );
+                                        })}
+                                        <View className="flex-row justify-between items-center pt-1 border-t border-slate-100">
+                                          <Text className="text-[10px] font-bold text-slate-700">Total: {totalQty} units</Text>
+                                          <View className="flex-row items-center gap-2">
+                                            <Text className="text-[10px] font-black text-emerald-600">Rs{formatWholeRupees(totalCost)}</Text>
+                                            <Pressable onPress={() => openPurchaseViewer(p)} className="p-1.5 bg-slate-100 rounded-lg border border-slate-200 active:bg-slate-200">
+                                              <Eye size={10} color="#64748b" />
+                                            </Pressable>
+                                            <Pressable onPress={() => handleDownloadStockReceiptPdf(p, s)} className="flex-row items-center gap-1 py-1 px-2 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100">
+                                              <Download size={10} color="#4f46e5" />
+                                              <Text className="text-indigo-600 font-bold text-[9px]">Download PDF</Text>
+                                            </Pressable>
                                           </View>
-                                        );
-                                      })}
-                                      <View className="flex-row justify-between items-center pt-1 border-t border-slate-100">
-                                        <Text className="text-[10px] font-bold text-slate-700">Total: {totalQty} units</Text>
-                                        <View className="flex-row items-center gap-2">
-                                          <Text className="text-[10px] font-black text-emerald-600">Rs{totalCost.toFixed(2)}</Text>
-                                          <Pressable onPress={() => handleDownloadStockReceiptPdf(p, s)} className="flex-row items-center gap-1 py-1 px-2 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100">
-                                            <Download size={10} color="#4f46e5" />
-                                            <Text className="text-indigo-600 font-bold text-[9px]">Download PDF</Text>
-                                          </Pressable>
                                         </View>
                                       </View>
-                                    </View>
-                                  );
-                                })
-                              )}
-                            </View>
-                          )}
-                        </View>
-                      );
-                    })
-                )}
-              </View>
+                                    );
+                                  })
+                                )}
+                              </View>
+                            )}
+                          </View>
+                        );
+                      })
+                    )}
+                  </View>
+                );
+              })()}
             </View>
           )}
 
@@ -1141,85 +3255,174 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   <View className="absolute left-3 z-10"><Search size={16} color="#94a3b8" /></View>
                   <TextInput value={storeSearch} onChangeText={setStoreSearch} placeholder="Search store name, owner, area..." placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 pl-9 pr-4 py-2.5 text-xs rounded-xl" />
                 </View>
+                <Pressable onPress={handleOpenManageAreas} className="bg-slate-800 p-2.5 rounded-xl active:bg-slate-900"><Tag size={20} color="#fff" /></Pressable>
                 <Pressable onPress={handleOpenAddStore} className="bg-rose-500 p-2.5 rounded-xl active:bg-rose-600"><Plus size={20} color="#fff" /></Pressable>
               </View>
 
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {data.stores.length === 0 ? (
-                  <View className="p-8 items-center bg-white border border-dashed border-slate-200 rounded-3xl gap-2">
-                    <View className="w-12 h-12 bg-slate-50 rounded-full items-center justify-center border border-slate-100"><MapPin size={20} color="#94a3b8" /></View>
-                    <Text className="text-xs font-black text-slate-800">No shop partners registered yet</Text>
-                    <Pressable onPress={handleOpenAddStore} className="py-1.5 px-3 bg-rose-500 rounded-lg active:bg-rose-600"><Text className="text-white text-[10px] font-bold">+ Register First Shop Partner</Text></Pressable>
-                  </View>
-                ) : filteredStores.length === 0 ? (
-                  <Text className="py-6 text-center text-slate-400 italic bg-white rounded-2xl border border-slate-200 text-xs">No partner stores match your search query.</Text>
-                ) : (
-                  filteredStores.map(s => {
-                    const isExpanded = expandedStoreId === s.id;
-                    const storeOrders = data.orders.filter(o => o.store_id === s.id);
-                    const isInactive = s.status === 'Inactive';
-                    return (
-                      <View key={s.id} className={`w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 relative ${isInactive ? 'opacity-60' : ''}`}>
-                        <View className="absolute top-3 right-3 items-end gap-1">
-                          <Text className={`text-[9px] font-black px-1.5 py-0.5 rounded-full ${s.ranking === 'Platinum' ? 'bg-indigo-50 text-indigo-600' : s.ranking === 'Gold' ? 'bg-amber-50 text-amber-600' : s.ranking === 'Silver' ? 'bg-slate-100 text-slate-600' : 'bg-red-50 text-red-500'}`}>{s.ranking}</Text>
-                          {isInactive && <Text className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-red-50 text-red-600">Inactive</Text>}
-                        </View>
-                        <View className="flex-row items-start gap-2 pr-16">
-                          <View className="p-2 bg-rose-50 rounded-xl mt-0.5"><MapPin size={16} color="#f43f5e" /></View>
-                          <View className="flex-1">
-                            <Text className="font-bold text-slate-800 text-xs">{s.name}</Text>
-                            <Text className="text-[10px] text-slate-400 mt-0.5">Owner: {s.owner_name} - Phone: {s.phone}</Text>
-                          </View>
-                        </View>
-                        <View className="flex-row justify-between mt-3 pt-2 border-t border-slate-50">
-                          <View><Text className="text-slate-400 text-[9px]">Outstanding Bal</Text><Text className={`font-bold text-[10px] ${s.outstanding_balance > s.credit_limit ? 'text-red-500' : 'text-slate-700'}`}>Rs{s.outstanding_balance} / Rs{s.credit_limit} Max</Text></View>
-                          <View className="items-end"><Text className="text-slate-400 text-[9px]">Health Index</Text><Text className="font-extrabold text-indigo-500 text-[10px]">{calculateStoreHealthScore(s)}/100</Text></View>
-                        </View>
-                        <View className="flex-row flex-wrap gap-1.5 mt-2 pt-2 border-t border-slate-50 justify-end">
-                          <Pressable onPress={() => setViewingStore(s)} className="py-1 px-2.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[9px]">View Info</Text></Pressable>
-                          <Pressable
-                            onPress={() => {
-                              setSelectedStore(s);
-                              setStoreForm({ name: s.name, owner_name: s.owner_name, phone: s.phone, alt_phone: s.alt_phone, address: s.address, area: s.area, city: s.city, state: s.state, pincode: s.pincode, gst_number: s.gst_number, credit_limit: s.credit_limit, refill_frequency: s.refill_frequency, custom_days: s.custom_days || 7, ranking: s.ranking });
-                              setActiveForm('edit_store');
-                            }}
-                            className="py-1 px-2.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"
-                          ><Text className="text-slate-600 font-bold text-[9px]">Edit</Text></Pressable>
-                          {isInactive ? (
-                            <Pressable onPress={() => handleReactivateStore(s.id)} className="py-1 px-2.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Reactivate</Text></Pressable>
-                          ) : (
-                            <Pressable onPress={() => setDeleteStoreConfirmId(s.id)} className="py-1 px-2.5 bg-rose-50 rounded-lg border border-rose-100 active:bg-rose-100"><Text className="text-rose-600 font-bold text-[9px]">Delete</Text></Pressable>
-                          )}
-                          <Pressable onPress={() => setExpandedStoreId(isExpanded ? null : s.id)} className={`py-1 px-2.5 rounded-lg border ${isExpanded ? 'bg-rose-500 border-rose-600' : 'bg-white border-slate-200'}`}>
-                            <Text className={`font-bold text-[9px] ${isExpanded ? 'text-white' : 'text-slate-600'}`}>{isExpanded ? 'Close' : 'View Details'}</Text>
-                          </Pressable>
-                        </View>
-                        {isExpanded && (
-                          <View className="mt-3 bg-slate-50 border-t border-slate-100 p-3 rounded-xl gap-2">
-                            <View className="flex-row justify-between"><View><Text className="text-slate-400 text-[9px]">Alt Phone</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.alt_phone || 'N/A'}</Text></View><View className="items-end"><Text className="text-slate-400 text-[9px]">GST Number</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.gst_number || 'N/A'}</Text></View></View>
-                            <View><Text className="text-slate-400 text-[9px]">Full Address</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.address}, {s.area}, {s.city}, {s.state} - {s.pincode}</Text></View>
-                            <Text className="font-bold text-slate-700 text-[9px]">Recent Orders ({storeOrders.length})</Text>
-                            {storeOrders.length === 0 ? (
-                              <Text className="text-[9px] text-slate-400 italic">No orders logged for this store yet.</Text>
-                            ) : (
-                              storeOrders.slice(0, 5).map(o => {
-                                const totalQty = o.items.reduce((acc, item) => acc + item.quantity, 0);
-                                const orderVal = o.items.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0);
-                                return (
-                                  <View key={o.id} className="bg-white border border-slate-100 p-2 rounded-lg flex-row justify-between items-center">
-                                    <View><Text className="font-bold text-indigo-600 text-[9px]">#{o.id}</Text><Text className="text-slate-400 text-[9px]">{new Date(o.created_at).toLocaleDateString()} - {totalQty} units</Text></View>
-                                    <View className="items-end"><Text className={`px-1.5 py-0.5 rounded-md font-bold text-[8px] uppercase ${o.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : o.status === 'Confirmed' ? 'bg-blue-50 text-blue-600' : 'bg-red-50 text-red-600'}`}>{o.status}</Text><Text className="font-bold text-slate-700 text-[9px]">Rs{orderVal}</Text></View>
-                                  </View>
-                                );
-                              })
+              <FilterBar hideSearch>
+                <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
+                  <Pressable onPress={() => setStoreListTab('active')} className={`py-1.5 px-3 rounded-lg items-center justify-center ${storeListTab === 'active' ? 'bg-indigo-600' : ''}`}>
+                    <Text className={`text-[10px] font-extrabold ${storeListTab === 'active' ? 'text-white' : 'text-slate-500'}`}>Partner Shops</Text>
+                  </Pressable>
+                  <Pressable onPress={() => setStoreListTab('inactive')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${storeListTab === 'inactive' ? 'bg-indigo-600' : ''}`}>
+                    <RotateCcw size={13} color={storeListTab === 'inactive' ? '#ffffff' : '#64748b'} />
+                    <Text className={`text-[10px] font-extrabold ${storeListTab === 'inactive' ? 'text-white' : 'text-slate-500'}`}>Removed Shops</Text>
+                    {data.stores.filter(s => s.status === 'Inactive').length > 0 && (
+                      <View className="bg-red-500 rounded-full px-1.5 py-0.5">
+                        <Text className="text-white font-extrabold text-[8px]">{data.stores.filter(s => s.status === 'Inactive').length}</Text>
+                      </View>
+                    )}
+                  </Pressable>
+                </View>
+              </FilterBar>
+
+              {(() => {
+                const emptyStoreText = storeListTab === 'inactive' ? 'No removed shop partners. Anything you remove will show up here for restoring.' : 'No partner stores match your search query.';
+
+                if (data.stores.length === 0) {
+                  return (
+                    <View className="p-8 items-center bg-white border border-dashed border-slate-200 rounded-3xl gap-2">
+                      <View className="w-12 h-12 bg-slate-50 rounded-full items-center justify-center border border-slate-100"><MapPin size={20} color="#94a3b8" /></View>
+                      <Text className="text-xs font-black text-slate-800">No shop partners registered yet</Text>
+                      <Pressable onPress={handleOpenAddStore} className="py-1.5 px-3 bg-rose-500 rounded-lg active:bg-rose-600"><Text className="text-white text-[10px] font-bold">+ Register First Shop Partner</Text></Pressable>
+                    </View>
+                  );
+                }
+
+                if (viewMode === 'table') {
+                  return (
+                    <DataTable
+                      data={filteredStores}
+                      keyExtractor={s => s.id}
+                      emptyText={emptyStoreText}
+                      columns={[
+                        {
+                          key: 'name', label: 'Store', width: 190,
+                          render: (s: Store) => (
+                            <View>
+                              <View className="flex-row items-center gap-1">
+                                <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text>
+                                <Text className={`text-[8px] font-black px-1 rounded-full ${s.ranking === 'Platinum' ? 'bg-indigo-50 text-indigo-600' : s.ranking === 'Gold' ? 'bg-amber-50 text-amber-600' : s.ranking === 'Silver' ? 'bg-slate-100 text-slate-600' : 'bg-red-50 text-red-500'}`}>{s.ranking}</Text>
+                                {s.status === 'Inactive' && <Text className="text-[8px] font-black px-1 rounded-full bg-red-50 text-red-600">Inactive</Text>}
+                              </View>
+                            </View>
+                          ),
+                        },
+                        { key: 'owner', label: 'Owner', width: 120, render: (s: Store) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.owner_name}</Text> },
+                        { key: 'phone', label: 'Phone', width: 100, render: (s: Store) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.phone}</Text> },
+                        {
+                          key: 'outstanding', label: 'Outstanding/Limit', width: 130,
+                          render: (s: Store) => <Text className={`text-[10px] font-bold ${s.outstanding_balance > s.credit_limit ? 'text-red-500' : 'text-slate-700'}`}>Rs{s.outstanding_balance.toFixed(0)} / Rs{s.credit_limit.toFixed(0)}</Text>,
+                        },
+                        { key: 'health', label: 'Health', width: 70, align: 'center' as const, render: (s: Store) => <Text className="font-extrabold text-indigo-500 text-[10px] text-center">{calculateStoreHealthScore(s)}/100</Text> },
+                        {
+                          key: 'actions', label: 'Actions', width: 160, grow: false,
+                          render: (s: Store) => {
+                            const isInactive = s.status === 'Inactive';
+                            return (
+                              <View className="flex-row flex-wrap items-center gap-1">
+                                <Pressable onPress={() => setViewingStore(s)} className="py-0.5 px-1.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[8px]">View Info</Text></Pressable>
+                                <Pressable onPress={() => handleOpenStoreReport(s)} className="py-0.5 px-1.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[8px]">Report</Text></Pressable>
+                                <Pressable
+                                  onPress={() => {
+                                    setSelectedStore(s);
+                                    setStoreForm({ name: s.name, owner_name: s.owner_name, phone: s.phone, alt_phone: s.alt_phone, address: s.address, area: s.area, city: s.city, state: s.state, pincode: s.pincode, gst_number: s.gst_number, credit_limit: s.credit_limit, refill_frequency: s.refill_frequency, custom_days: s.custom_days || 7, ranking: s.ranking });
+                                    setActiveForm('edit_store');
+                                  }}
+                                  className="py-0.5 px-1.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"
+                                ><Text className="text-slate-600 font-bold text-[8px]">Edit</Text></Pressable>
+                                <Pressable onPress={() => handleOpenStorePricing(s)} className="py-0.5 px-1.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[8px]">Pricing</Text></Pressable>
+                                {isInactive ? (
+                                  <Pressable onPress={() => handleReactivateStore(s.id)} className="py-0.5 px-1.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[8px]">Reactivate</Text></Pressable>
+                                ) : (
+                                  <Pressable onPress={() => setDeleteStoreConfirmId(s.id)} className="py-0.5 px-1.5 bg-rose-50 rounded-lg border border-rose-100 active:bg-rose-100"><Text className="text-rose-600 font-bold text-[8px]">Delete</Text></Pressable>
+                                )}
+                              </View>
+                            );
+                          },
+                        },
+                      ] as DataTableColumn<Store>[]}
+                    />
+                  );
+                }
+
+                return (
+                  <View className="gap-2.5 md:flex-row md:flex-wrap">
+                    {filteredStores.length === 0 ? (
+                      <Text className="py-6 text-center text-slate-400 italic bg-white rounded-2xl border border-slate-200 text-xs">
+                        {emptyStoreText}
+                      </Text>
+                    ) : (
+                      filteredStores.map(s => {
+                        const isExpanded = expandedStoreId === s.id;
+                        const storeOrders = data.orders.filter(o => o.store_id === s.id);
+                        const isInactive = s.status === 'Inactive';
+                        return (
+                          <View key={s.id} className={`w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 relative ${isInactive ? 'opacity-60' : ''}`}>
+                            <View className="absolute top-3 right-3 items-end gap-1">
+                              <Text className={`text-[9px] font-black px-1.5 py-0.5 rounded-full ${s.ranking === 'Platinum' ? 'bg-indigo-50 text-indigo-600' : s.ranking === 'Gold' ? 'bg-amber-50 text-amber-600' : s.ranking === 'Silver' ? 'bg-slate-100 text-slate-600' : 'bg-red-50 text-red-500'}`}>{s.ranking}</Text>
+                              {isInactive && <Text className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-red-50 text-red-600">Inactive</Text>}
+                            </View>
+                            <View className="flex-row items-start gap-2 pr-16">
+                              <View className="p-2 bg-rose-50 rounded-xl mt-0.5"><MapPin size={16} color="#f43f5e" /></View>
+                              <View className="flex-1">
+                                <Text className="font-bold text-slate-800 text-xs">{s.name}</Text>
+                                <Text className="text-[10px] text-slate-400 mt-0.5">Owner: {s.owner_name} - Phone: {s.phone}</Text>
+                              </View>
+                            </View>
+                            <View className="flex-row justify-between mt-3 pt-2 border-t border-slate-50">
+                              <View><Text className="text-slate-400 text-[9px]">Outstanding Bal</Text><Text className={`font-bold text-[10px] ${s.outstanding_balance > s.credit_limit ? 'text-red-500' : 'text-slate-700'}`}>Rs{s.outstanding_balance.toFixed(2)} / Rs{s.credit_limit.toFixed(2)} Max</Text></View>
+                              <View className="items-end"><Text className="text-slate-400 text-[9px]">Health Index</Text><Text className="font-extrabold text-indigo-500 text-[10px]">{calculateStoreHealthScore(s)}/100</Text></View>
+                            </View>
+                            <View className="flex-row flex-wrap gap-1.5 mt-2 pt-2 border-t border-slate-50 justify-end">
+                              <Pressable onPress={() => setViewingStore(s)} className="py-1 px-2.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[9px]">View Info</Text></Pressable>
+                              <Pressable onPress={() => handleOpenStoreReport(s)} className="py-1 px-2.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Report</Text></Pressable>
+                              <Pressable
+                                onPress={() => {
+                                  setSelectedStore(s);
+                                  setStoreForm({ name: s.name, owner_name: s.owner_name, phone: s.phone, alt_phone: s.alt_phone, address: s.address, area: s.area, city: s.city, state: s.state, pincode: s.pincode, gst_number: s.gst_number, credit_limit: s.credit_limit, refill_frequency: s.refill_frequency, custom_days: s.custom_days || 7, ranking: s.ranking });
+                                  setActiveForm('edit_store');
+                                }}
+                                className="py-1 px-2.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"
+                              ><Text className="text-slate-600 font-bold text-[9px]">Edit</Text></Pressable>
+                              <Pressable onPress={() => handleOpenStorePricing(s)} className="py-1 px-2.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100"><Text className="text-indigo-600 font-bold text-[9px]">Pricing</Text></Pressable>
+                              {isInactive ? (
+                                <Pressable onPress={() => handleReactivateStore(s.id)} className="py-1 px-2.5 bg-emerald-50 rounded-lg border border-emerald-100 active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Reactivate</Text></Pressable>
+                              ) : (
+                                <Pressable onPress={() => setDeleteStoreConfirmId(s.id)} className="py-1 px-2.5 bg-rose-50 rounded-lg border border-rose-100 active:bg-rose-100"><Text className="text-rose-600 font-bold text-[9px]">Delete</Text></Pressable>
+                              )}
+                              {/* <Pressable onPress={() => setExpandedStoreId(isExpanded ? null : s.id)} className={`py-1 px-2.5 rounded-lg border ${isExpanded ? 'bg-rose-500 border-rose-600' : 'bg-white border-slate-200'}`}>
+                                <Text className={`font-bold text-[9px] ${isExpanded ? 'text-white' : 'text-slate-600'}`}>{isExpanded ? 'Close' : 'View Details'}</Text>
+                              </Pressable> */}
+                            </View>
+                            {isExpanded && (
+                              <View className="mt-3 bg-slate-50 border-t border-slate-100 p-3 rounded-xl gap-2">
+                                <View className="flex-row justify-between"><View><Text className="text-slate-400 text-[9px]">Alt Phone</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.alt_phone || 'N/A'}</Text></View><View className="items-end"><Text className="text-slate-400 text-[9px]">GST Number</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.gst_number || 'N/A'}</Text></View></View>
+                                <View><Text className="text-slate-400 text-[9px]">Full Address</Text><Text className="font-semibold text-slate-700 text-[10px]">{s.address}, {s.area}, {s.city}, {s.state} - {s.pincode}</Text></View>
+                                <Text className="font-bold text-slate-700 text-[9px]">Recent Orders ({storeOrders.length})</Text>
+                                {storeOrders.length === 0 ? (
+                                  <Text className="text-[9px] text-slate-400 italic">No orders logged for this store yet.</Text>
+                                ) : (
+                                  storeOrders.slice(0, 5).map(o => {
+                                    const totalQty = o.items.reduce((acc, item) => acc + item.quantity, 0);
+                                    const orderVal = o.items.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0);
+                                    return (
+                                      <View key={o.id} className="bg-white border border-slate-100 p-2 rounded-lg flex-row justify-between items-center">
+                                        <View><Text className="font-bold text-indigo-600 text-[9px]">#{o.id}</Text><Text className="text-slate-400 text-[9px]">{new Date(o.created_at).toLocaleDateString()} - {totalQty} units</Text></View>
+                                        <View className="items-end"><Text className={`px-1.5 py-0.5 rounded-md font-bold text-[8px] uppercase ${o.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : o.status === 'Confirmed' ? 'bg-blue-50 text-blue-600' : 'bg-red-50 text-red-600'}`}>{o.status}</Text><Text className="font-bold text-slate-700 text-[9px]">Rs{orderVal.toFixed(2)}</Text></View>
+                                      </View>
+                                    );
+                                  })
+                                )}
+                              </View>
                             )}
                           </View>
-                        )}
-                      </View>
-                    );
-                  })
-                )}
-              </View>
+                        );
+                      })
+                    )}
+                  </View>
+                );
+              })()}
             </View>
           )}
 
@@ -1228,7 +3431,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
               <View className="flex-row justify-between items-center">
                 <Text className="font-bold text-slate-600 text-xs">Ice Cream Order Fleet Dispatch</Text>
                 <View className="flex-row items-center gap-2">
-                  <Text className="text-[10px] text-slate-400">Total: {data.orders.length}</Text>
+                  <Text className="text-[10px] text-slate-400">Total: {orders.total}</Text>
                   <Pressable
                     onPress={handleOpenCreateOrder}
                     className="px-3 py-1.5 bg-blue-600 rounded-lg flex-row items-center gap-1 active:bg-blue-700"
@@ -1238,93 +3441,160 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   </Pressable>
                 </View>
               </View>
-              <View className="relative justify-center lg:max-w-sm">
-                <View className="absolute left-3 z-10"><Search size={16} color="#94a3b8" /></View>
-                <TextInput value={orderSearch} onChangeText={setOrderSearch} placeholder="Search by Outlet name, Owner, or Order ID..." placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 pl-9 pr-4 py-2.5 text-xs rounded-xl" />
-              </View>
-              <View className="gap-1">
-                <Text className="text-[9px] font-bold text-slate-400 uppercase">Fulfillment Status</Text>
-                <View className="flex-row flex-wrap gap-1.5">
-                  {(['All', 'Confirmed', 'Delivered', 'Cancelled'] as const).map(status => (
-                    <Pressable key={status} onPress={() => setOrderStatusFilter(status)} className={`px-2.5 py-1 rounded-lg border ${orderStatusFilter === status ? 'bg-blue-600 border-blue-600' : 'bg-white border-slate-200'}`}>
-                      <Text className={`text-[10px] font-bold ${orderStatusFilter === status ? 'text-white' : 'text-slate-600'}`}>{status}</Text>
-                    </Pressable>
-                  ))}
-                </View>
-              </View>
-              <View className="gap-1">
-                <Text className="text-[9px] font-bold text-slate-400 uppercase">Settlement Status</Text>
-                <View className="flex-row flex-wrap gap-1.5">
-                  {(['All', 'Paid', 'Partial', 'Unpaid'] as const).map(payStat => (
-                    <Pressable key={payStat} onPress={() => setOrderPaymentFilter(payStat)} className={`px-2.5 py-1 rounded-lg border ${orderPaymentFilter === payStat ? 'bg-indigo-600 border-indigo-600' : 'bg-white border-slate-200'}`}>
-                      <Text className={`text-[10px] font-bold ${orderPaymentFilter === payStat ? 'text-white' : 'text-slate-600'}`}>{payStat === 'Paid' ? 'Fully Paid' : payStat === 'Partial' ? 'Partial Paid' : payStat === 'Unpaid' ? 'Not Paid' : 'All'}</Text>
-                    </Pressable>
-                  ))}
-                </View>
-              </View>
-              {renderDateFilterBar()}
+              <FilterBar searchValue={orderSearch} onSearchChange={setOrderSearch} searchPlaceholder="Search by Outlet name, Owner, or Order ID...">
+                <SelectField
+                  value={orderStatusFilter}
+                  onValueChange={v => setOrderStatusFilter(v as typeof orderStatusFilter)}
+                  options={[
+                    { label: 'All Statuses', value: 'All' },
+                    { label: 'Confirmed', value: 'Confirmed' },
+                    { label: 'Delivered', value: 'Delivered' },
+                    { label: 'Cancelled', value: 'Cancelled' },
+                  ]}
+                  title="Fulfillment Status"
+                  className={FILTER_PILL_CLASS}
+                  textClassName={FILTER_PILL_TEXT_CLASS}
+                />
+                <SelectField
+                  value={orderPaymentFilter}
+                  onValueChange={v => setOrderPaymentFilter(v as typeof orderPaymentFilter)}
+                  options={[
+                    { label: 'All Payments', value: 'All' },
+                    { label: 'Fully Paid', value: 'Paid' },
+                    { label: 'Partial Paid', value: 'Partial' },
+                    { label: 'Not Paid', value: 'Unpaid' },
+                  ]}
+                  title="Settlement Status"
+                  className={FILTER_PILL_CLASS}
+                  textClassName={FILTER_PILL_TEXT_CLASS}
+                />
+                {renderDateFilterField()}
+              </FilterBar>
 
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {(() => {
-                  const filteredOrders = data.orders.filter(o => {
-                    const store = data.stores.find(s => s.id === o.store_id);
-                    const inv = data.invoices.find(i => i.order_id === o.id);
-                    const searchMatch = !orderSearch || o.id.toLowerCase().includes(orderSearch.toLowerCase()) || (store && (store.name.toLowerCase().includes(orderSearch.toLowerCase()) || store.owner_name.toLowerCase().includes(orderSearch.toLowerCase())));
-                    if (!searchMatch) return false;
-                    if (!isWithinDateFilter(o.created_at)) return false;
-                    if (orderStatusFilter !== 'All' && o.status !== orderStatusFilter) return false;
-                    if (orderPaymentFilter !== 'All') {
-                      if (o.status !== 'Delivered') return false;
-                      if (!inv) return orderPaymentFilter === 'Unpaid';
-                      const isPaid = inv.payment_status === 'Paid';
-                      const isPartial = inv.payment_status === 'Partial';
-                      const isUnpaid = inv.payment_status === 'Credit' || !inv.payment_status;
-                      if (orderPaymentFilter === 'Paid' && !isPaid) return false;
-                      if (orderPaymentFilter === 'Partial' && !isPartial) return false;
-                      if (orderPaymentFilter === 'Unpaid' && !isUnpaid) return false;
-                    }
-                    return true;
-                  });
-                  if (filteredOrders.length === 0) {
-                    return <Text className="text-center text-slate-400 italic py-8 bg-white border border-slate-200 rounded-2xl text-xs">No orders match the current filters.</Text>;
-                  }
-                  return filteredOrders.map(o => {
-                    const store = data.stores.find(s => s.id === o.store_id);
-                    const itemsCount = o.items.reduce((s, i) => s + i.quantity, 0);
-                    const orderVal = o.items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
-                    const inv = data.invoices.find(i => i.order_id === o.id);
-                    return (
-                      <View key={o.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
-                        <View className="flex-1 pr-2">
-                          <View className="flex-row items-center gap-2 flex-wrap">
-                            <Text className="font-extrabold text-slate-800 text-xs">{store?.name}</Text>
-                            <Text className="text-[8px] bg-slate-100 text-slate-400 font-bold uppercase px-1 rounded">{o.id}</Text>
-                          </View>
-                          <Text className="text-slate-400 text-[10px] mt-0.5">{itemsCount} units - Rs {orderVal.toFixed(2)}</Text>
-                          <Text className="text-[9px] text-slate-400">{new Date(o.created_at).toLocaleDateString()}</Text>
-                        </View>
-                        <View className="flex-row items-center gap-1.5">
-                          <View className="items-end gap-1">
-                            <Text className={`px-2 py-0.5 font-bold rounded text-[8px] uppercase ${o.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : o.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{o.status}</Text>
-                            {o.status === 'Delivered' && inv && (() => {
-                              const isPaid = inv.payment_status === 'Paid';
-                              const isPartial = inv.payment_status === 'Partial';
-                              return <Text className={`px-2 py-0.5 font-black rounded text-[7px] uppercase ${isPaid ? 'bg-emerald-100 text-emerald-800' : isPartial ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>{isPaid ? 'Fully Paid' : isPartial ? 'Partial Paid' : 'Not Paid'}</Text>;
-                            })()}
-                          </View>
-                          {o.status === 'Delivered' && inv && store && (
-                            <>
-                              <Pressable onPress={() => downloadInvoicePDF(o, inv, store)} className="p-1.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"><Download size={14} color="#475569" /></Pressable>
-                              <Pressable onPress={() => handleWhatsAppShare(inv, store, o)} className="p-1.5 bg-emerald-50 rounded-lg border border-emerald-200 active:bg-emerald-100"><MessageSquare size={14} color="#059669" /></Pressable>
-                            </>
-                          )}
-                          <Pressable onPress={() => { setSelectedOrder(o); setActiveForm('order_details'); }} className="p-1.5 bg-slate-50 rounded-lg border border-slate-100 active:bg-slate-100"><Eye size={14} color="#64748b" /></Pressable>
-                        </View>
+              <ScrollableSection height={ordersTableHeight}>
+              {(() => {
+                const filteredOrders = orders.data;
+
+                if (orders.loading && filteredOrders.length === 0) {
+                  return <View className="flex-1 items-center justify-center"><Text className="text-center text-slate-400 italic text-xs">Loading orders...</Text></View>;
+                }
+                if (orders.error) {
+                  return <View className="flex-1 items-center justify-center"><Text className="text-center text-red-500 italic text-xs">{orders.error}</Text></View>;
+                }
+
+                if (viewMode === 'table') {
+                  return (
+                    <DataTable
+                      data={filteredOrders}
+                      keyExtractor={o => o.id}
+                      emptyText="No orders match the current filters."
+                      columns={[
+                        {
+                          key: 'store', label: 'Store / Order ID', width: 180,
+                          render: (o: Order) => {
+                            const store = data.stores.find(s => s.id === o.store_id);
+                            return (
+                              <View>
+                                <Text className="font-extrabold text-slate-800 text-[11px]" numberOfLines={1}>{store?.name}</Text>
+                                <Text className="text-[8px] bg-slate-100 text-slate-400 font-bold uppercase px-1 rounded self-start mt-0.5">{o.id}</Text>
+                              </View>
+                            );
+                          },
+                        },
+                        {
+                          key: 'value', label: 'Items / Value', width: 110,
+                          render: (o: Order) => {
+                            const itemsCount = o.items.reduce((s, i) => s + i.quantity, 0);
+                            const orderVal = o.items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
+                            return <Text className="text-[10px] text-slate-600">{itemsCount} units{'\n'}Rs {orderVal.toFixed(2)}</Text>;
+                          },
+                        },
+                        { key: 'date', label: 'Date', width: 90, grow: false, render: (o: Order) => <Text className="text-[9px] text-slate-400">{new Date(o.created_at).toLocaleDateString()}</Text> },
+                        {
+                          key: 'status', label: 'Status', width: 90, grow: false,
+                          render: (o: Order) => <Text className={`px-2 py-0.5 font-bold rounded text-[8px] uppercase self-start ${o.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : o.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{o.status}</Text>,
+                        },
+                        {
+                          key: 'payment', label: 'Payment', width: 90, grow: false,
+                          render: (o: Order) => {
+                            const inv = data.invoices.find(i => i.order_id === o.id);
+                            if (o.status !== 'Delivered' || !inv) return <Text className="text-[9px] text-slate-300">-</Text>;
+                            const isPaid = inv.payment_status === 'Paid';
+                            const isPartial = inv.payment_status === 'Partial';
+                            return <Text className={`px-2 py-0.5 font-black rounded text-[7px] uppercase self-start ${isPaid ? 'bg-emerald-100 text-emerald-800' : isPartial ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>{isPaid ? 'Fully Paid' : isPartial ? 'Partial Paid' : 'Not Paid'}</Text>;
+                          },
+                        },
+                        {
+                          key: 'actions', label: 'Actions', width: 110, grow: false,
+                          render: (o: Order) => {
+                            const store = data.stores.find(s => s.id === o.store_id);
+                            const inv = data.invoices.find(i => i.order_id === o.id);
+                            return (
+                              <View className="flex-row items-center gap-1">
+                                {o.status === 'Delivered' && inv && store && (
+                                  <>
+                                    <Pressable onPress={() => downloadInvoicePDF(o, inv, store)} className="p-1.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"><Download size={13} color="#475569" /></Pressable>
+                                    <Pressable onPress={() => handleWhatsAppShare(inv, store, o)} className="p-1.5 bg-emerald-50 rounded-lg border border-emerald-200 active:bg-emerald-100"><MessageSquare size={13} color="#059669" /></Pressable>
+                                  </>
+                                )}
+                                <Pressable onPress={() => { setSelectedOrder(o); setActiveForm('order_details'); }} className="p-1.5 bg-slate-50 rounded-lg border border-slate-100 active:bg-slate-100"><Eye size={13} color="#64748b" /></Pressable>
+                              </View>
+                            );
+                          },
+                        },
+                      ] as DataTableColumn<Order>[]}
+                    />
+                  );
+                }
+
+                return (
+                  <View className={`gap-2.5 md:flex-row md:flex-wrap ${filteredOrders.length === 0 ? 'flex-1' : ''}`}>
+                    {filteredOrders.length === 0 ? (
+                      <View className="flex-1 items-center justify-center bg-white border border-slate-200 rounded-2xl py-8">
+                        <Text className="text-center text-slate-400 italic text-xs">No orders match the current filters.</Text>
                       </View>
-                    );
-                  });
-                })()}
-              </View>
+                    ) : (
+                      filteredOrders.map(o => {
+                        const store = data.stores.find(s => s.id === o.store_id);
+                        const itemsCount = o.items.reduce((s, i) => s + i.quantity, 0);
+                        const orderVal = o.items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
+                        const inv = data.invoices.find(i => i.order_id === o.id);
+                        return (
+                          <View key={o.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
+                            <View className="flex-1 pr-2">
+                              <View className="flex-row items-center gap-2 flex-wrap">
+                                <Text className="font-extrabold text-slate-800 text-xs">{store?.name}</Text>
+                                <Text className="text-[8px] bg-slate-100 text-slate-400 font-bold uppercase px-1 rounded">{o.id}</Text>
+                              </View>
+                              <Text className="text-slate-400 text-[10px] mt-0.5">{itemsCount} units - Rs {orderVal.toFixed(2)}</Text>
+                              <Text className="text-[9px] text-slate-400">{new Date(o.created_at).toLocaleDateString()}</Text>
+                            </View>
+                            <View className="flex-row items-center gap-1.5">
+                              <View className="items-end gap-1">
+                                <Text className={`px-2 py-0.5 font-bold rounded text-[8px] uppercase ${o.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : o.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{o.status}</Text>
+                                {o.status === 'Delivered' && inv && (() => {
+                                  const isPaid = inv.payment_status === 'Paid';
+                                  const isPartial = inv.payment_status === 'Partial';
+                                  return <Text className={`px-2 py-0.5 font-black rounded text-[7px] uppercase ${isPaid ? 'bg-emerald-100 text-emerald-800' : isPartial ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>{isPaid ? 'Fully Paid' : isPartial ? 'Partial Paid' : 'Not Paid'}</Text>;
+                                })()}
+                              </View>
+                              {o.status === 'Delivered' && inv && store && (
+                                <>
+                                  <Pressable onPress={() => downloadInvoicePDF(o, inv, store)} className="p-1.5 bg-slate-50 rounded-lg border border-slate-200 active:bg-slate-100"><Download size={14} color="#475569" /></Pressable>
+                                  <Pressable onPress={() => handleWhatsAppShare(inv, store, o)} className="p-1.5 bg-emerald-50 rounded-lg border border-emerald-200 active:bg-emerald-100"><MessageSquare size={14} color="#059669" /></Pressable>
+                                </>
+                              )}
+                              <Pressable onPress={() => { setSelectedOrder(o); setActiveForm('order_details'); }} className="p-1.5 bg-slate-50 rounded-lg border border-slate-100 active:bg-slate-100"><Eye size={14} color="#64748b" /></Pressable>
+                            </View>
+                          </View>
+                        );
+                      })
+                    )}
+                  </View>
+                );
+              })()}
+              </ScrollableSection>
+              <PaginationFooter mode="offset" page={orders.page} totalPages={orders.totalPages} total={orders.total} loading={orders.loading} onPageChange={orders.goToPage} />
             </View>
           )}
 
@@ -1350,29 +3620,82 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   </View>
                 )}
               </View>
-              {renderDateFilterBar()}
+              <FilterBar searchValue={paymentSearch} onSearchChange={setPaymentSearch} searchPlaceholder="Search by store or owner name...">
+                <SelectField
+                  value={paymentMethodFilter}
+                  onValueChange={setPaymentMethodFilter}
+                  options={[
+                    { label: 'All Methods', value: 'All' },
+                    { label: 'Cash', value: 'Cash' },
+                    { label: 'UPI', value: 'UPI' },
+                    { label: 'Google Pay', value: 'Google Pay' },
+                    { label: 'PhonePe', value: 'PhonePe' },
+                    { label: 'Paytm', value: 'Paytm' },
+                    { label: 'Bank Transfer', value: 'Bank Transfer' },
+                    { label: 'Credit', value: 'Credit' },
+                  ]}
+                  title="Payment Method"
+                  className={FILTER_PILL_CLASS}
+                  textClassName={FILTER_PILL_TEXT_CLASS}
+                />
+                {renderDateFilterField()}
+              </FilterBar>
 
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {(() => {
-                  const filteredPayments = data.payments.filter(p => isWithinDateFilter(p.date));
-                  if (filteredPayments.length === 0) {
-                    return <Text className="text-center text-slate-400 italic py-8 bg-white border border-slate-200 rounded-2xl text-xs w-full">No payments match the current date range.</Text>;
-                  }
-                  return filteredPayments.map(p => {
-                    const store = data.stores.find(s => s.id === p.store_id);
-                    return (
-                      <View key={p.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
-                        <View>
-                          <Text className="font-bold text-slate-800 text-xs">{store?.name}</Text>
-                          <Text className="text-slate-400 text-[9px] mt-0.5">Method: {p.method} - Officer: {p.collected_by}</Text>
-                          <Text className="text-[9px] text-slate-400">{new Date(p.date).toLocaleString()}</Text>
-                        </View>
-                        <Text className="text-emerald-600 font-black bg-emerald-50 px-2 py-1 rounded-xl text-xs">+Rs{p.amount.toFixed(2)}</Text>
+              <ScrollableSection height={paymentsTableHeight}>
+              {(() => {
+                const filteredPayments = payments.data;
+
+                if (payments.loading && filteredPayments.length === 0) {
+                  return <View className="flex-1 items-center justify-center"><Text className="text-center text-slate-400 italic text-xs">Loading payments...</Text></View>;
+                }
+                if (payments.error) {
+                  return <View className="flex-1 items-center justify-center"><Text className="text-center text-red-500 italic text-xs">{payments.error}</Text></View>;
+                }
+
+                if (viewMode === 'table') {
+                  return (
+                    <DataTable
+                      data={filteredPayments}
+                      keyExtractor={p => p.id}
+                      emptyText="No payments match the current filters."
+                      onRowPress={p => { const store = data.stores.find(s => s.id === p.store_id); if (store) setViewingStore(store); }}
+                      columns={[
+                        { key: 'store', label: 'Store', width: 170, render: (p: Payment) => <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{data.stores.find(s => s.id === p.store_id)?.name}</Text> },
+                        { key: 'method', label: 'Method', width: 100, render: (p: Payment) => <Text className="text-[10px] text-slate-600">{p.method}</Text> },
+                        { key: 'collected_by', label: 'Collected By', width: 130, render: (p: Payment) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{p.collected_by}</Text> },
+                        { key: 'date', label: 'Date', width: 120, grow: false, render: (p: Payment) => <Text className="text-[9px] text-slate-400">{new Date(p.date).toLocaleString()}</Text> },
+                        { key: 'amount', label: 'Amount', width: 100, align: 'right' as const, render: (p: Payment) => <Text className="text-emerald-600 font-black text-[11px] text-right">+Rs{p.amount.toFixed(2)}</Text> },
+                      ] as DataTableColumn<Payment>[]}
+                    />
+                  );
+                }
+
+                return (
+                  <View className={`gap-2.5 md:flex-row md:flex-wrap ${filteredPayments.length === 0 ? 'flex-1' : ''}`}>
+                    {filteredPayments.length === 0 ? (
+                      <View className="flex-1 items-center justify-center bg-white border border-slate-200 rounded-2xl py-8">
+                        <Text className="text-center text-slate-400 italic text-xs">No payments match the current filters.</Text>
                       </View>
-                    );
-                  });
-                })()}
-              </View>
+                    ) : (
+                      filteredPayments.map(p => {
+                        const store = data.stores.find(s => s.id === p.store_id);
+                        return (
+                          <Pressable key={p.id} onPress={() => store && setViewingStore(store)} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
+                            <View>
+                              <Text className="font-bold text-slate-800 text-xs">{store?.name}</Text>
+                              <Text className="text-slate-400 text-[9px] mt-0.5">Method: {p.method} - Officer: {p.collected_by}</Text>
+                              <Text className="text-[9px] text-slate-400">{new Date(p.date).toLocaleString()}</Text>
+                            </View>
+                            <Text className="text-emerald-600 font-black bg-emerald-50 px-2 py-1 rounded-xl text-xs">+Rs{p.amount.toFixed(2)}</Text>
+                          </Pressable>
+                        );
+                      })
+                    )}
+                  </View>
+                );
+              })()}
+              </ScrollableSection>
+              <PaginationFooter mode="offset" page={payments.page} totalPages={payments.totalPages} total={payments.total} loading={payments.loading} onPageChange={payments.goToPage} />
             </View>
           )}
 
@@ -1383,11 +3706,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   <Text className="font-extrabold text-slate-800 text-xs uppercase">Outstanding Credit Limits Monitoring</Text>
                   <Text className="text-[10px] text-slate-400 font-medium">Filter, search, and sort partner outlet credit utilization</Text>
                 </View>
-                <View className="flex-row gap-2">
-                  <View className="flex-1 lg:max-w-sm relative justify-center">
-                    <View className="absolute left-2.5 z-10"><Search size={14} color="#94a3b8" /></View>
-                    <TextInput value={creditSearch} onChangeText={setCreditSearch} placeholder="Search partner..." placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-xl py-2 pl-7 pr-3 text-[11px] font-bold text-slate-700" />
-                  </View>
+                <FilterBar searchValue={creditSearch} onSearchChange={setCreditSearch} searchPlaceholder="Search partner...">
                   <SelectField
                     value={creditSort}
                     onValueChange={v => setCreditSort(v as any)}
@@ -1396,66 +3715,119 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                       { label: 'Credit Limit: High to Low', value: 'limit_desc' }, { label: 'Credit Limit: Low to High', value: 'limit_asc' },
                     ]}
                     title="Sort By"
-                    className="bg-white border border-slate-200 rounded-xl py-2 px-2.5 flex-row items-center"
-                    textClassName="text-[11px] font-black text-slate-600"
+                    className={FILTER_PILL_CLASS}
+                    textClassName={FILTER_PILL_TEXT_CLASS}
                   />
-                </View>
-                {renderDateFilterBar()}
+                </FilterBar>
               </View>
 
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {(() => {
-                  const filteredCreditStores = data.stores
-                    .filter(s => s.name.toLowerCase().includes(creditSearch.toLowerCase()) || s.owner_name.toLowerCase().includes(creditSearch.toLowerCase()))
-                    .filter(s => isWithinDateFilter(s.last_purchase_date))
-                    .sort((a, b) => creditSort === 'balance_desc' ? b.outstanding_balance - a.outstanding_balance : creditSort === 'balance_asc' ? a.outstanding_balance - b.outstanding_balance : creditSort === 'limit_desc' ? b.credit_limit - a.credit_limit : a.credit_limit - b.credit_limit);
-                  if (filteredCreditStores.length === 0) {
-                    return <Text className="text-center text-slate-400 italic py-8 bg-white border border-slate-200 rounded-2xl text-xs w-full">No partner outlets match the current filters.</Text>;
-                  }
-                  return filteredCreditStores.map(s => {
-                    const limitRatio = s.outstanding_balance / (s.credit_limit || 1);
-                    const isOverdue = limitRatio > 0.8;
-                    const percentUsed = Math.min(100, Math.round(limitRatio * 100));
-                    return (
-                      <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-4 border border-slate-200 gap-3">
-                        <View className="flex-row items-center justify-between gap-2">
-                          <View className="flex-1"><Text className="font-extrabold text-slate-800 text-xs">{s.name}</Text><Text className="text-[9px] text-slate-400 font-bold mt-0.5">Owner: {s.owner_name} - Phone: {s.phone}</Text></View>
-                          {isOverdue ? (
-                            <Text className="bg-rose-500 text-white font-black text-[9px] px-2 py-0.5 rounded">CRITICAL ({percentUsed}%)</Text>
-                          ) : (
-                            <Text className="bg-emerald-50 text-emerald-600 border border-emerald-100 font-extrabold text-[9px] px-2 py-0.5 rounded">{percentUsed}%</Text>
-                          )}
-                        </View>
-                        <View className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
-                          <View className={`h-full rounded-full ${isOverdue ? 'bg-rose-500' : 'bg-indigo-500'}`} style={{ width: `${percentUsed}%` }} />
-                        </View>
-                        <View className="flex-row justify-between pt-1 border-t border-slate-100">
-                          <View><Text className="text-slate-400 font-semibold text-[11px]">Credit Limit:</Text><Text className="font-bold text-slate-700 text-[11px]">Rs{s.credit_limit.toLocaleString('en-IN')}</Text></View>
-                          <View className="items-end"><Text className="text-slate-400 font-semibold text-[11px]">Outstanding:</Text><Text className={`font-extrabold text-[11px] ${isOverdue ? 'text-rose-600' : 'text-slate-800'}`}>Rs{s.outstanding_balance.toLocaleString('en-IN')}</Text></View>
-                        </View>
-                        <View className="flex-row justify-between items-center pt-2.5 border-t border-slate-100">
-                          <Text className="text-[10px] text-slate-400 font-medium">{s.outstanding_balance > 0 ? 'Has unpaid dues' : 'Credit balance clear'}</Text>
-                          <Pressable
-                            onPress={() => { setPaymentForm({ store_id: s.id, invoice_id: 'general', amount: s.outstanding_balance > 0 ? s.outstanding_balance : 0, method: 'UPI' }); setActiveForm('add_payment'); }}
-                            className="py-1 px-2.5 bg-emerald-600 rounded-lg flex-row items-center gap-1 active:bg-emerald-700"
-                          >
-                            <DollarSign size={12} color="#fff" />
-                            <Text className="text-white text-[10px] font-black">Record Payment</Text>
-                          </Pressable>
-                        </View>
-                      </View>
-                    );
-                  });
-                })()}
-              </View>
+              {(() => {
+                const filteredCreditStores = data.stores
+                  .filter(s => s.name.toLowerCase().includes(creditSearch.toLowerCase()) || s.owner_name.toLowerCase().includes(creditSearch.toLowerCase()))
+                  .sort((a, b) => creditSort === 'balance_desc' ? b.outstanding_balance - a.outstanding_balance : creditSort === 'balance_asc' ? a.outstanding_balance - b.outstanding_balance : creditSort === 'limit_desc' ? b.credit_limit - a.credit_limit : a.credit_limit - b.credit_limit);
+
+                if (viewMode === 'table') {
+                  return (
+                    <DataTable
+                      data={filteredCreditStores}
+                      keyExtractor={s => s.id}
+                      emptyText="No partner outlets match the current filters."
+                      columns={[
+                        { key: 'store', label: 'Store', width: 160, render: (s: Store) => <Text className="font-extrabold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text> },
+                        { key: 'owner', label: 'Owner / Phone', width: 150, render: (s: Store) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.owner_name} - {s.phone}</Text> },
+                        {
+                          key: 'used', label: 'Credit Used %', width: 90,
+                          render: (s: Store) => {
+                            const limitRatio = s.outstanding_balance / (s.credit_limit || 1);
+                            const isOverdue = limitRatio > 0.8;
+                            const percentUsed = Math.min(100, Math.round(limitRatio * 100));
+                            return (
+                              <View className="gap-1">
+                                <Text className={`text-[9px] font-black ${isOverdue ? 'text-rose-600' : 'text-slate-700'}`}>{percentUsed}%</Text>
+                                <View className="w-full bg-slate-100 h-1 rounded-full overflow-hidden">
+                                  <View className={`h-full rounded-full ${isOverdue ? 'bg-rose-500' : 'bg-indigo-500'}`} style={{ width: `${percentUsed}%` }} />
+                                </View>
+                              </View>
+                            );
+                          },
+                        },
+                        { key: 'limit', label: 'Limit', width: 90, align: 'right' as const, render: (s: Store) => <Text className="text-[10px] font-bold text-slate-700 text-right">Rs{s.credit_limit.toLocaleString('en-IN')}</Text> },
+                        {
+                          key: 'outstanding', label: 'Outstanding', width: 100, align: 'right' as const,
+                          render: (s: Store) => {
+                            const isOverdue = (s.outstanding_balance / (s.credit_limit || 1)) > 0.8;
+                            return <Text className={`text-[10px] font-extrabold text-right ${isOverdue ? 'text-rose-600' : 'text-slate-800'}`}>Rs{s.outstanding_balance.toLocaleString('en-IN')}</Text>;
+                          },
+                        },
+                        {
+                          key: 'actions', label: 'Actions', width: 100, grow: false,
+                          render: (s: Store) => (
+                            <Pressable
+                              onPress={() => { setPaymentForm({ store_id: s.id, invoice_id: 'general', amount: s.outstanding_balance > 0 ? s.outstanding_balance : 0, method: 'UPI' }); setActiveForm('add_payment'); }}
+                              className="py-1 px-2 bg-emerald-600 rounded-lg flex-row items-center gap-1 active:bg-emerald-700 self-start"
+                            >
+                              <DollarSign size={11} color="#fff" />
+                              <Text className="text-white text-[8px] font-black">Record</Text>
+                            </Pressable>
+                          ),
+                        },
+                      ] as DataTableColumn<Store>[]}
+                    />
+                  );
+                }
+
+                return (
+                  <View className="gap-2.5 md:flex-row md:flex-wrap">
+                    {filteredCreditStores.length === 0 ? (
+                      <Text className="text-center text-slate-400 italic py-8 bg-white border border-slate-200 rounded-2xl text-xs w-full">No partner outlets match the current filters.</Text>
+                    ) : (
+                      filteredCreditStores.map(s => {
+                        const limitRatio = s.outstanding_balance / (s.credit_limit || 1);
+                        const isOverdue = limitRatio > 0.8;
+                        const percentUsed = Math.min(100, Math.round(limitRatio * 100));
+                        return (
+                          <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-4 border border-slate-200 gap-3">
+                            <View className="flex-row items-center justify-between gap-2">
+                              <View className="flex-1"><Text className="font-extrabold text-slate-800 text-xs">{s.name}</Text><Text className="text-[9px] text-slate-400 font-bold mt-0.5">Owner: {s.owner_name} - Phone: {s.phone}</Text></View>
+                              {isOverdue ? (
+                                <Text className="bg-rose-500 text-white font-black text-[9px] px-2 py-0.5 rounded">CRITICAL ({percentUsed}%)</Text>
+                              ) : (
+                                <Text className="bg-emerald-50 text-emerald-600 border border-emerald-100 font-extrabold text-[9px] px-2 py-0.5 rounded">{percentUsed}%</Text>
+                              )}
+                            </View>
+                            <View className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                              <View className={`h-full rounded-full ${isOverdue ? 'bg-rose-500' : 'bg-indigo-500'}`} style={{ width: `${percentUsed}%` }} />
+                            </View>
+                            <View className="flex-row justify-between pt-1 border-t border-slate-100">
+                              <View><Text className="text-slate-400 font-semibold text-[11px]">Credit Limit:</Text><Text className="font-bold text-slate-700 text-[11px]">Rs{s.credit_limit.toLocaleString('en-IN')}</Text></View>
+                              <View className="items-end"><Text className="text-slate-400 font-semibold text-[11px]">Outstanding:</Text><Text className={`font-extrabold text-[11px] ${isOverdue ? 'text-rose-600' : 'text-slate-800'}`}>Rs{s.outstanding_balance.toLocaleString('en-IN')}</Text></View>
+                            </View>
+                            <View className="flex-row justify-between items-center pt-2.5 border-t border-slate-100">
+                              <Text className="text-[10px] text-slate-400 font-medium">{s.outstanding_balance > 0 ? 'Has unpaid dues' : 'Credit balance clear'}</Text>
+                              <Pressable
+                                onPress={() => { setPaymentForm({ store_id: s.id, invoice_id: 'general', amount: s.outstanding_balance > 0 ? s.outstanding_balance : 0, method: 'UPI' }); setActiveForm('add_payment'); }}
+                                className="py-1 px-2.5 bg-emerald-600 rounded-lg flex-row items-center gap-1 active:bg-emerald-700"
+                              >
+                                <DollarSign size={12} color="#fff" />
+                                <Text className="text-white text-[10px] font-black">Record Payment</Text>
+                              </Pressable>
+                            </View>
+                          </View>
+                        );
+                      })
+                    )}
+                  </View>
+                );
+              })()}
             </View>
           )}
 
           {salesTab === 'refill' && (
             <View className="gap-2.5">
               <Text className="font-bold text-slate-600 text-xs">Smart Refill Cycles Reminders</Text>
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {data.stores.map(s => {
+              <ViewToggle />
+              {(() => {
+                const refillInfo = (s: Store) => {
                   const todayDate = new Date('2026-06-27');
                   const nextRefill = new Date(s.next_refill_date);
                   const daysDiff = Math.ceil((nextRefill.getTime() - todayDate.getTime()) / (1000 * 60 * 60 * 24));
@@ -1464,14 +3836,45 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   else if (daysDiff === 0) { badgeClass = 'bg-red-500'; textClass = 'text-white'; text = 'DUE TODAY'; }
                   else if (daysDiff === 1) { badgeClass = 'bg-amber-500'; textClass = 'text-white'; text = 'DUE TOMORROW'; }
                   else if (daysDiff === 2) { badgeClass = 'bg-amber-100'; textClass = 'text-amber-700'; text = 'DUE IN 2 DAYS'; }
+                  return { badgeClass, textClass, text };
+                };
+
+                if (viewMode === 'table') {
                   return (
-                    <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
-                      <View><Text className="font-bold text-slate-800 text-xs">{s.name}</Text><Text className="text-slate-400 text-[9px] mt-0.5">Cycle: {s.refill_frequency} - Last: {s.last_purchase_date || 'N/A'}</Text></View>
-                      <Text className={`px-2.5 py-1 text-[9px] font-black rounded-lg ${badgeClass} ${textClass}`}>{text}</Text>
-                    </View>
+                    <DataTable
+                      data={data.stores}
+                      keyExtractor={s => s.id}
+                      emptyText="No partner stores found."
+                      columns={[
+                        { key: 'store', label: 'Store', width: 170, render: (s: Store) => <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text> },
+                        { key: 'cycle', label: 'Refill Cycle', width: 100, render: (s: Store) => <Text className="text-[10px] text-slate-600">{s.refill_frequency}</Text> },
+                        { key: 'last', label: 'Last Purchase', width: 110, render: (s: Store) => <Text className="text-[10px] text-slate-600">{s.last_purchase_date || 'N/A'}</Text> },
+                        {
+                          key: 'due', label: 'Due In', width: 150, grow: false,
+                          render: (s: Store) => {
+                            const { badgeClass, textClass, text } = refillInfo(s);
+                            return <Text className={`px-2 py-0.5 text-[8px] font-black rounded-lg self-start ${badgeClass} ${textClass}`}>{text}</Text>;
+                          },
+                        },
+                      ] as DataTableColumn<Store>[]}
+                    />
                   );
-                })}
-              </View>
+                }
+
+                return (
+                  <View className="gap-2.5 md:flex-row md:flex-wrap">
+                    {data.stores.map(s => {
+                      const { badgeClass, textClass, text } = refillInfo(s);
+                      return (
+                        <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
+                          <View><Text className="font-bold text-slate-800 text-xs">{s.name}</Text><Text className="text-slate-400 text-[9px] mt-0.5">Cycle: {s.refill_frequency} - Last: {s.last_purchase_date || 'N/A'}</Text></View>
+                          <Text className={`px-2.5 py-1 text-[9px] font-black rounded-lg ${badgeClass} ${textClass}`}>{text}</Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                );
+              })()}
             </View>
           )}
 
@@ -1479,22 +3882,37 @@ export default function AdminSales({ data, setData, addNotification, currentUser
             <View className="gap-3">
               <View className="flex-row bg-slate-50 p-1 rounded-xl border border-slate-200">
                 {([30, 60, 90] as const).map(days => (
-                  <Pressable key={days} onPress={() => setInactiveDaysTab(days)} className={`flex-1 py-1 rounded-lg items-center ${inactiveDaysTab === days ? 'bg-white' : ''}`}>
-                    <Text className={`text-[10px] font-extrabold ${inactiveDaysTab === days ? 'text-slate-800' : 'text-slate-400'}`}>No order in {days} Days</Text>
+                  <Pressable key={days} onPress={() => setInactiveDaysTab(days)} className={`flex-1 py-1 rounded-lg items-center ${inactiveDaysTab === days ? 'bg-indigo-600' : ''}`}>
+                    <Text className={`text-[10px] font-extrabold ${inactiveDaysTab === days ? 'text-white' : 'text-slate-400'}`}>No order in {days} Days</Text>
                   </Pressable>
                 ))}
               </View>
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {getInactiveStores(inactiveDaysTab).map(s => (
-                  <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
-                    <View><Text className="font-bold text-slate-800 text-xs">{s.name}</Text><Text className="text-slate-400 text-[10px] mt-0.5">Area: {s.area} - Last: {s.last_purchase_date || 'NEVER'}</Text></View>
-                    <Text className="bg-red-50 text-red-600 font-extrabold text-[9px] px-2 py-0.5 rounded-full border border-red-100">WARNING</Text>
-                  </View>
-                ))}
-                {getInactiveStores(inactiveDaysTab).length === 0 && (
-                  <Text className="py-6 text-center text-slate-400 italic bg-white rounded-2xl border border-slate-200 text-xs">No partner stores found in this inactivity range.</Text>
-                )}
-              </View>
+              <ViewToggle />
+              {viewMode === 'table' ? (
+                <DataTable
+                  data={getInactiveStores(inactiveDaysTab)}
+                  keyExtractor={s => s.id}
+                  emptyText="No partner stores found in this inactivity range."
+                  columns={[
+                    { key: 'store', label: 'Store', width: 180, render: (s: Store) => <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text> },
+                    { key: 'area', label: 'Area', width: 120, render: (s: Store) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{s.area}</Text> },
+                    { key: 'last', label: 'Last Purchase', width: 110, render: (s: Store) => <Text className="text-[10px] text-slate-600">{s.last_purchase_date || 'NEVER'}</Text> },
+                    { key: 'status', label: 'Status', width: 90, grow: false, render: () => <Text className="bg-red-50 text-red-600 font-extrabold text-[8px] px-2 py-0.5 rounded-full border border-red-100 self-start">WARNING</Text> },
+                  ] as DataTableColumn<Store>[]}
+                />
+              ) : (
+                <View className="gap-2.5 md:flex-row md:flex-wrap">
+                  {getInactiveStores(inactiveDaysTab).map(s => (
+                    <View key={s.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between">
+                      <View><Text className="font-bold text-slate-800 text-xs">{s.name}</Text><Text className="text-slate-400 text-[10px] mt-0.5">Area: {s.area} - Last: {s.last_purchase_date || 'NEVER'}</Text></View>
+                      <Text className="bg-red-50 text-red-600 font-extrabold text-[9px] px-2 py-0.5 rounded-full border border-red-100">WARNING</Text>
+                    </View>
+                  ))}
+                  {getInactiveStores(inactiveDaysTab).length === 0 && (
+                    <Text className="py-6 text-center text-slate-400 italic bg-white rounded-2xl border border-slate-200 text-xs">No partner stores found in this inactivity range.</Text>
+                  )}
+                </View>
+              )}
             </View>
           )}
 
@@ -1510,89 +3928,165 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   <Text className="text-white font-bold text-[10px]">New Pre-Booking</Text>
                 </Pressable>
               </View>
-              <View className="relative justify-center lg:max-w-sm">
-                <View className="absolute left-3 z-10"><Search size={16} color="#94a3b8" /></View>
-                <TextInput value={preBookingSearch} onChangeText={setPreBookingSearch} placeholder="Search by Outlet name or Pre-Booking ID..." placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 pl-9 pr-4 py-2.5 text-xs rounded-xl" />
-              </View>
-              {!hideAdminControls && (
-                <View className="gap-1">
-                  <Text className="text-[9px] font-bold text-slate-400 uppercase">Fulfillment Status</Text>
-                  <View className="flex-row flex-wrap gap-1.5">
-                    {(['All', 'Booked', 'Delivered', 'Cancelled'] as const).map(status => (
-                      <Pressable key={status} onPress={() => setPreBookingStatusFilter(status)} className={`px-2.5 py-1 rounded-lg border ${preBookingStatusFilter === status ? 'bg-blue-600 border-blue-600' : 'bg-white border-slate-200'}`}>
-                        <Text className={`text-[10px] font-bold ${preBookingStatusFilter === status ? 'text-white' : 'text-slate-600'}`}>{status === 'Booked' ? 'Active / Booked' : status}</Text>
-                      </Pressable>
-                    ))}
-                  </View>
-                </View>
-              )}
-              {renderDateFilterBar()}
-              <View className="gap-2.5 md:flex-row md:flex-wrap">
-                {(() => {
-                  const preBookingsList = data.preBookingOrders || [];
-                  const filteredPreBookings = preBookingsList.filter(pb => {
-                    if (hideAdminControls && pb.status !== 'Booked') return false;
-                    const store = data.stores.find(s => s.id === pb.store_id);
-                    const searchMatch = !preBookingSearch || pb.id.toLowerCase().includes(preBookingSearch.toLowerCase()) || (store && store.name.toLowerCase().includes(preBookingSearch.toLowerCase()));
-                    if (!searchMatch) return false;
-                    if (!isWithinDateFilter(pb.scheduled_delivery_date)) return false;
-                    if (!hideAdminControls && preBookingStatusFilter !== 'All' && pb.status !== preBookingStatusFilter) return false;
-                    return true;
-                  });
-                  if (filteredPreBookings.length === 0) {
-                    return <Text className="text-center text-slate-400 italic py-8 bg-white border border-slate-200 rounded-2xl text-xs">No pre-booking orders match the current filters.</Text>;
-                  }
-                  return filteredPreBookings.map(pb => {
-                    const store = data.stores.find(s => s.id === pb.store_id);
-                    const itemsCount = pb.items.reduce((s, i) => s + i.quantity, 0);
-                    const orderVal = pb.items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
-                    const bookedBy = resolveActor(data.users, pb.salesperson_id);
-                    return (
-                      <View key={pb.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 gap-2">
-                        <View className="flex-row items-start justify-between">
-                          <View className="flex-1 pr-2">
-                            <View className="flex-row items-center gap-2 flex-wrap">
-                              <Text className="font-extrabold text-slate-800 text-xs">{store?.name}</Text>
-                              <Text className="text-[8px] bg-slate-100 text-slate-400 font-bold uppercase px-1 rounded">{pb.id}</Text>
-                            </View>
-                            <Text className="text-slate-400 text-[10px] mt-0.5">{itemsCount} units - Rs {orderVal.toFixed(2)}</Text>
-                            <View className="flex-row items-center gap-1 mt-1">
-                              <Text className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded">Booked by: {bookedBy.name} ({bookedBy.role})</Text>
-                            </View>
-                            <Text className="text-[9px] text-slate-400 mt-1">Booked: {new Date(pb.created_at).toLocaleDateString()} - Scheduled: {new Date(pb.scheduled_delivery_date).toLocaleDateString()}</Text>
-                            {pb.notes && <Text className="text-slate-500 italic text-[9px] bg-slate-50 p-1.5 rounded-lg border border-slate-100 mt-1">Note: {pb.notes}</Text>}
-                          </View>
-                          <Text className={`px-2 py-0.5 font-bold rounded text-[8px] uppercase ${pb.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : pb.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{pb.status}</Text>
-                        </View>
-                        <View className="border-t border-slate-100 pt-2 gap-1">
-                          <Text className="text-[9px] font-bold text-slate-400 uppercase">Pre-booked Cargo:</Text>
-                          {pb.items.map((item, idx) => {
-                            const p = data.products.find(prod => prod.id === item.product_id);
-                            const basis = p && item.unit_price === p.wholesale_price ? 'Wholesale' : p && item.unit_price === p.selling_price ? 'Selling' : '';
+              <FilterBar searchValue={preBookingSearch} onSearchChange={setPreBookingSearch} searchPlaceholder="Search by Outlet name or Pre-Booking ID...">
+                {!hideAdminControls && (
+                  <SelectField
+                    value={preBookingStatusFilter}
+                    onValueChange={v => setPreBookingStatusFilter(v as typeof preBookingStatusFilter)}
+                    options={[
+                      { label: 'All Statuses', value: 'All' },
+                      { label: 'Active / Booked', value: 'Booked' },
+                      { label: 'Delivered', value: 'Delivered' },
+                      { label: 'Cancelled', value: 'Cancelled' },
+                    ]}
+                    title="Fulfillment Status"
+                    className={FILTER_PILL_CLASS}
+                    textClassName={FILTER_PILL_TEXT_CLASS}
+                  />
+                )}
+                {renderDateFilterField()}
+              </FilterBar>
+
+              <ScrollableSection height={preBookingsTableHeight}>
+              {(() => {
+                const filteredPreBookings = preBookings.data;
+
+                if (preBookings.loading && filteredPreBookings.length === 0) {
+                  return <View className="flex-1 items-center justify-center"><Text className="text-center text-slate-400 italic text-xs">Loading pre-booking orders...</Text></View>;
+                }
+                if (preBookings.error) {
+                  return <View className="flex-1 items-center justify-center"><Text className="text-center text-red-500 italic text-xs">{preBookings.error}</Text></View>;
+                }
+
+                if (viewMode === 'table') {
+                  return (
+                    <DataTable
+                      data={filteredPreBookings}
+                      keyExtractor={pb => pb.id}
+                      emptyText="No pre-booking orders match the current filters."
+                      columns={[
+                        {
+                          key: 'store', label: 'Store / Booking ID', width: 180,
+                          render: (pb: PreBookingOrder) => {
+                            const store = data.stores.find(s => s.id === pb.store_id);
                             return (
-                              <View key={idx} className="flex-row justify-between bg-slate-50 p-1 rounded">
-                                <Text className="text-[9px] text-slate-600">{p?.name || item.product_id}</Text>
-                                <Text className="font-extrabold text-slate-800 text-[9px]">{item.quantity} units - Rs{item.unit_price.toFixed(2)}{basis ? ` (${basis})` : ''}</Text>
+                              <View>
+                                <Text className="font-extrabold text-slate-800 text-[11px]" numberOfLines={1}>{store?.name}</Text>
+                                <Text className="text-[8px] bg-slate-100 text-slate-400 font-bold uppercase px-1 rounded self-start mt-0.5">{pb.id}</Text>
                               </View>
                             );
-                          })}
-                        </View>
-                        {pb.status === 'Booked' && (
-                          <View className="flex-row gap-2 justify-end pt-2 border-t border-slate-100">
-                            {!hideAdminControls && (
-                              <>
-                                <Pressable onPress={() => handleOpenEditPreBooking(pb)} className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100"><Text className="text-slate-600 font-bold text-[9px]">Edit</Text></Pressable>
-                                <Pressable onPress={() => { const grandTotal = pb.items.reduce((sum, item) => sum + (item.quantity * item.unit_price * (1 + item.tax_pct / 100)), 0); setPreBookingSettleAmount(parseFloat(grandTotal.toFixed(2))); setPreBookingSettleMethod('UPI'); setPreBookingConfirmAction({ bookingId: pb.id, action: 'deliver' }); }} className="px-2.5 py-1 bg-emerald-50 border border-emerald-200 rounded-lg active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Confirm Delivery</Text></Pressable>
-                              </>
-                            )}
-                            <Pressable onPress={() => setPreBookingConfirmAction({ bookingId: pb.id, action: 'cancel' })} className="px-2.5 py-1 bg-red-50 border border-red-200 rounded-lg active:bg-red-100"><Text className="text-red-600 font-bold text-[9px]">Cancel</Text></Pressable>
-                          </View>
-                        )}
+                          },
+                        },
+                        {
+                          key: 'booked_by', label: 'Booked By', width: 130,
+                          render: (pb: PreBookingOrder) => {
+                            const bookedBy = resolveActor(data.users, pb.salesperson_id);
+                            return <Text className="text-[10px] text-slate-600" numberOfLines={1}>{bookedBy.name} ({bookedBy.role})</Text>;
+                          },
+                        },
+                        { key: 'scheduled', label: 'Scheduled Date', width: 100, render: (pb: PreBookingOrder) => <Text className="text-[9px] text-slate-400">{new Date(pb.scheduled_delivery_date).toLocaleDateString()}</Text> },
+                        {
+                          key: 'value', label: 'Value', width: 90, align: 'right' as const,
+                          render: (pb: PreBookingOrder) => {
+                            const orderVal = pb.items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
+                            return <Text className="text-[10px] font-bold text-slate-700 text-right">Rs {orderVal.toFixed(2)}</Text>;
+                          },
+                        },
+                        {
+                          key: 'status', label: 'Status', width: 90, grow: false,
+                          render: (pb: PreBookingOrder) => <Text className={`px-2 py-0.5 font-bold rounded text-[8px] uppercase self-start ${pb.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : pb.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{pb.status}</Text>,
+                        },
+                        {
+                          key: 'actions', label: 'Actions', width: 160, grow: false,
+                          render: (pb: PreBookingOrder) => (
+                            <View className="flex-row flex-wrap items-center gap-1">
+                              <Pressable onPress={() => openPreBookingViewer(pb)} className="p-1 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100"><Eye size={12} color="#475569" /></Pressable>
+                              <Pressable onPress={() => handleDownloadPreBookingPdf(pb)} className="p-1 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100"><Download size={12} color="#475569" /></Pressable>
+                              {pb.status === 'Booked' && (
+                                <>
+                                  {!hideAdminControls && (
+                                    <>
+                                      <Pressable onPress={() => handleOpenEditPreBooking(pb)} className="px-1.5 py-0.5 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100"><Text className="text-slate-600 font-bold text-[8px]">Edit</Text></Pressable>
+                                      <Pressable onPress={() => { const grandTotal = computeInvoiceTotals(pb.items).grand_total; setPreBookingSettleAmount(grandTotal); setPreBookingSettleMethod('UPI'); setPreBookingConfirmAction({ bookingId: pb.id, action: 'deliver' }); }} className="px-1.5 py-0.5 bg-emerald-50 border border-emerald-200 rounded-lg active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[8px]">Confirm</Text></Pressable>
+                                    </>
+                                  )}
+                                  <Pressable onPress={() => setPreBookingConfirmAction({ bookingId: pb.id, action: 'cancel' })} className="px-1.5 py-0.5 bg-red-50 border border-red-200 rounded-lg active:bg-red-100"><Text className="text-red-600 font-bold text-[8px]">Cancel</Text></Pressable>
+                                </>
+                              )}
+                            </View>
+                          ),
+                        },
+                      ] as DataTableColumn<PreBookingOrder>[]}
+                    />
+                  );
+                }
+
+                return (
+                  <View className={`gap-2.5 md:flex-row md:flex-wrap ${filteredPreBookings.length === 0 ? 'flex-1' : ''}`}>
+                    {filteredPreBookings.length === 0 ? (
+                      <View className="flex-1 items-center justify-center w-full bg-white border border-slate-200 rounded-2xl py-8">
+                        <Text className="text-center text-slate-400 italic text-xs">No pre-booking orders match the current filters.</Text>
                       </View>
-                    );
-                  });
-                })()}
-              </View>
+                    ) : (
+                      filteredPreBookings.map(pb => {
+                        const store = data.stores.find(s => s.id === pb.store_id);
+                        const itemsCount = pb.items.reduce((s, i) => s + i.quantity, 0);
+                        const orderVal = pb.items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
+                        const bookedBy = resolveActor(data.users, pb.salesperson_id);
+                        return (
+                          <View key={pb.id} className="w-full md:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 gap-2">
+                            <View className="flex-row items-start justify-between">
+                              <View className="flex-1 pr-2">
+                                <View className="flex-row items-center gap-2 flex-wrap">
+                                  <Text className="font-extrabold text-slate-800 text-xs">{store?.name}</Text>
+                                  <Text className="text-[8px] bg-slate-100 text-slate-400 font-bold uppercase px-1 rounded">{pb.id}</Text>
+                                </View>
+                                <Text className="text-slate-400 text-[10px] mt-0.5">{itemsCount} units - Rs {orderVal.toFixed(2)}</Text>
+                                <View className="flex-row items-center gap-1 mt-1">
+                                  <Text className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded">Booked by: {bookedBy.name} ({bookedBy.role})</Text>
+                                </View>
+                                <Text className="text-[9px] text-slate-400 mt-1">Booked: {new Date(pb.created_at).toLocaleDateString()} - Scheduled: {new Date(pb.scheduled_delivery_date).toLocaleDateString()}</Text>
+                                {pb.notes && <Text className="text-slate-500 italic text-[9px] bg-slate-50 p-1.5 rounded-lg border border-slate-100 mt-1">Note: {pb.notes}</Text>}
+                              </View>
+                              <Text className={`px-2 py-0.5 font-bold rounded text-[8px] uppercase ${pb.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : pb.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{pb.status}</Text>
+                            </View>
+                            <View className="border-t border-slate-100 pt-2 gap-1">
+                              <Text className="text-[9px] font-bold text-slate-400 uppercase">Pre-booked Cargo:</Text>
+                              {pb.items.map((item, idx) => {
+                                const p = data.products.find(prod => prod.id === item.product_id);
+                                const basis = p && item.unit_price === p.wholesale_price ? 'Wholesale' : p && item.unit_price === p.selling_price ? 'Selling' : '';
+                                return (
+                                  <View key={idx} className="flex-row justify-between bg-slate-50 p-1 rounded">
+                                    <Text className="text-[9px] text-slate-600">{p?.name || item.product_id}</Text>
+                                    <Text className="font-extrabold text-slate-800 text-[9px]">{item.quantity} units - Rs{item.unit_price.toFixed(2)}{basis ? ` (${basis})` : ''}</Text>
+                                  </View>
+                                );
+                              })}
+                            </View>
+                            <View className="flex-row gap-2 justify-end pt-2 border-t border-slate-100">
+                              <Pressable onPress={() => openPreBookingViewer(pb)} className="p-1.5 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100"><Eye size={14} color="#475569" /></Pressable>
+                              <Pressable onPress={() => handleDownloadPreBookingPdf(pb)} className="p-1.5 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100"><Download size={14} color="#475569" /></Pressable>
+                              {pb.status === 'Booked' && (
+                                <>
+                                  {!hideAdminControls && (
+                                    <>
+                                      <Pressable onPress={() => handleOpenEditPreBooking(pb)} className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100"><Text className="text-slate-600 font-bold text-[9px]">Edit</Text></Pressable>
+                                      <Pressable onPress={() => { const grandTotal = computeInvoiceTotals(pb.items).grand_total; setPreBookingSettleAmount(grandTotal); setPreBookingSettleMethod('UPI'); setPreBookingConfirmAction({ bookingId: pb.id, action: 'deliver' }); }} className="px-2.5 py-1 bg-emerald-50 border border-emerald-200 rounded-lg active:bg-emerald-100"><Text className="text-emerald-600 font-bold text-[9px]">Confirm Delivery</Text></Pressable>
+                                    </>
+                                  )}
+                                  <Pressable onPress={() => setPreBookingConfirmAction({ bookingId: pb.id, action: 'cancel' })} className="px-2.5 py-1 bg-red-50 border border-red-200 rounded-lg active:bg-red-100"><Text className="text-red-600 font-bold text-[9px]">Cancel</Text></Pressable>
+                                </>
+                              )}
+                            </View>
+                          </View>
+                        );
+                      })
+                    )}
+                  </View>
+                );
+              })()}
+              </ScrollableSection>
+              <PaginationFooter mode="offset" page={preBookings.page} totalPages={preBookings.totalPages} total={preBookings.total} loading={preBookings.loading} onPageChange={preBookings.goToPage} />
             </View>
           )}
         </View>
@@ -1612,7 +4106,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
           try {
             await suppliersApi.setStatus(supplierToDelete.id, 'Inactive');
             await refreshData();
-            addNotification('partner_update', `Supplier "${supplierToDelete.name}" has been deactivated.`);
+            addNotification('partner_update', `Supplier "${supplierToDelete.name}" has been deactivated.`, 'supplier', supplierToDelete.id);
           } catch (e: any) {
             showAlert(e.message ?? 'Unable to deactivate supplier.');
           } finally {
@@ -1635,13 +4129,24 @@ export default function AdminSales({ data, setData, addNotification, currentUser
           try {
             await storesApi.setStatus(storeToDelete.id, 'Inactive');
             await refreshData();
-            addNotification('partner_update', `Partner store "${storeToDelete.name}" has been deactivated.`);
+            addNotification('partner_update', `Partner store "${storeToDelete.name}" has been deactivated.`, 'store', storeToDelete.id);
           } catch (e: any) {
             showAlert(e.message ?? 'Unable to deactivate store.');
           } finally {
             setDeleteStoreConfirmId(null);
           }
         }}
+      />
+
+      <ConfirmModal
+        visible={!!deleteAreaConfirmId}
+        onClose={() => setDeleteAreaConfirmId(null)}
+        icon={AlertTriangle}
+        title="Delete District Area?"
+        message="Are you sure you want to delete this district area? This can't be undone. Areas still used by a partner outlet can't be deleted - move those outlets to a different area first."
+        confirmLabel="Yes, Delete"
+        cancelLabel="No, Keep"
+        onConfirm={handleConfirmDeleteArea}
       />
 
       <ConfirmModal
@@ -1654,6 +4159,62 @@ export default function AdminSales({ data, setData, addNotification, currentUser
         cancelLabel="No, Keep Order"
         onConfirm={() => { if (cancelOrderConfirmId) { executeCancelOrder(cancelOrderConfirmId); setCancelOrderConfirmId(null); } }}
       />
+
+      <ConfirmModal
+        visible={!!deleteOrderConfirmId}
+        onClose={() => setDeleteOrderConfirmId(null)}
+        icon={AlertTriangle}
+        title="Permanently Delete This Order?"
+        message="This action is irreversible. The order and its invoice will be permanently removed, its item quantities will be returned to warehouse stock, any outstanding balance it added to the store will be reversed, and any payments collected against it will be removed from collection totals."
+        confirmLabel="Yes, Delete Order"
+        cancelLabel="No, Keep Order"
+        confirmColor="bg-rose-600"
+        onConfirm={() => { if (deleteOrderConfirmId) { executeDeleteOrder(deleteOrderConfirmId); setDeleteOrderConfirmId(null); } }}
+      />
+
+      <ConfirmModal
+        visible={showConfirmOrderDialog}
+        onClose={() => setShowConfirmOrderDialog(false)}
+        icon={Check}
+        iconBg="bg-emerald-50"
+        iconColor="#059669"
+        title="Confirm This Order?"
+        message="Please make sure the selected products, quantities, and prices are all correct. If anything needs changing, go back and update the order first."
+        confirmLabel="Yes, Details Are Correct"
+        confirmColor="bg-emerald-600"
+        cancelLabel="No, Let Me Review"
+        onConfirm={() => { setShowConfirmOrderDialog(false); handleProceedToPayment(); }}
+      />
+
+      <Modal visible={showUnsavedPricingModal} transparent animationType="fade" onRequestClose={() => setShowUnsavedPricingModal(false)}>
+        <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
+          <View className="bg-white w-full max-w-sm rounded-3xl p-6 relative">
+            <Pressable onPress={() => setShowUnsavedPricingModal(false)} className="absolute top-4 right-4 p-1 rounded-full z-10" hitSlop={8}>
+              <X size={16} color="#94a3b8" />
+            </Pressable>
+            <View className="items-center mt-2">
+              <View className="w-14 h-14 bg-amber-50 rounded-full items-center justify-center mb-4">
+                <AlertTriangle size={24} color="#d97706" />
+              </View>
+              <Text className="text-base font-black text-slate-800 tracking-tight text-center">Unsaved Changes</Text>
+              <Text className="text-xs text-slate-500 font-semibold mt-1.5 text-center leading-relaxed">
+                You have unsaved changes related to product pricing. Do you want to save them before leaving?
+              </Text>
+              <View className="w-full mt-6 gap-2">
+                <Pressable onPress={handleSaveAllPricingAndLeave} className="w-full py-2.5 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
+                  <Text className="text-white font-black text-xs">Save & Leave</Text>
+                </Pressable>
+                <Pressable onPress={leaveStorePricing} className="w-full py-2.5 bg-rose-50 rounded-xl items-center active:bg-rose-100">
+                  <Text className="text-rose-600 font-extrabold text-xs">Leave Without Saving</Text>
+                </Pressable>
+                <Pressable onPress={() => setShowUnsavedPricingModal(false)} className="w-full py-2.5 bg-slate-100 rounded-xl items-center active:bg-slate-200">
+                  <Text className="text-slate-700 font-extrabold text-xs">Cancel</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {preBookingConfirmAction && preBookingConfirmAction.action === 'cancel' && (() => {
         const booking = (data.preBookingOrders || []).find(o => o.id === preBookingConfirmAction.bookingId);
@@ -1678,7 +4239,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
       {preBookingConfirmAction && preBookingConfirmAction.action === 'deliver' && (() => {
         const booking = (data.preBookingOrders || []).find(o => o.id === preBookingConfirmAction.bookingId);
         if (!booking) return null;
-        const grandTotal = booking.items.reduce((sum, item) => sum + (item.quantity * item.unit_price * (1 + item.tax_pct / 100)), 0);
+        const grandTotal = computeInvoiceTotals(booking.items).grand_total;
         const isUnpaid = preBookingSettleMethod === 'Credit' || preBookingSettleAmount <= 0;
         const isPartial = !isUnpaid && preBookingSettleAmount < grandTotal - 0.05;
         let btnColor = 'bg-emerald-600 active:bg-emerald-700';
@@ -1690,18 +4251,31 @@ export default function AdminSales({ data, setData, addNotification, currentUser
           <Modal visible transparent animationType="fade" onRequestClose={() => setPreBookingConfirmAction(null)}>
             <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
               <ScrollView className="w-full max-w-sm" style={{ maxHeight: '92%' }} contentContainerStyle={{ flexGrow: 0 }}>
-                <View className="bg-white w-full rounded-3xl p-5 gap-3">
+                <View className="bg-white w-full rounded-3xl p-4 gap-2.5">
                   <Text className="text-base font-black text-slate-800 text-center">Confirm Delivery & Payment</Text>
-                  <Text className="text-xs text-slate-500 font-semibold text-center leading-relaxed">
+                  <Text className="text-[10px] text-slate-500 font-semibold text-center leading-relaxed">
                     Mark pre-booking {booking.id.toUpperCase()} as delivered and record how much was collected from the store.
                   </Text>
 
-                  <View className="bg-slate-50 rounded-xl p-3 flex-row justify-between items-center">
-                    <Text className="text-slate-400 font-bold text-[10px] uppercase">Bill Total</Text>
-                    <Text className="font-black text-indigo-600 text-sm">Rs {grandTotal.toFixed(2)}</Text>
+                  {/* Same product order as the picker (selection order), never alphabetical. */}
+                  <View className="bg-slate-50 rounded-xl p-2.5 gap-1">
+                    <Text className="text-slate-400 font-black text-[8px] uppercase mb-0.5">Pre-Booking Bill</Text>
+                    {booking.items.map(item => {
+                      const p = data.products.find(prod => prod.id === item.product_id);
+                      return (
+                        <View key={item.product_id} className="flex-row justify-between items-center">
+                          <Text numberOfLines={1} className="flex-1 text-slate-700 font-bold text-[10px] pr-2">{p?.name || 'Unknown'} <Text className="text-slate-400 font-semibold">x{item.quantity}</Text></Text>
+                          <Text className="text-slate-600 font-bold text-[10px]">Rs {(item.quantity * item.unit_price).toFixed(2)}</Text>
+                        </View>
+                      );
+                    })}
+                    <View className="flex-row justify-between items-center border-t border-slate-200 mt-1 pt-1">
+                      <Text className="text-slate-400 font-bold text-[10px] uppercase">Bill Total</Text>
+                      <Text className="font-black text-indigo-600 text-sm">Rs {formatWholeRupees(grandTotal)}</Text>
+                    </View>
                   </View>
 
-                  <View className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 gap-3">
+                  <View className="bg-indigo-50 border border-indigo-100 rounded-2xl p-3 gap-2">
                     <Text className="font-extrabold text-indigo-900 text-xs uppercase">Record Settlement</Text>
                     <View className="flex-row gap-2">
                       <Pressable onPress={() => { setPreBookingSettleMethod('UPI'); setPreBookingSettleAmount(parseFloat(grandTotal.toFixed(2))); }} className={`flex-1 py-2.5 rounded-xl border items-center ${!isPartial && !isUnpaid ? 'bg-emerald-600 border-emerald-600' : 'bg-white border-indigo-100'}`}>
@@ -1736,8 +4310,10 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                         <TextInput
                           editable={preBookingSettleMethod !== 'Credit'}
                           keyboardType="decimal-pad"
-                          value={String(preBookingSettleAmount)}
+                          value={preBookingSettleAmount === 0 ? '' : String(preBookingSettleAmount)}
                           onChangeText={v => setPreBookingSettleAmount(Math.max(0, Math.min(grandTotal, parseFloat(v) || 0)))}
+                          placeholder="0"
+                          placeholderTextColor="#94a3b8"
                           className={`w-full border border-indigo-200 font-black text-indigo-900 rounded-xl p-2.5 ${preBookingSettleMethod === 'Credit' ? 'bg-slate-100 text-slate-400' : 'bg-white'}`}
                         />
                       </View>
@@ -1750,14 +4326,14 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                     )}
                     {isUnpaid && (
                       <View className="bg-rose-50 border border-rose-200 rounded-xl p-2">
-                        <Text className="text-[10px] text-rose-700 font-bold">Full amount Rs {grandTotal.toFixed(2)} will be added to store outstanding credit.</Text>
+                        <Text className="text-[10px] text-rose-700 font-bold">Full amount Rs {formatWholeRupees(grandTotal)} will be added to store outstanding credit.</Text>
                       </View>
                     )}
 
                     {preBookingSettleMethod === 'UPI' && (
-                      <View className="bg-white border border-slate-200 rounded-2xl p-3 items-center gap-2">
-                        <Image source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=upi://pay?pa=distributor@ic-erp&pn=Ice%20Cream%20Distributors&am=${preBookingSettleAmount}&cu=INR` }} className="w-32 h-32" />
-                        <Text className="text-[9px] font-black text-slate-500 uppercase">Scan via GPay, PhonePe, Paytm, BHIM UPI</Text>
+                      <View className="bg-white border border-slate-200 rounded-xl p-2 flex-row items-center gap-2.5">
+                        <Image source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=100x100&data=upi://pay?pa=distributor@ic-erp&pn=Ice%20Cream%20Distributors&am=${preBookingSettleAmount}&cu=INR` }} className="w-16 h-16" />
+                        <Text className="flex-1 text-[9px] font-black text-slate-500 uppercase">Scan via GPay, PhonePe, Paytm, BHIM UPI</Text>
                       </View>
                     )}
                   </View>
@@ -1770,6 +4346,114 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                       <Text className="text-slate-700 font-extrabold text-xs">Cancel</Text>
                     </Pressable>
                   </View>
+                </View>
+              </ScrollView>
+            </View>
+          </Modal>
+        );
+      })()}
+
+      {pendingNewOrder && showNewOrderPaymentModal && (() => {
+        const grandTotal = pendingNewOrder.grandTotal;
+        const isUnpaid = newOrderSettleMethod === 'Credit' || newOrderSettleAmount <= 0;
+        const isPartial = !isUnpaid && newOrderSettleAmount < grandTotal - 0.05;
+        let btnColor = 'bg-emerald-600 active:bg-emerald-700';
+        let btnLabel = `Confirm Order — Fully Paid (Rs ${newOrderSettleAmount.toFixed(2)})`;
+        if (isPartial) { btnColor = 'bg-amber-600 active:bg-amber-700'; btnLabel = `Confirm Order — Partial Payment (Rs ${newOrderSettleAmount.toFixed(2)})`; }
+        else if (isUnpaid) { btnColor = 'bg-rose-600 active:bg-rose-700'; btnLabel = 'Confirm Order — Unpaid (100% Credit)'; }
+
+        return (
+          <Modal visible transparent animationType="fade" onRequestClose={() => {}}>
+            <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
+              <ScrollView className="w-full max-w-sm" style={{ maxHeight: '92%' }} contentContainerStyle={{ flexGrow: 0 }}>
+                <View className="bg-white w-full rounded-3xl p-4 gap-2.5">
+                  <View className="flex-row items-center justify-between">
+                    <Pressable onPress={handleSkipNewOrderPayment} className="py-1"><Text className="text-slate-400 text-xs font-bold">Back</Text></Pressable>
+                    <Text className="text-base font-black text-slate-800">Collect Payment</Text>
+                    <View style={{ width: 34 }} />
+                  </View>
+                  <Text className="text-[10px] text-slate-500 font-semibold text-center leading-relaxed">
+                    Confirm how much will be collected from {pendingNewOrder.storeName} — the order is only created once you confirm.
+                  </Text>
+
+                  {/* Full item breakdown was already reviewed on the Order Confirmation page. */}
+                  <View className="bg-slate-50 rounded-xl p-2.5 gap-1">
+                    <View className="flex-row justify-between items-center">
+                      <Text className="text-slate-400 font-semibold text-[9px] uppercase">Round Off</Text>
+                      <Text className="font-bold text-slate-500 text-[10px]">{pendingNewOrder.roundOff > 0 ? '+' : ''}Rs {pendingNewOrder.roundOff.toFixed(2)}</Text>
+                    </View>
+                    <View className="flex-row justify-between items-center">
+                      <Text className="text-slate-400 font-bold text-[10px] uppercase">Net Amount (Bill Total)</Text>
+                      <Text className="font-black text-indigo-600 text-sm">Rs {formatWholeRupees(grandTotal)}</Text>
+                    </View>
+                  </View>
+
+                  <View className="bg-indigo-50 border border-indigo-100 rounded-2xl p-3 gap-2">
+                    <Text className="font-extrabold text-indigo-900 text-xs uppercase">Record Settlement</Text>
+                    <View className="flex-row gap-2">
+                      <Pressable onPress={() => { setNewOrderSettleMethod('UPI'); setNewOrderSettleAmount(parseFloat(grandTotal.toFixed(2))); }} className={`flex-1 py-2.5 rounded-xl border items-center ${!isPartial && !isUnpaid ? 'bg-emerald-600 border-emerald-600' : 'bg-white border-indigo-100'}`}>
+                        <Text className={`font-extrabold text-[10px] ${!isPartial && !isUnpaid ? 'text-white' : 'text-slate-700'}`}>Fully Paid</Text>
+                      </Pressable>
+                      <Pressable onPress={() => { setNewOrderSettleMethod('UPI'); setNewOrderSettleAmount(parseFloat((grandTotal / 2).toFixed(2))); }} className={`flex-1 py-2.5 rounded-xl border items-center ${isPartial ? 'bg-amber-500 border-amber-500' : 'bg-white border-indigo-100'}`}>
+                        <Text className={`font-extrabold text-[10px] ${isPartial ? 'text-white' : 'text-slate-700'}`}>Partial Paid</Text>
+                      </Pressable>
+                      <Pressable onPress={() => { setNewOrderSettleMethod('Credit'); setNewOrderSettleAmount(0); }} className={`flex-1 py-2.5 rounded-xl border items-center ${isUnpaid ? 'bg-rose-600 border-rose-600' : 'bg-white border-indigo-100'}`}>
+                        <Text className={`font-extrabold text-[10px] ${isUnpaid ? 'text-white' : 'text-slate-700'}`}>No Payment</Text>
+                      </Pressable>
+                    </View>
+
+                    <View className="flex-row gap-2">
+                      <View className="flex-1">
+                        <Text className="font-bold text-indigo-700 mb-1 text-xs">Settlement Method</Text>
+                        <SelectField
+                          value={newOrderSettleMethod}
+                          onValueChange={v => {
+                            const prevMethod = newOrderSettleMethod;
+                            setNewOrderSettleMethod(v as any);
+                            if (v === 'Credit') setNewOrderSettleAmount(0);
+                            else if (prevMethod === 'Credit' || newOrderSettleAmount === 0) setNewOrderSettleAmount(parseFloat(grandTotal.toFixed(2)));
+                          }}
+                          options={preBookingMethodOptions}
+                          title="Select Method"
+                          className="bg-white border border-indigo-200 rounded-xl p-2.5 flex-row items-center justify-between"
+                        />
+                      </View>
+                      <View className="flex-1">
+                        <Text className="font-bold text-indigo-700 mb-1 text-xs">Settled Amount</Text>
+                        <TextInput
+                          editable={newOrderSettleMethod !== 'Credit'}
+                          keyboardType="decimal-pad"
+                          value={newOrderSettleAmount === 0 ? '' : String(newOrderSettleAmount)}
+                          onChangeText={v => setNewOrderSettleAmount(Math.max(0, Math.min(grandTotal, parseFloat(v) || 0)))}
+                          placeholder="0"
+                          placeholderTextColor="#94a3b8"
+                          className={`w-full border border-indigo-200 font-black text-indigo-900 rounded-xl p-2.5 ${newOrderSettleMethod === 'Credit' ? 'bg-slate-100 text-slate-400' : 'bg-white'}`}
+                        />
+                      </View>
+                    </View>
+
+                    {isPartial && (
+                      <View className="bg-amber-50 border border-amber-200 rounded-xl p-2">
+                        <Text className="text-[10px] text-amber-800 font-bold">Partial payment: Rs {(grandTotal - newOrderSettleAmount).toFixed(2)} outstanding will be automatically added to store credit.</Text>
+                      </View>
+                    )}
+                    {isUnpaid && (
+                      <View className="bg-rose-50 border border-rose-200 rounded-xl p-2">
+                        <Text className="text-[10px] text-rose-700 font-bold">Full amount Rs {formatWholeRupees(grandTotal)} will be added to store outstanding credit.</Text>
+                      </View>
+                    )}
+
+                    {newOrderSettleMethod === 'UPI' && (
+                      <View className="bg-white border border-slate-200 rounded-xl p-2 flex-row items-center gap-2.5">
+                        <Image source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=100x100&data=upi://pay?pa=distributor@ic-erp&pn=Ice%20Cream%20Distributors&am=${newOrderSettleAmount}&cu=INR` }} className="w-16 h-16" />
+                        <Text className="flex-1 text-[9px] font-black text-slate-500 uppercase">Scan via GPay, PhonePe, Paytm, BHIM UPI</Text>
+                      </View>
+                    )}
+                  </View>
+
+                  <Pressable onPress={handleSettleNewOrder} className={`w-full py-2.5 rounded-xl items-center ${btnColor}`}>
+                    <Text className="text-white font-black text-xs uppercase">{btnLabel}</Text>
+                  </Pressable>
                 </View>
               </ScrollView>
             </View>
@@ -1834,6 +4518,533 @@ export default function AdminSales({ data, setData, addNotification, currentUser
                   <Text className="text-slate-700 text-xs"><Text className="font-bold">Next Refill:</Text> {viewingStore.next_refill_date || 'N/A'}</Text>
                 </View>
                 <Pressable onPress={() => setViewingStore(null)} className="w-full py-2.5 bg-slate-100 rounded-2xl items-center active:bg-slate-200"><Text className="text-slate-700 font-bold text-xs">Close Portfolio</Text></Pressable>
+              </View>
+            </View>
+          );
+        })()}
+      </Modal>
+
+      <Modal visible={showClonePricingModal} transparent animationType="fade" onRequestClose={() => setShowClonePricingModal(false)}>
+        {pricingStore && (() => {
+          const sourceOverrideCount = data.storePricing.filter(sp => sp.store_id === pricingStore.id).length;
+          const cloneCandidates = data.stores
+            .filter(s => s.status === 'Active' && s.id !== pricingStore.id)
+            .filter(s => s.name.toLowerCase().includes(cloneStoreSearch.trim().toLowerCase()));
+          return (
+            <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
+              <View className="bg-white rounded-3xl border border-slate-200 p-5 max-w-xl w-full h-[85%]">
+                <View className="flex-row items-center justify-between border-b border-slate-100 pb-3 mb-3">
+                  <View>
+                    <Text className="font-extrabold text-slate-800 text-sm">Clone Custom Pricing</Text>
+                    <Text className="text-[10px] text-slate-400 mt-0.5">From {pricingStore.name} ({sourceOverrideCount} product{sourceOverrideCount === 1 ? '' : 's'})</Text>
+                  </View>
+                  <Pressable onPress={() => setShowClonePricingModal(false)}><Text className="text-slate-400 text-lg">x</Text></Pressable>
+                </View>
+
+                <View className="bg-amber-50 border border-amber-100 rounded-xl p-2.5 mb-3">
+                  <Text className="text-[10px] text-amber-700 font-semibold leading-relaxed">
+                    This replaces any existing custom pricing at the store(s) you select below with an exact copy of {pricingStore.name}'s price list.
+                  </Text>
+                </View>
+
+                <View className="flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 mb-3">
+                  <Search size={14} color="#94a3b8" />
+                  <TextInput
+                    value={cloneStoreSearch}
+                    onChangeText={setCloneStoreSearch}
+                    placeholder="Search destination stores..."
+                    placeholderTextColor="#94a3b8"
+                    className="flex-1 text-xs text-slate-800 py-2.5"
+                    style={{ outlineStyle: 'none' } as any}
+                  />
+                  {cloneStoreSearch.length > 0 && (
+                    <Pressable onPress={() => setCloneStoreSearch('')} hitSlop={8}>
+                      <X size={14} color="#94a3b8" />
+                    </Pressable>
+                  )}
+                </View>
+
+                <View className="flex-row items-center justify-between mb-2 px-0.5">
+                  <Text className="text-[10px] font-bold text-slate-500 uppercase">{cloneTargetStoreIds.length} store(s) selected</Text>
+                  {cloneCandidates.length > 0 && (
+                    <Pressable
+                      onPress={() => setCloneTargetStoreIds(
+                        cloneCandidates.every(s => cloneTargetStoreIds.includes(s.id))
+                          ? cloneTargetStoreIds.filter(id => !cloneCandidates.some(s => s.id === id))
+                          : [...new Set([...cloneTargetStoreIds, ...cloneCandidates.map(s => s.id)])]
+                      )}
+                    >
+                      <Text className="text-[10px] font-bold text-indigo-600">
+                        {cloneCandidates.every(s => cloneTargetStoreIds.includes(s.id)) ? 'Deselect All' : 'Select All'}
+                      </Text>
+                    </Pressable>
+                  )}
+                </View>
+
+                <ScrollView className="flex-1 mb-3">
+                  <View className="gap-1.5">
+                    {cloneCandidates.map(s => {
+                      const isSelected = cloneTargetStoreIds.includes(s.id);
+                      const existingCount = data.storePricing.filter(sp => sp.store_id === s.id).length;
+                      return (
+                        <Pressable
+                          key={s.id}
+                          onPress={() => toggleClonePricingTarget(s.id)}
+                          className={`flex-row items-center justify-between gap-2 p-2.5 rounded-lg border ${isSelected ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-100'}`}
+                        >
+                          <View className="flex-1 min-w-0">
+                            <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text>
+                            <Text className="text-slate-400 text-[9px]">{s.area}{existingCount > 0 ? ` - has ${existingCount} custom price(s) already` : ''}</Text>
+                          </View>
+                          <View className={`w-5 h-5 rounded border items-center justify-center ${isSelected ? 'bg-emerald-600 border-emerald-600' : 'bg-white border-slate-300'}`}>
+                            {isSelected && <Check size={13} color="#fff" />}
+                          </View>
+                        </Pressable>
+                      );
+                    })}
+                    {cloneCandidates.length === 0 && (
+                      <Text className="text-[10px] text-slate-400 italic py-4 text-center">No other partner stores match your search.</Text>
+                    )}
+                  </View>
+                </ScrollView>
+
+                <View className="flex-row gap-2">
+                  <Pressable onPress={handleConfirmClonePricing} className="flex-1 py-2.5 bg-emerald-600 rounded-2xl items-center active:bg-emerald-700 flex-row justify-center gap-1.5">
+                    <Copy size={14} color="#fff" />
+                    <Text className="text-white font-bold text-xs">Clone Pricing</Text>
+                  </Pressable>
+                  <Pressable onPress={() => setShowClonePricingModal(false)} className="flex-1 py-2.5 bg-slate-100 rounded-2xl items-center active:bg-slate-200"><Text className="text-slate-700 font-bold text-xs">Cancel</Text></Pressable>
+                </View>
+              </View>
+            </View>
+          );
+        })()}
+      </Modal>
+
+      <Modal visible={showCloneFromModal} transparent animationType="fade" onRequestClose={() => setShowCloneFromModal(false)}>
+        {pricingStore && (() => {
+          const sourceCandidates = data.stores
+            .filter(s => s.status === 'Active' && s.id !== pricingStore.id)
+            .filter(s => s.name.toLowerCase().includes(cloneFromStoreSearch.trim().toLowerCase()));
+          return (
+            <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
+              <View className="bg-white rounded-3xl border border-slate-200 p-5 max-w-xl w-full h-[85%]">
+                <View className="flex-row items-center justify-between border-b border-slate-100 pb-3 mb-3">
+                  <View>
+                    <Text className="font-extrabold text-slate-800 text-sm">Clone Custom Pricing</Text>
+                    <Text className="text-[10px] text-slate-400 mt-0.5">Into {pricingStore.name}</Text>
+                  </View>
+                  <Pressable onPress={() => setShowCloneFromModal(false)}><Text className="text-slate-400 text-lg">x</Text></Pressable>
+                </View>
+
+                <View className="bg-amber-50 border border-amber-100 rounded-xl p-2.5 mb-3">
+                  <Text className="text-[10px] text-amber-700 font-semibold leading-relaxed">
+                    This replaces {pricingStore.name}'s existing custom pricing with an exact copy of the source store's price list you select below.
+                  </Text>
+                </View>
+
+                <View className="flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 mb-3">
+                  <Search size={14} color="#94a3b8" />
+                  <TextInput
+                    value={cloneFromStoreSearch}
+                    onChangeText={setCloneFromStoreSearch}
+                    placeholder="Search source stores..."
+                    placeholderTextColor="#94a3b8"
+                    className="flex-1 text-xs text-slate-800 py-2.5"
+                    style={{ outlineStyle: 'none' } as any}
+                  />
+                  {cloneFromStoreSearch.length > 0 && (
+                    <Pressable onPress={() => setCloneFromStoreSearch('')} hitSlop={8}>
+                      <X size={14} color="#94a3b8" />
+                    </Pressable>
+                  )}
+                </View>
+
+                <Text className="text-[10px] font-bold text-slate-500 uppercase mb-2 px-0.5">Select one source store</Text>
+
+                <ScrollView className="flex-1 mb-3">
+                  <View className="gap-1.5">
+                    {sourceCandidates.map(s => {
+                      const isSelected = cloneSourceStoreId === s.id;
+                      const existingCount = data.storePricing.filter(sp => sp.store_id === s.id).length;
+                      return (
+                        <Pressable
+                          key={s.id}
+                          onPress={() => setCloneSourceStoreId(s.id)}
+                          className={`flex-row items-center justify-between gap-2 p-2.5 rounded-lg border ${isSelected ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-100'}`}
+                        >
+                          <View className="flex-1 min-w-0">
+                            <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{s.name}</Text>
+                            <Text className="text-slate-400 text-[9px]">{s.area}{existingCount > 0 ? ` - has ${existingCount} custom price(s)` : ' - no custom pricing yet'}</Text>
+                          </View>
+                          <View className={`w-5 h-5 rounded-full border items-center justify-center ${isSelected ? 'bg-indigo-600 border-indigo-600' : 'bg-white border-slate-300'}`}>
+                            {isSelected && <Check size={13} color="#fff" />}
+                          </View>
+                        </Pressable>
+                      );
+                    })}
+                    {sourceCandidates.length === 0 && (
+                      <Text className="text-[10px] text-slate-400 italic py-4 text-center">No other partner stores match your search.</Text>
+                    )}
+                  </View>
+                </ScrollView>
+
+                <View className="flex-row gap-2">
+                  <Pressable onPress={handleConfirmCloneFromPricing} className="flex-1 py-2.5 bg-indigo-600 rounded-2xl items-center active:bg-indigo-700 flex-row justify-center gap-1.5">
+                    <Copy size={14} color="#fff" />
+                    <Text className="text-white font-bold text-xs">Clone Pricing</Text>
+                  </Pressable>
+                  <Pressable onPress={() => setShowCloneFromModal(false)} className="flex-1 py-2.5 bg-slate-100 rounded-2xl items-center active:bg-slate-200"><Text className="text-slate-700 font-bold text-xs">Cancel</Text></Pressable>
+                </View>
+              </View>
+            </View>
+          );
+        })()}
+      </Modal>
+
+      <Modal visible={!!reportingStore} transparent animationType="fade" onRequestClose={() => setReportingStore(null)}>
+        {reportingStore && (() => {
+          const storeOrders = data.orders
+            .filter(o => o.store_id === reportingStore.id && isWithinDateFilterUtil(o.created_at, storeReportDateMode, storeReportFrom, storeReportTo))
+            .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+          let totalUnits = 0, totalPurchaseValue = 0, totalOutstanding = 0;
+          const rowsData = storeOrders.map(o => {
+            const inv = data.invoices.find(i => i.order_id === o.id);
+            const units = o.items.reduce((sum, item) => sum + item.quantity, 0);
+            const grandTotal = inv ? inv.grand_total : computeInvoiceTotals(o.items).grand_total;
+            const due = inv ? Math.max(0, inv.grand_total - (inv.paid_amount || 0)) : 0;
+            const isPaid = inv?.payment_status === 'Paid';
+            const isPartial = inv?.payment_status === 'Partial';
+            const paymentLabel = !inv ? null : isPaid ? 'Fully Paid' : isPartial ? 'Partial Paid' : 'Not Paid';
+            totalUnits += units;
+            totalPurchaseValue += grandTotal;
+            totalOutstanding += due;
+            return { order: o, invoice: inv, units, grandTotal, due, isPaid, isPartial, paymentLabel };
+          });
+          // Delivered pre-bookings already appear above as a real Order (see
+          // deliverPreBooking in the backend), so only Booked/Cancelled ones
+          // are shown here to avoid double-counting the same purchase twice.
+          const storePreBookings = (data.preBookingOrders || [])
+            .filter(pb => pb.store_id === reportingStore.id && pb.status !== 'Delivered' && isWithinDateFilterUtil(pb.scheduled_delivery_date, storeReportDateMode, storeReportFrom, storeReportTo))
+            .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+          const preBookingRows = storePreBookings.map(pb => {
+            const units = pb.items.reduce((sum, item) => sum + item.quantity, 0);
+            const grandTotal = computeInvoiceTotals(pb.items).grand_total;
+            return { booking: pb, units, grandTotal };
+          });
+          return (
+            <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
+              <View className="bg-white rounded-3xl border border-slate-200 p-5 max-w-xl w-full h-[85%]">
+                <View className="flex-row items-center justify-between border-b border-slate-100 pb-3 mb-3">
+                  <View>
+                    <Text className="font-extrabold text-slate-800 text-sm">Purchase Report</Text>
+                    <Text className="text-[10px] text-slate-400 mt-0.5">{reportingStore.name}</Text>
+                  </View>
+                  <Pressable onPress={() => setReportingStore(null)}><Text className="text-slate-400 text-lg">x</Text></Pressable>
+                </View>
+
+                <View className="mb-3 items-start">
+                  <DateRangeFilterField
+                    mode={storeReportDateMode}
+                    onModeChange={setStoreReportDateMode}
+                    customFrom={storeReportFrom}
+                    customTo={storeReportTo}
+                    onCustomFromChange={setStoreReportFrom}
+                    onCustomToChange={setStoreReportTo}
+                    title="Date Range"
+                  />
+                </View>
+
+                <View className="flex-row gap-2 mb-3">
+                  <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Orders</Text><Text className="text-xs font-black text-slate-800">{storeOrders.length}</Text></View>
+                  <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Units</Text><Text className="text-xs font-black text-slate-800">{totalUnits}</Text></View>
+                  <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Purchased</Text><Text className="text-xs font-black text-emerald-600">Rs{totalPurchaseValue.toFixed(0)}</Text></View>
+                  <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Due</Text><Text className={`text-xs font-black ${totalOutstanding > 0 ? 'text-red-500' : 'text-slate-800'}`}>Rs{totalOutstanding.toFixed(0)}</Text></View>
+                </View>
+
+                <ScrollView className="flex-1 mb-3">
+                  <Text className="font-bold text-slate-700 text-[9px] uppercase mb-1.5">Order Details ({storeOrders.length}) - tap to view, or use the download icon</Text>
+                  <View className="gap-1.5 mb-3">
+                    {rowsData.length === 0 ? (
+                      <Text className="text-[10px] text-slate-400 italic py-2 text-center">No orders in this date range.</Text>
+                    ) : (
+                      rowsData.map(({ order: o, invoice, units, grandTotal, due, isPaid, isPartial, paymentLabel }) => (
+                        <Pressable
+                          key={o.id}
+                          onPress={() => handleOpenOrderFromReport(o)}
+                          className="bg-slate-50 border border-slate-100 p-2 rounded-lg flex-row justify-between items-center active:bg-slate-100"
+                        >
+                          <View>
+                            <Text className="font-bold text-indigo-600 text-[9px]">#{o.id}</Text>
+                            <Text className="text-slate-400 text-[9px]">{new Date(o.created_at).toLocaleDateString('en-IN')} - {units} units</Text>
+                            <View className="flex-row items-center gap-1 mt-1">
+                              <Text className={`px-1.5 py-0.5 rounded-md font-bold text-[8px] uppercase ${o.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : o.status === 'Confirmed' ? 'bg-blue-50 text-blue-600' : 'bg-red-50 text-red-600'}`}>{o.status}</Text>
+                              {paymentLabel && (
+                                <Text className={`px-1.5 py-0.5 rounded-md font-bold text-[8px] uppercase ${isPaid ? 'bg-emerald-100 text-emerald-800' : isPartial ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>{paymentLabel}</Text>
+                              )}
+                            </View>
+                          </View>
+                          <View className="flex-row items-center gap-1.5">
+                            <View className="items-end">
+                              <Text className="font-bold text-slate-700 text-[9px]">Rs{formatWholeRupees(grandTotal)}</Text>
+                              {due > 0.01 && <Text className="font-bold text-rose-500 text-[8px] mt-0.5">Due Rs{formatWholeRupees(due)}</Text>}
+                            </View>
+                            {invoice && (
+                              <Pressable onPress={() => downloadInvoicePDF(o, invoice, reportingStore)} hitSlop={6} className="p-1.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100">
+                                <Download size={12} color="#4f46e5" />
+                              </Pressable>
+                            )}
+                            <Eye size={12} color="#94a3b8" />
+                          </View>
+                        </Pressable>
+                      ))
+                    )}
+                  </View>
+
+                  <Text className="font-bold text-slate-700 text-[9px] uppercase mb-1.5">Pre-Bookings ({storePreBookings.length}) - tap to view, or use the download icon</Text>
+                  <View className="gap-1.5">
+                    {preBookingRows.length === 0 ? (
+                      <Text className="text-[10px] text-slate-400 italic py-2 text-center">No active or cancelled pre-bookings in this date range.</Text>
+                    ) : (
+                      preBookingRows.map(({ booking: pb, units, grandTotal }) => (
+                        <Pressable
+                          key={pb.id}
+                          onPress={() => openPreBookingViewer(pb)}
+                          className="bg-indigo-50/40 border border-indigo-100 p-2 rounded-lg flex-row justify-between items-center active:bg-indigo-100/60"
+                        >
+                          <View>
+                            <Text className="font-bold text-indigo-600 text-[9px]">#{pb.id}</Text>
+                            <Text className="text-slate-400 text-[9px]">Scheduled: {new Date(pb.scheduled_delivery_date).toLocaleDateString('en-IN')} - {units} units</Text>
+                            <Text className={`px-1.5 py-0.5 rounded-md font-bold text-[8px] uppercase mt-1 self-start ${pb.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{pb.status}</Text>
+                          </View>
+                          <View className="flex-row items-center gap-1.5">
+                            <Text className="font-bold text-slate-700 text-[9px]">Rs{formatWholeRupees(grandTotal)}</Text>
+                            <Pressable onPress={() => handleDownloadPreBookingPdf(pb)} hitSlop={6} className="p-1.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100">
+                              <Download size={12} color="#4f46e5" />
+                            </Pressable>
+                            <Eye size={12} color="#94a3b8" />
+                          </View>
+                        </Pressable>
+                      ))
+                    )}
+                  </View>
+                </ScrollView>
+
+                <View className="flex-row gap-2">
+                  <Pressable onPress={handleExportStoreReport} className="flex-1 py-2.5 bg-emerald-50 border border-emerald-100 rounded-2xl items-center active:bg-emerald-100 flex-row justify-center gap-1.5">
+                    <Download size={14} color="#059669" />
+                    <Text className="text-emerald-600 font-bold text-xs">Download PDF</Text>
+                  </Pressable>
+                  <Pressable onPress={() => setReportingStore(null)} className="flex-1 py-2.5 bg-slate-100 rounded-2xl items-center active:bg-slate-200"><Text className="text-slate-700 font-bold text-xs">Close</Text></Pressable>
+                </View>
+              </View>
+            </View>
+          );
+        })()}
+      </Modal>
+
+      <Modal visible={!!reportingSupplier} transparent animationType="fade" onRequestClose={() => setReportingSupplier(null)}>
+        {reportingSupplier && (() => {
+          // Receipt count/units/spend stats still come from the already-loaded
+          // full data blob (cheap, no extra network cost) so they stay
+          // accurate across every matching receipt, not just the current
+          // page - only the receipts list below is paginated server-side.
+          const supplierPurchasesAll = data.purchases
+            .filter(p => p.supplier_id === reportingSupplier.id && isWithinDateFilterUtil(p.date, supplierReportDateMode, supplierReportFrom, supplierReportTo));
+          let totalUnits = 0, totalSpendVal = 0;
+          for (const p of supplierPurchasesAll) {
+            totalUnits += p.items.reduce((sum, item) => sum + item.quantity, 0);
+            totalSpendVal += p.items.reduce((sum, item) => sum + item.quantity * item.purchase_price, 0);
+          }
+          const rowsData = supplierPurchases.data.map(p => ({
+            purchase: p,
+            units: p.items.reduce((sum, item) => sum + item.quantity, 0),
+            value: p.items.reduce((sum, item) => sum + item.quantity * item.purchase_price, 0),
+          }));
+          return (
+            <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
+              <View className="bg-white rounded-3xl border border-slate-200 p-5 max-w-xl w-full h-[85%]">
+                <View className="flex-row items-center justify-between border-b border-slate-100 pb-3 mb-3">
+                  <View>
+                    <Text className="font-extrabold text-slate-800 text-sm">Purchase Report</Text>
+                    <Text className="text-[10px] text-slate-400 mt-0.5">{reportingSupplier.name}</Text>
+                  </View>
+                  <Pressable onPress={() => setReportingSupplier(null)}><Text className="text-slate-400 text-lg">x</Text></Pressable>
+                </View>
+
+                <View className="mb-3 items-start">
+                  <DateRangeFilterField
+                    mode={supplierReportDateMode}
+                    onModeChange={setSupplierReportDateMode}
+                    customFrom={supplierReportFrom}
+                    customTo={supplierReportTo}
+                    onCustomFromChange={setSupplierReportFrom}
+                    onCustomToChange={setSupplierReportTo}
+                    title="Date Range"
+                  />
+                </View>
+
+                <View className="flex-row gap-2 mb-3">
+                  <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Receipts</Text><Text className="text-xs font-black text-slate-800">{supplierPurchasesAll.length}</Text></View>
+                  <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Units</Text><Text className="text-xs font-black text-slate-800">{totalUnits}</Text></View>
+                  <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Total Spend</Text><Text className="text-xs font-black text-emerald-600">Rs{totalSpendVal.toFixed(0)}</Text></View>
+                </View>
+
+                <Text className="font-bold text-slate-700 text-[9px] uppercase mb-1.5">Stock Inward Receipts ({supplierPurchasesAll.length}) - tap a receipt to view its invoice</Text>
+                <ScrollableSection height={260}>
+                  <View className="gap-1.5 mb-3">
+                    {supplierPurchases.loading && rowsData.length === 0 ? (
+                      <Text className="text-[10px] text-slate-400 italic py-4 text-center">Loading receipts...</Text>
+                    ) : supplierPurchases.error ? (
+                      <Text className="text-[10px] text-red-500 italic py-4 text-center">{supplierPurchases.error}</Text>
+                    ) : rowsData.length === 0 ? (
+                      <Text className="text-[10px] text-slate-400 italic py-4 text-center">No stock inwards in this date range.</Text>
+                    ) : (
+                      rowsData.map(({ purchase: p, units, value }) => (
+                        <Pressable
+                          key={p.id}
+                          onPress={() => openPurchaseViewer(p)}
+                          className="bg-slate-50 border border-slate-100 p-2 rounded-lg flex-row justify-between items-center active:bg-slate-100"
+                        >
+                          <View>
+                            <Text className="font-bold text-indigo-600 text-[9px]">Invoice: {p.invoice_number}</Text>
+                            <Text className="text-slate-400 text-[9px]">{new Date(p.date).toLocaleDateString('en-IN')} - {p.items.length} SKU(s), {units} units</Text>
+                          </View>
+                          <View className="flex-row items-center gap-1.5">
+                            <Text className="font-bold text-slate-700 text-[9px]">Rs{formatWholeRupees(value)}</Text>
+                            <Pressable onPress={() => handleDownloadStockReceiptPdf(p, reportingSupplier)} hitSlop={6} className="p-1.5 bg-indigo-50 rounded-lg border border-indigo-100 active:bg-indigo-100">
+                              <Download size={12} color="#4f46e5" />
+                            </Pressable>
+                            <Eye size={14} color="#94a3b8" />
+                          </View>
+                        </Pressable>
+                      ))
+                    )}
+                  </View>
+                </ScrollableSection>
+                <PaginationFooter mode="offset" page={supplierPurchases.page} totalPages={supplierPurchases.totalPages} total={supplierPurchases.total} loading={supplierPurchases.loading} onPageChange={supplierPurchases.goToPage} />
+
+                <View className="flex-row gap-2">
+                  <Pressable onPress={handleExportSupplierReport} className="flex-1 py-2.5 bg-emerald-50 border border-emerald-100 rounded-2xl items-center active:bg-emerald-100 flex-row justify-center gap-1.5">
+                    <Download size={14} color="#059669" />
+                    <Text className="text-emerald-600 font-bold text-xs">Download PDF</Text>
+                  </Pressable>
+                  <Pressable onPress={() => setReportingSupplier(null)} className="flex-1 py-2.5 bg-slate-100 rounded-2xl items-center active:bg-slate-200"><Text className="text-slate-700 font-bold text-xs">Close</Text></Pressable>
+                </View>
+              </View>
+            </View>
+          );
+        })()}
+      </Modal>
+
+      <Modal visible={!!viewingPreBooking} transparent animationType="fade" onRequestClose={closePreBookingViewer}>
+        {viewingPreBooking && (() => {
+          const store = data.stores.find(s => s.id === viewingPreBooking.store_id);
+          const units = viewingPreBooking.items.reduce((sum, item) => sum + item.quantity, 0);
+          const { tax: taxTotal, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(viewingPreBooking.items);
+          const bookedBy = resolveActor(data.users, viewingPreBooking.salesperson_id);
+          return (
+            <View className="flex-1 bg-slate-900/60 items-center justify-center p-4">
+              <View className="bg-white rounded-3xl border border-slate-200 p-5 max-w-xl w-full h-[80%]">
+                <View className="flex-row items-center justify-between border-b border-slate-100 pb-3 mb-3">
+                  <View>
+                    <Text className="font-extrabold text-slate-800 text-sm">Pre-Booking Bill</Text>
+                    <Text className="text-[10px] text-slate-400 mt-0.5">#{viewingPreBooking.id}</Text>
+                  </View>
+                  <Pressable onPress={closePreBookingViewer}><Text className="text-slate-400 text-lg">x</Text></Pressable>
+                </View>
+
+                <View className="gap-1 bg-slate-50 p-3 rounded-2xl mb-3">
+                  <Text className="text-slate-700 text-xs"><Text className="font-bold">Store:</Text> {store?.name || 'Unknown'}</Text>
+                  <Text className="text-slate-700 text-xs"><Text className="font-bold">Booked On:</Text> {new Date(viewingPreBooking.created_at).toLocaleDateString('en-IN')}</Text>
+                  <Text className="text-slate-700 text-xs"><Text className="font-bold">Scheduled Delivery:</Text> {new Date(viewingPreBooking.scheduled_delivery_date).toLocaleDateString('en-IN')}</Text>
+                  <Text className="text-slate-700 text-xs"><Text className="font-bold">Booked By:</Text> {bookedBy.name} ({bookedBy.role})</Text>
+                  <View className="flex-row items-center gap-1.5 mt-0.5">
+                    <Text className="text-slate-700 text-xs font-bold">Status:</Text>
+                    <Text className={`px-1.5 py-0.5 rounded-md font-bold text-[9px] uppercase ${viewingPreBooking.status === 'Delivered' ? 'bg-emerald-50 text-emerald-600' : viewingPreBooking.status === 'Cancelled' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'}`}>{viewingPreBooking.status}</Text>
+                  </View>
+                  {viewingPreBooking.notes && <Text className="text-slate-500 italic text-xs">Note: {viewingPreBooking.notes}</Text>}
+                </View>
+
+                <View className="mb-3">
+                  <View className="flex-row gap-2">
+                    <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Units</Text><Text className="text-xs font-black text-slate-800">{units}</Text></View>
+                    <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Tax</Text><Text className="text-xs font-black text-slate-800">Rs{taxTotal.toFixed(2)}</Text></View>
+                    <View className="flex-1 bg-slate-50 p-2.5 rounded-2xl items-center"><Text className="text-slate-400 text-[8px] font-black uppercase">Net Amount</Text><Text className="text-xs font-black text-emerald-600">Rs{formatWholeRupees(grandTotal)}</Text></View>
+                  </View>
+                  <View className="flex-row justify-between mt-1.5 px-0.5">
+                    <Text className="text-slate-400 text-[9px]">Total (Before Round Off): Rs{(grandTotal - roundOff).toFixed(2)}</Text>
+                    <Text className="text-slate-400 text-[9px]">Round Off: {roundOff > 0 ? '+' : ''}Rs{roundOff.toFixed(2)}</Text>
+                  </View>
+                </View>
+
+                <Text className="font-bold text-slate-700 text-[9px] uppercase mb-1.5">Line Items</Text>
+                <ScrollView className="flex-1 mb-3">
+                  <View className="gap-1.5">
+                    {viewingPreBooking.items.map((item, idx) => {
+                      const p = data.products.find(prod => prod.id === item.product_id);
+                      const lineTotal = item.quantity * item.unit_price;
+                      const basis = p && item.unit_price === p.wholesale_price ? 'Wholesale' : p && item.unit_price === p.selling_price ? 'Selling' : '';
+                      return (
+                        <View key={idx} className="bg-slate-50 border border-slate-100 p-2 rounded-lg flex-row justify-between items-center">
+                          <Text className="font-bold text-slate-800 text-[10px] flex-1" numberOfLines={1}>{p?.name || item.product_id}</Text>
+                          <Text className="text-slate-600 text-[10px]">{item.quantity} x Rs{item.unit_price.toFixed(2)}{basis ? ` (${basis})` : ''} = Rs{lineTotal.toFixed(2)}</Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                </ScrollView>
+
+                {/* Admin-only override: a Delivered pre-booking normally can't be
+                    changed - this lets an Admin correct a mistake by editing the
+                    real order/invoice it produced, automatically
+                    reversing/reapplying warehouse stock either way. Only shown
+                    once fulfilled_order_id is present (older deliveries from
+                    before this feature existed have nothing to link to). */}
+                {currentUser?.role === 'Admin' && viewingPreBooking.status === 'Delivered' && viewingPreBooking.fulfilled_order_id && (
+                  deletePreBookingConfirmId === viewingPreBooking.id ? (
+                    // Rendered inline inside this same Modal rather than as a
+                    // second <ConfirmModal> - two RN <Modal>s don't reliably
+                    // stack on top of one another (see openPreBookingViewer),
+                    // so a nested confirm Modal could end up hidden behind
+                    // this Pre-Booking Bill popup.
+                    <View className="gap-2 p-3 bg-rose-50 border border-rose-100 rounded-xl mb-2">
+                      <Text className="text-rose-700 text-[10px] font-bold leading-relaxed">
+                        Permanently delete this pre-booking? This action is irreversible. The pre-booking and the real order/invoice it produced will be permanently removed, its item quantities will be returned to warehouse stock, any outstanding balance it added to the store will be reversed, and any payments collected against it will be removed from collection totals.
+                      </Text>
+                      <View className="flex-row gap-2">
+                        <Pressable
+                          onPress={() => executeDeleteDeliveredPreBooking(viewingPreBooking.id)}
+                          className="flex-1 py-1.5 bg-rose-600 rounded-lg items-center active:bg-rose-700"
+                        >
+                          <Text className="text-white font-bold text-[10px]">Yes, Delete Pre-Booking</Text>
+                        </Pressable>
+                        <Pressable onPress={() => setDeletePreBookingConfirmId(null)} className="flex-1 py-1.5 bg-white border border-slate-200 rounded-lg items-center active:bg-slate-100">
+                          <Text className="text-slate-700 font-bold text-[10px]">No, Keep It</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  ) : (
+                    <View className="flex-row gap-2 mb-2">
+                      <Pressable onPress={() => handleOpenEditDeliveredPreBooking(viewingPreBooking)} className="flex-1 py-2 bg-slate-100 rounded-xl flex-row items-center justify-center gap-1.5 border border-slate-200 active:bg-slate-200">
+                        <Edit size={13} color="#475569" />
+                        <Text className="text-slate-700 font-bold text-xs">Edit (Admin)</Text>
+                      </Pressable>
+                      <Pressable onPress={() => handleDeleteDeliveredPreBooking(viewingPreBooking.id)} className="flex-1 py-2 bg-rose-50 rounded-xl flex-row items-center justify-center gap-1.5 border border-rose-200 active:bg-rose-100">
+                        <Trash2 size={13} color="#e11d48" />
+                        <Text className="text-rose-600 font-bold text-xs">Delete (Admin)</Text>
+                      </Pressable>
+                    </View>
+                  )
+                )}
+
+                <View className="flex-row gap-2">
+                  <Pressable onPress={() => handleDownloadPreBookingPdf(viewingPreBooking)} className="flex-1 py-2.5 bg-emerald-50 border border-emerald-100 rounded-2xl items-center active:bg-emerald-100 flex-row justify-center gap-1.5">
+                    <Download size={14} color="#059669" />
+                    <Text className="text-emerald-600 font-bold text-xs">Download PDF</Text>
+                  </Pressable>
+                  <Pressable onPress={closePreBookingViewer} className="flex-1 py-2.5 bg-slate-100 rounded-2xl items-center active:bg-slate-200"><Text className="text-slate-700 font-bold text-xs">Close</Text></Pressable>
+                </View>
               </View>
             </View>
           );

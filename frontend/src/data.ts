@@ -1,4 +1,4 @@
-import { Order, Purchase, Store } from './types';
+import { Invoice, Order, Purchase, Store } from './types';
 
 // Calculate Customer Health Score based on parameters: Outstanding, Ranking, Refill delay
 export function calculateStoreHealthScore(store: Store): number {
@@ -27,28 +27,30 @@ export function calculateStoreHealthScore(store: Store): number {
 }
 
 // Get store metrics
-export function getStoreMetrics(storeId: string, ordersList: Order[]) {
+export function getStoreMetrics(storeId: string, ordersList: Order[], purchases: Purchase[] = [], invoices: Invoice[] = []) {
   const storeOrders = ordersList.filter(o => o.store_id === storeId && o.status === 'Delivered');
   const count = storeOrders.length;
 
   let totalRevenue = 0;
-  let totalCost = 0;
+  let totalProfit = 0;
 
   storeOrders.forEach(o => {
     o.items.forEach(item => {
-      const cost = getLatestPurchasePrice(item.product_id);
       totalRevenue += item.quantity * item.unit_price;
-      totalCost += item.quantity * cost;
     });
+    const invoice = invoices.find(i => i.order_id === o.id);
+    totalProfit += calculateDeliveredOrderProfit(o, purchases, invoice);
   });
 
-  const profit = totalRevenue - totalCost;
   const avgOrderVal = count > 0 ? totalRevenue / count : 0;
 
   return {
     orderCount: count,
     revenue: parseFloat(totalRevenue.toFixed(2)),
-    profit: parseFloat(profit.toFixed(2)),
+    // Only the portion of each order's profit backed by money actually
+    // collected so far (see calculateDeliveredOrderProfit) - not the full
+    // invoiced/order profit.
+    profit: parseFloat(totalProfit.toFixed(2)),
     avgOrderValue: parseFloat(avgOrderVal.toFixed(2))
   };
 }
@@ -62,13 +64,24 @@ export function getLatestPurchasePrice(productId: string, purchases: Purchase[] 
   return latestPurchasedItem?.purchase_price ?? 0;
 }
 
-export function calculateDeliveredOrderProfit(order: Order, purchases: Purchase[]): number {
-  return order.items.reduce((sum, item) => {
+// Profit is recognized on a cash basis, not an accrual one: money isn't
+// collected the moment an order is delivered (stores often carry balances on
+// credit), so an order's profit only counts once - and to the extent that -
+// its invoice has actually been paid. A fully-unpaid invoice contributes 0,
+// a fully-paid one contributes the full margin, and a partially-paid one
+// contributes that same proportion of the margin, so partial collections are
+// still reflected instead of being invisible until "Paid" is reached.
+export function calculateDeliveredOrderProfit(order: Order, purchases: Purchase[], invoice?: { grand_total: number; paid_amount?: number }): number {
+  const fullMargin = order.items.reduce((sum, item) => {
     const costPrice = getLatestPurchasePrice(item.product_id, purchases);
     const revenue = item.unit_price * item.quantity;
     const cost = costPrice * item.quantity;
     return sum + (revenue - cost);
   }, 0);
+
+  if (!invoice || !invoice.grand_total) return 0;
+  const collectedFraction = Math.min(1, Math.max(0, (invoice.paid_amount ?? 0) / invoice.grand_total));
+  return fullMargin * collectedFraction;
 }
 
 export function getAveragePurchasePrice(productId: string, purchases: Purchase[] = []): number {

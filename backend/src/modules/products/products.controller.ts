@@ -10,9 +10,10 @@ const productSchema = z.object({
   brand: z.string().min(1),
   description: z.string().default(''),
   image_url: z.string().default(''),
-  purchase_price: z.number().nonnegative(),
-  wholesale_price: z.number().nonnegative(),
-  selling_price: z.number().nonnegative(),
+  mrp: z.number().nonnegative(),
+  purchase_discount_pct: z.number().min(0).max(100),
+  wholesale_discount_pct: z.number().min(0).max(100),
+  retail_discount_pct: z.number().min(0).max(100),
   tax_pct: z.number().nonnegative(),
   status: z.enum(['Active', 'Inactive']).default('Active'),
   unit_value: z.number().nonnegative(),
@@ -20,9 +21,10 @@ const productSchema = z.object({
 });
 
 const priceSchema = z.object({
-  purchase_price: z.number().nonnegative(),
-  wholesale_price: z.number().nonnegative(),
-  selling_price: z.number().nonnegative(),
+  mrp: z.number().nonnegative(),
+  purchase_discount_pct: z.number().min(0).max(100),
+  wholesale_discount_pct: z.number().min(0).max(100),
+  retail_discount_pct: z.number().min(0).max(100),
 });
 
 const statusSchema = z.object({ status: z.enum(['Active', 'Inactive']) });
