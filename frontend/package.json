@@ -12,6 +12,8 @@
     "expo-image-picker": "~17.0.11",
     "expo-print": "~15.0.8",
     "expo-sharing": "~14.0.8",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^4.2.1",
     "lucide-react-native": "^1.23.0",
     "nativewind": "^4.2.6",
     "react": "19.1.4",
@@ -23,26 +25,30 @@
     "react-native-safe-area-context": "5.6.1",
     "react-native-svg": "15.12.1",
     "react-native-web": "^0.21.2",
-    "react-native-windows": "0.81.29",
+    "react-native-windows": "^0.81.29",
     "react-native-worklets": "0.8.3",
     "socket.io-client": "^4.8.1",
     "tailwindcss": "^3.4.19",
     "xlsx-js-style": "^1.2.0"
   },
   "devDependencies": {
+    "@react-native-community/cli": "17.0.0",
     "@rnx-kit/jest-preset": "^0.1.17",
     "@types/react": "~19.1.4",
     "babel-plugin-module-resolver": "^5.0.3",
+    "patch-package": "^8.0.1",
     "typescript": "~5.9.2"
   },
   "scripts": {
+    "postinstall": "patch-package",
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
     "windows": "npx @react-native-community/cli run-windows",
     "macos": "react-native run-macos",
-    "test:windows": "jest --config jest.config.windows.js"
+    "test:windows": "jest --config jest.config.windows.js",
+    "test:smoke": "node --experimental-strip-types --import ./scripts/register-ts-loader.mjs --test src/utils/__tests__/*.smoke.test.ts"
   },
   "private": true,
   "overrides": {

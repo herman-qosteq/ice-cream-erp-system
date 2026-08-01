@@ -6,8 +6,14 @@ import { ApiError } from '../../utils/ApiError';
 import { computeInvoiceTotals } from '../../utils/billing';
 import { parsePageParams, parseDateRangeParams, containsInsensitive, buildPagedResult } from '../../utils/pagination';
 import { editOrder, deleteOrder } from '../orders/orders.service';
+import { BoxPieceQty, addQty, subtractQty, toTotalPieces, fromTotalPieces, formatQty, readQtyField } from '../../utils/pieceQty';
 
-const TODAY = new Date('2026-06-27');
+// Must be computed fresh at the point of use, not once at module load - a
+// module-level `new Date()` would still freeze at server-start time and
+// silently drift stale exactly like the literal date this replaced.
+function today(): Date {
+  return new Date();
+}
 
 function refillDaysFor(refill_frequency: string, custom_days?: number | null): number {
   if (refill_frequency === 'Weekly') return 7;
@@ -15,6 +21,13 @@ function refillDaysFor(refill_frequency: string, custom_days?: number | null): n
   if (refill_frequency === 'Monthly') return 30;
   if (refill_frequency === 'Custom') return custom_days || 7;
   return 7;
+}
+
+// Single place every function in this file uses to look up each involved
+// product's pieces_per_box, needed to carry box/pieces math correctly.
+async function piecesPerBoxMap<T extends { product: { findMany: (args: any) => Promise<{ id: string; pieces_per_box: number }[]> } }>(client: T, productIds: string[]): Promise<Map<string, number>> {
+  const products = await client.product.findMany({ where: { id: { in: productIds } } });
+  return new Map(products.map(p => [p.id, p.pieces_per_box]));
 }
 
 function serializeBooking(b: any) {
@@ -26,8 +39,8 @@ function serializeBooking(b: any) {
     scheduled_delivery_date: dateOnly(b.scheduled_delivery_date),
     status: b.status,
     notes: b.notes ?? undefined,
-    items: b.items.map((i: any) => ({ product_id: i.product_id, quantity: i.quantity, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) })),
-    dispatched_items: b.dispatched_items.map((d: any) => ({ product_id: d.product_id, quantity: d.quantity })),
+    items: b.items.map((i: any) => ({ product_id: i.product_id, quantity: i.quantity, quantity_pieces: i.quantity_pieces, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) })),
+    dispatched_items: b.dispatched_items.map((d: any) => ({ product_id: d.product_id, quantity: d.quantity, quantity_pieces: d.quantity_pieces })),
     // Lets the frontend show/hide the Admin Edit/Delete-delivered actions
     // without guessing - only present once a delivery has actually linked
     // this booking to a real order (see deliverPreBooking).
@@ -72,6 +85,11 @@ function buildPreBookingsWhere(query: Record<string, unknown>): Prisma.PreBookin
     });
   }
 
+  // partner_type is never denormalized onto PreBookingOrder - always read via
+  // the existing store_id join, same as the store name/owner_name search above.
+  const partnerType = typeof query.partnerType === 'string' && query.partnerType !== 'All' ? query.partnerType : '';
+  if (partnerType) and.push({ store: { partner_type: partnerType } });
+
   return and.length ? { AND: and } : {};
 }
 
@@ -88,28 +106,44 @@ export async function listPreBookingsPaged(query: Record<string, unknown>) {
 interface ItemInput {
   product_id: string;
   quantity: number;
+  quantity_pieces?: number;
   unit_price: number;
   tax_pct: number;
+}
+
+function itemQty(item: ItemInput): BoxPieceQty {
+  return { boxes: item.quantity, pieces: item.quantity_pieces ?? 0 };
 }
 
 async function assertStockAvailable(items: ItemInput[], excludeBookingId?: string) {
   // When editing, the booking's own currently-held reservation is added back
   // to "available" first, so shrinking/growing quantities is validated
   // against what's truly free (mirrors getEffectiveAvailableForBooking()).
-  let alreadyHeld: Record<string, number> = {};
+  let existingItems: { product_id: string; quantity: number; quantity_pieces: number }[] = [];
   if (excludeBookingId) {
     const existing = await prisma.preBookingOrder.findUnique({ where: { id: excludeBookingId }, include: { items: true } });
-    if (existing) {
-      for (const item of existing.items) alreadyHeld[item.product_id] = (alreadyHeld[item.product_id] ?? 0) + item.quantity;
-    }
+    if (existing) existingItems = existing.items;
+  }
+
+  const productIds = new Set<string>();
+  for (const i of items) productIds.add(i.product_id);
+  for (const i of existingItems) productIds.add(i.product_id);
+  const ppbMap = await piecesPerBoxMap(prisma, [...productIds]);
+
+  const alreadyHeldPieces: Record<string, number> = {};
+  for (const item of existingItems) {
+    const ppb = ppbMap.get(item.product_id) ?? 1;
+    alreadyHeldPieces[item.product_id] = (alreadyHeldPieces[item.product_id] ?? 0) + toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, ppb);
   }
 
   for (const item of items) {
+    const ppb = ppbMap.get(item.product_id) ?? 1;
     const inv = await prisma.warehouseInventory.findUnique({ where: { product_id: item.product_id } });
-    const available = (inv?.available_qty ?? 0) + (alreadyHeld[item.product_id] ?? 0);
-    if (item.quantity > available) {
+    const availablePieces = (inv ? toTotalPieces(readQtyField(inv, 'available_qty', 'available_pieces'), ppb) : 0) + (alreadyHeldPieces[item.product_id] ?? 0);
+    const needPieces = toTotalPieces(itemQty(item), ppb);
+    if (needPieces > availablePieces) {
       const product = await prisma.product.findUnique({ where: { id: item.product_id } });
-      throw ApiError.conflict(`Insufficient warehouse stock for ${product?.name ?? item.product_id}. Only ${available} units are available.`);
+      throw ApiError.conflict(`Insufficient warehouse stock for ${product?.name ?? item.product_id}. Only ${formatQty(fromTotalPieces(availablePieces, ppb))} available.`);
     }
   }
 }
@@ -123,9 +157,16 @@ export async function createPreBooking(input: { store_id: string; salesperson_id
   const store = await prisma.store.findUnique({ where: { id: input.store_id } });
   if (!store) throw ApiError.notFound('Store not found');
 
+  const ppbMap = await piecesPerBoxMap(prisma, input.items.map(i => i.product_id));
+
   const booking = await prisma.$transaction(async tx => {
     for (const item of input.items) {
-      await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: { decrement: item.quantity }, reserved_qty: { increment: item.quantity } } });
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = itemQty(item);
+      const inv = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
+      const nextAvail = subtractQty(readQtyField(inv, 'available_qty', 'available_pieces'), need, ppb);
+      const nextReserved = addQty(readQtyField(inv, 'reserved_qty', 'reserved_pieces'), need, ppb);
+      await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
     }
     return tx.preBookingOrder.create({
       data: {
@@ -134,7 +175,7 @@ export async function createPreBooking(input: { store_id: string; salesperson_id
         scheduled_delivery_date: new Date(input.scheduled_delivery_date),
         status: 'Booked',
         notes: input.notes,
-        items: { create: input.items.map((item, idx) => ({ ...item, position: idx })) },
+        items: { create: input.items.map((item, idx) => ({ product_id: item.product_id, quantity: item.quantity, quantity_pieces: item.quantity_pieces ?? 0, unit_price: item.unit_price, tax_pct: item.tax_pct, position: idx })) },
       },
       include: bookingInclude,
     });
@@ -158,12 +199,27 @@ export async function updatePreBooking(id: string, input: { store_id: string; sc
   const store = await prisma.store.findUnique({ where: { id: input.store_id } });
   if (!store) throw ApiError.notFound('Store not found');
 
+  const productIds = new Set<string>();
+  for (const i of existing.items) productIds.add(i.product_id);
+  for (const i of input.items) productIds.add(i.product_id);
+  const ppbMap = await piecesPerBoxMap(prisma, [...productIds]);
+
   const booking = await prisma.$transaction(async tx => {
     for (const item of existing.items) {
-      await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: { increment: item.quantity }, reserved_qty: { decrement: item.quantity } } });
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+      const inv = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
+      const nextAvail = addQty(readQtyField(inv, 'available_qty', 'available_pieces'), need, ppb);
+      const nextReserved = subtractQty(readQtyField(inv, 'reserved_qty', 'reserved_pieces'), need, ppb);
+      await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
     }
     for (const item of input.items) {
-      await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: { decrement: item.quantity }, reserved_qty: { increment: item.quantity } } });
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = itemQty(item);
+      const inv = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
+      const nextAvail = subtractQty(readQtyField(inv, 'available_qty', 'available_pieces'), need, ppb);
+      const nextReserved = addQty(readQtyField(inv, 'reserved_qty', 'reserved_pieces'), need, ppb);
+      await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
     }
     await tx.preBookingItem.deleteMany({ where: { pre_booking_id: id } });
     return tx.preBookingOrder.update({
@@ -172,7 +228,7 @@ export async function updatePreBooking(id: string, input: { store_id: string; sc
         store_id: input.store_id,
         scheduled_delivery_date: new Date(input.scheduled_delivery_date),
         notes: input.notes,
-        items: { create: input.items.map((item, idx) => ({ ...item, position: idx })) },
+        items: { create: input.items.map((item, idx) => ({ product_id: item.product_id, quantity: item.quantity, quantity_pieces: item.quantity_pieces ?? 0, unit_price: item.unit_price, tax_pct: item.tax_pct, position: idx })) },
       },
       include: bookingInclude,
     });
@@ -193,23 +249,28 @@ export async function deliverPreBooking(id: string, input: { method: string; amo
   const store = await prisma.store.findUnique({ where: { id: booking.store_id } });
   if (!store) throw ApiError.notFound('Store not found');
 
-  const itemsForTotals = booking.items.map(i => ({ quantity: i.quantity, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) }));
+  const ppbMap = await piecesPerBoxMap(prisma, booking.items.map(i => i.product_id));
+  const itemsForTotals = booking.items.map(i => ({ quantity: i.quantity, quantity_pieces: i.quantity_pieces, pieces_per_box: ppbMap.get(i.product_id) ?? 1, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) }));
   const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(itemsForTotals);
 
   const isPayLater = input.method === 'Credit' || input.amount <= 0;
   const actualCollection = isPayLater ? 0 : Math.min(parseFloat(input.amount.toFixed(2)), grandTotal);
   const paymentStatus = actualCollection >= grandTotal - 0.05 ? 'Paid' : actualCollection > 0 ? 'Partial' : 'Credit';
 
-  const dispatchedByProduct: Record<string, number> = {};
-  for (const d of booking.dispatched_items) dispatchedByProduct[d.product_id] = d.quantity;
+  const dispatchedByProduct: Record<string, BoxPieceQty> = {};
+  for (const d of booking.dispatched_items) dispatchedByProduct[d.product_id] = { boxes: d.quantity, pieces: d.quantity_pieces };
 
   const result = await prisma.$transaction(async tx => {
     for (const item of booking.items) {
-      const stillReserved = Math.max(0, item.quantity - (dispatchedByProduct[item.product_id] ?? 0));
-      if (stillReserved > 0) {
-        const inv = await tx.warehouseInventory.findUnique({ where: { product_id: item.product_id } });
-        const nextReserved = Math.max(0, (inv?.reserved_qty ?? 0) - stillReserved);
-        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { reserved_qty: nextReserved } });
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+      const dispatched = dispatchedByProduct[item.product_id] ?? { boxes: 0, pieces: 0 };
+      const stillReservedTotal = Math.max(0, toTotalPieces(need, ppb) - toTotalPieces(dispatched, ppb));
+      if (stillReservedTotal > 0) {
+        const inv = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
+        const nextReservedTotal = Math.max(0, toTotalPieces(readQtyField(inv, 'reserved_qty', 'reserved_pieces'), ppb) - stillReservedTotal);
+        const nextReserved = fromTotalPieces(nextReservedTotal, ppb);
+        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
       }
     }
 
@@ -221,7 +282,7 @@ export async function deliverPreBooking(id: string, input: { method: string; amo
         // booking.items is already position-ordered (see bookingInclude) -
         // carrying that same order over via idx keeps the resulting order's
         // own bill in the same item order as the original booking.
-        items: { create: booking.items.map((i, idx) => ({ product_id: i.product_id, quantity: i.quantity, unit_price: i.unit_price, tax_pct: i.tax_pct, position: idx })) },
+        items: { create: booking.items.map((i, idx) => ({ product_id: i.product_id, quantity: i.quantity, quantity_pieces: i.quantity_pieces, unit_price: i.unit_price, tax_pct: i.tax_pct, position: idx })) },
       },
     });
 
@@ -245,12 +306,13 @@ export async function deliverPreBooking(id: string, input: { method: string; amo
     }
 
     const refillDays = refillDaysFor(store.refill_frequency, store.custom_days);
+    const now = today();
     await tx.store.update({
       where: { id: booking.store_id },
       data: {
         outstanding_balance: { increment: parseFloat((grandTotal - actualCollection).toFixed(2)) },
-        last_purchase_date: TODAY,
-        next_refill_date: new Date(TODAY.getTime() + refillDays * 86400000),
+        last_purchase_date: now,
+        next_refill_date: new Date(now.getTime() + refillDays * 86400000),
       },
     });
 
@@ -262,7 +324,7 @@ export async function deliverPreBooking(id: string, input: { method: string; amo
     return { order, invoice, payment };
   });
 
-  await logAudit({ action: 'PREBOOKING_DELIVER', entity_type: 'PreBookingOrder', entity_id: id, user_id: actorId, details: `Delivered pre-booking order ${id}, generated order ${result.order.id} (Rs${grandTotal.toFixed(2)}, ${paymentStatus}), and released reserved warehouse stock.` });
+  await logAudit({ action: 'PREBOOKING_DELIVER', entity_type: 'PreBookingOrder', entity_id: id, user_id: actorId, details: `Delivered pre-booking order ${id}, generated order ${result.order.id} (Rs. ${grandTotal.toFixed(2)}, ${paymentStatus}), and released reserved warehouse stock.` });
   return { order_id: result.order.id, invoice_id: result.invoice.id, grand_total: grandTotal, payment_status: paymentStatus };
 }
 
@@ -273,18 +335,23 @@ export async function cancelPreBooking(id: string, actorId: string) {
   const booking = await prisma.preBookingOrder.findUnique({ where: { id }, include: bookingInclude });
   if (!booking) throw ApiError.notFound('Pre-booking not found');
 
-  const dispatchedByProduct: Record<string, number> = {};
-  for (const d of booking.dispatched_items) dispatchedByProduct[d.product_id] = d.quantity;
+  const ppbMap = await piecesPerBoxMap(prisma, booking.items.map(i => i.product_id));
+  const dispatchedByProduct: Record<string, BoxPieceQty> = {};
+  for (const d of booking.dispatched_items) dispatchedByProduct[d.product_id] = { boxes: d.quantity, pieces: d.quantity_pieces };
 
   await prisma.$transaction(async tx => {
     for (const item of booking.items) {
-      const stillReserved = Math.max(0, item.quantity - (dispatchedByProduct[item.product_id] ?? 0));
-      if (stillReserved > 0) {
-        const inv = await tx.warehouseInventory.findUnique({ where: { product_id: item.product_id } });
-        await tx.warehouseInventory.update({
-          where: { product_id: item.product_id },
-          data: { available_qty: (inv?.available_qty ?? 0) + stillReserved, reserved_qty: Math.max(0, (inv?.reserved_qty ?? 0) - stillReserved) },
-        });
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+      const dispatched = dispatchedByProduct[item.product_id] ?? { boxes: 0, pieces: 0 };
+      const stillReservedTotal = Math.max(0, toTotalPieces(need, ppb) - toTotalPieces(dispatched, ppb));
+      if (stillReservedTotal > 0) {
+        const inv = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
+        const nextAvailTotal = toTotalPieces(readQtyField(inv, 'available_qty', 'available_pieces'), ppb) + stillReservedTotal;
+        const nextReservedTotal = Math.max(0, toTotalPieces(readQtyField(inv, 'reserved_qty', 'reserved_pieces'), ppb) - stillReservedTotal);
+        const nextAvail = fromTotalPieces(nextAvailTotal, ppb);
+        const nextReserved = fromTotalPieces(nextReservedTotal, ppb);
+        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
       }
     }
     await tx.preBookingOrder.update({ where: { id }, data: { status: 'Cancelled' } });
@@ -314,7 +381,7 @@ export async function editDeliveredPreBooking(id: string, input: { items: ItemIn
     await tx.preBookingItem.deleteMany({ where: { pre_booking_id: id } });
     await tx.preBookingOrder.update({
       where: { id },
-      data: { items: { create: input.items.map((item, idx) => ({ ...item, position: idx })) } },
+      data: { items: { create: input.items.map((item, idx) => ({ product_id: item.product_id, quantity: item.quantity, quantity_pieces: item.quantity_pieces ?? 0, unit_price: item.unit_price, tax_pct: item.tax_pct, position: idx })) } },
     });
   });
 

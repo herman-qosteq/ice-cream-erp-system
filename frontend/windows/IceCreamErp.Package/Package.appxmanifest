@@ -45,5 +45,6 @@
   <Capabilities>
     <Capability Name="internetClient" />
     <rescap:Capability Name="runFullTrust" />
+    <uap:Capability Name="documentsLibrary" />
   </Capabilities>
 </Package>

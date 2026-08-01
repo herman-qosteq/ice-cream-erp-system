@@ -1,20 +1,26 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { View, Text, TextInput, Pressable, Modal, ScrollView } from 'react-native';
 import { Shield, AlertTriangle, RefreshCw, ClipboardList, Trash2, Truck as TruckIcon, RotateCcw, X, Edit, Plus, FileSpreadsheet, Search, Paperclip, Check } from 'lucide-react-native';
 import { ERPData, ERPAuditLog, resolveActor } from '../../storage';
-import { Product, AppNotification, NotificationEntityType, Truck, PurchaseOrderRequest, WarehouseInventory } from '../../types';
+import { Product, AppNotification, NotificationEntityType, Truck, PurchaseOrderRequest, WarehouseInventory, BoxPieceQty } from '../../types';
 import ProductImage from '../../components/common/ProductImage';
 import SelectField from '../../components/common/SelectField';
+import BoxPieceInput from '../../components/common/BoxPieceInput';
+import AutocompleteInput from '../../components/common/AutocompleteInput';
+import { formatQty, formatQtyShort, readQtyField, addQty, subtractQty, compareQty, isPositiveQty } from '../../utils/qty';
 import DateField from '../../components/common/DateField';
 import ConfirmModal from '../../components/common/ConfirmModal';
 import { useAppContext } from '../../context/AppContext';
 import { trucksApi, purchasesApi, purchaseOrderRequestsApi, warehouseApi, dispatchApi, systemApi, productsApi, settingsApi } from '../../api/endpoints';
-import { isRetailPricingEnabled, discountFromPrice } from '../../utils/pricing';
+import { discountFromPrice, boxMrpFromMrp, mrpFromBoxMrp } from '../../utils/pricing';
+import { isRetailPricingEnabled } from '../../utils/permissions';
 import { formatDateTime12h } from '../../utils/format';
 import { buildPurchaseOrderWorkbook, buildPurchaseOrderRef, exportExcelWorkbook } from '../../utils/excelExport';
 import { pickBillFileAsDataUri, PickedFile } from '../../utils/documentPicker';
 import ViewToggle from '../../components/common/ViewToggle';
 import DataTable, { DataTableColumn } from '../../components/common/DataTable';
+import { useDebouncedValue } from '../../hooks/useDebouncedValue';
+import EmptyState from '../../components/common/EmptyState';
 import PaginationFooter from '../../components/common/PaginationFooter';
 import FilterBar, { FILTER_PILL_CLASS, FILTER_PILL_TEXT_CLASS } from '../../components/common/FilterBar';
 import DateRangeFilterField from '../../components/common/DateRangeFilterField';
@@ -24,6 +30,9 @@ import { useResetScrollOnChange } from '../../context/ScrollResetContext';
 import { usePaginatedList } from '../../hooks/usePaginatedList';
 import { useResponsiveTableHeight } from '../../hooks/useResponsiveTableHeight';
 import { DateFilterMode } from '../../utils/dateFilter';
+import AdminAssets from './AdminAssets';
+
+export type WarehouseTab = 'warehouse' | 'trucks' | 'transfers' | 'audits' | 'assets';
 
 interface AdminWarehouseProps {
   data: ERPData;
@@ -34,11 +43,25 @@ interface AdminWarehouseProps {
   setActiveScreen?: (screen: any) => void;
   showAlert: (opts: any) => void;
   hideAdminControls?: boolean;
+  // Restricts the internal tab bar to exactly these tabs - used whenever
+  // this component is mounted for an operator who was granted only some of
+  // the 5 registry screens it renders (Warehouse Inventory/Truck Fleet Load/
+  // Trucks/Movement Audit/Assets & Freezer Boxes - see WarehouseFlow.tsx and
+  // ScreenHost.tsx). Omitted (the AdminFlow.tsx call site) means unrestricted
+  // - Admin always sees all 5.
+  allowedTabs?: WarehouseTab[];
   onViewTodayPreBookings?: () => void;
   pendingNotificationTarget?: { entityType: NotificationEntityType; entityId: string } | null;
   onConsumePendingNotificationTarget?: () => void;
   onNavigateToEntity?: (entityType: NotificationEntityType, entityId: string) => void;
+  // Lets "Create Order" on an assigned asset's detail view (the 'assets' tab)
+  // hand off to the Orders screen with that asset's partner pre-selected -
+  // forwarded straight through to AdminAssets, see its own prop of the same
+  // name for details.
+  onCreateOrderForPartner?: (storeId: string) => void;
 }
+
+const ALL_WAREHOUSE_TABS: WarehouseTab[] = ['warehouse', 'transfers', 'trucks', 'audits', 'assets'];
 
 // AuditLog.entity_type values are PascalCase, written at each logAudit() call
 // site across the backend (e.g. 'Order', 'PreBookingOrder') - these don't
@@ -55,15 +78,17 @@ const AUDIT_ENTITY_TYPE_MAP: Record<string, NotificationEntityType | undefined> 
   Product: 'product',
   User: 'user',
   Truck: 'truck',
+  Asset: 'asset',
 };
 function mapAuditEntityType(raw: string): NotificationEntityType | null {
   return AUDIT_ENTITY_TYPE_MAP[raw] ?? null;
 }
 
-export default function AdminWarehouse({ data, setData, addNotification, currentUser, activeScreen, setActiveScreen, showAlert, hideAdminControls = false, onViewTodayPreBookings, pendingNotificationTarget, onConsumePendingNotificationTarget, onNavigateToEntity }: AdminWarehouseProps) {
+export default function AdminWarehouse({ data, setData, addNotification, currentUser, activeScreen, setActiveScreen, showAlert, hideAdminControls = false, allowedTabs, onViewTodayPreBookings, pendingNotificationTarget, onConsumePendingNotificationTarget, onNavigateToEntity, onCreateOrderForPartner }: AdminWarehouseProps) {
   const { refreshData } = useAppContext();
   const { viewMode } = useViewMode();
-  const [activeTab, setActiveTab] = useState<'warehouse' | 'trucks' | 'transfers' | 'audits'>('warehouse');
+  const visibleTabs = allowedTabs ?? ALL_WAREHOUSE_TABS;
+  const [activeTab, setActiveTab] = useState<WarehouseTab>(visibleTabs[0] ?? 'warehouse');
   const [warehouseSearch, setWarehouseSearch] = useState('');
   // Inventory is what users check most often (how much stock is loaded on a
   // truck) - fleet management (add/edit/remove trucks) is a rarer admin task,
@@ -75,15 +100,19 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
   const [auditSearch, setAuditSearch] = useState('');
   const [auditEntityTypeFilter, setAuditEntityTypeFilter] = useState('All');
+  const [auditUserFilter, setAuditUserFilter] = useState('All');
   const [auditDateFilterMode, setAuditDateFilterMode] = useState<DateFilterMode>('today');
   const [auditCustomDateFrom, setAuditCustomDateFrom] = useState('');
   const [auditCustomDateTo, setAuditCustomDateTo] = useState('');
-  const auditLogs = usePaginatedList<ERPAuditLog, { entity_type?: string }>({
+  const auditLogs = usePaginatedList<ERPAuditLog, { entity_type?: string; user_id?: string }>({
     resource: 'audit-logs',
     mode: 'offset',
     pageSize: 25,
     enabled: activeTab === 'audits',
-    filters: { entity_type: auditEntityTypeFilter !== 'All' ? auditEntityTypeFilter : undefined },
+    filters: {
+      entity_type: auditEntityTypeFilter !== 'All' ? auditEntityTypeFilter : undefined,
+      user_id: auditUserFilter !== 'All' ? auditUserFilter : undefined,
+    },
     search: auditSearch,
     dateFilterMode: auditDateFilterMode,
     customDateFrom: auditCustomDateFrom,
@@ -109,6 +138,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     else if (activeScreen === 'Trucks') setActiveTab('transfers');
     else if (activeScreen === 'TruckInventory') setActiveTab('trucks');
     else if (activeScreen === 'MovementAudit') setActiveTab('audits');
+    else if (activeScreen === 'Assets') setActiveTab('assets');
     // warehouseForm is checked in an early return before activeTab is even
     // considered (see the `if (warehouseForm === 'receive_stock') return (...)`
     // above the main render), so without this reset a still-open Receive
@@ -132,6 +162,16 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     setShowPendingPOList(false);
   }, [activeScreen]);
 
+  // Redirect off a tab that just became disallowed for this operator (e.g.
+  // an Admin revoked "Trucks" for them via Manage Permissions while they had
+  // it open, arriving live through realtime refreshData()) instead of
+  // rendering a tab bar with no active selection.
+  useEffect(() => {
+    if (!visibleTabs.includes(activeTab) && visibleTabs.length > 0) {
+      setActiveTab(visibleTabs[0]);
+    }
+  }, [activeTab, visibleTabs.join(',')]);
+
   useEffect(() => {
     if (!pendingNotificationTarget || pendingNotificationTarget.entityType !== 'truck') return;
     const truck = data.trucks.find(t => t.id === pendingNotificationTarget.entityId);
@@ -148,25 +188,25 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
   const [correctionForm, setCorrectionForm] = useState({
     product_id: '',
-    available_qty: '0',
-    reserved_qty: '0',
-    damaged_qty: '0',
-    expired_qty: '0',
+    available_qty: { boxes: 0, pieces: 0 } as BoxPieceQty,
+    reserved_qty: { boxes: 0, pieces: 0 } as BoxPieceQty,
+    damaged_qty: { boxes: 0, pieces: 0 } as BoxPieceQty,
+    expired_qty: { boxes: 0, pieces: 0 } as BoxPieceQty,
     comment: '',
   });
   const [showCorrectionModal, setShowCorrectionModal] = useState(false);
 
   const [dispatchTruckId, setDispatchTruckId] = useState<string>(data.trucks[0]?.id || '');
-  const [dispatchItems, setDispatchItems] = useState<{ product_id: string; qty: number; source: 'available_qty' | 'reserved_qty'; preBookingId?: string }[]>([]);
+  const [dispatchItems, setDispatchItems] = useState<{ product_id: string; qty: BoxPieceQty; source: 'available_qty' | 'reserved_qty'; preBookingId?: string }[]>([]);
   const [showDispatchPreBookings, setShowDispatchPreBookings] = useState(false);
 
   const [swapFromTruckId, setSwapFromTruckId] = useState<string>(data.trucks[0]?.id || '');
   const [swapToTruckId, setSwapToTruckId] = useState<string>(data.trucks[1]?.id || '');
-  const [swapItems, setSwapItems] = useState<{ product_id: string; qty: number }[]>([
-    { product_id: data.products[0]?.id || '', qty: 10 }
+  const [swapItems, setSwapItems] = useState<{ product_id: string; qty: BoxPieceQty }[]>([
+    { product_id: data.products[0]?.id || '', qty: { boxes: 10, pieces: 0 } }
   ]);
 
-  const [returnQuantities, setReturnQuantities] = useState<Record<string, string>>({});
+  const [returnQuantities, setReturnQuantities] = useState<Record<string, BoxPieceQty>>({});
   const [showReturnAllConfirm, setShowReturnAllConfirm] = useState(false);
   const [showResetModal, setShowResetModal] = useState(false);
   const [confirmResetType, setConfirmResetType] = useState<'none' | 'clear_stock' | 'factory_reset'>('none');
@@ -180,7 +220,9 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   const [showPurchaseOrderExport, setShowPurchaseOrderExport] = useState(false);
   const [poSupplierId, setPoSupplierId] = useState('');
   const [poOrderCase, setPoOrderCase] = useState<Record<string, string>>({});
+  const [poOrderCasePieces, setPoOrderCasePieces] = useState<Record<string, string>>({});
   const [poSearch, setPoSearch] = useState('');
+  const debouncedPoSearch = useDebouncedValue(poSearch, 150);
   const [pendingPOForReceive, setPendingPOForReceive] = useState<PurchaseOrderRequest | null>(null);
   const [showPendingPOList, setShowPendingPOList] = useState(false);
   // Set while the Purchase Order modal is being reused to edit an existing
@@ -198,10 +240,29 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   const [truckForm, setTruckForm] = useState({ vehicle_number: '', driver_user_id: '', route: '', area: '' });
   const [deleteTruckConfirmId, setDeleteTruckConfirmId] = useState<string | null>(null);
 
-  const driverOptions = data.users.filter(u => u.role === 'Salesperson' && u.status === 'Active').map(u => ({ label: u.name, value: u.id }));
-  const truckFormDriverOptions = driverOptions.some(o => o.value === truckForm.driver_user_id)
+  // Drivers already at the wheel of another active truck aren't offered -
+  // one driver, one truck at a time. Excludes the truck currently being
+  // edited (editingTruckId) so its own existing driver still shows up as a
+  // pickable option instead of disappearing because it's "assigned to
+  // itself"; on Register New Truck editingTruckId is null, so every active
+  // truck's driver counts as taken.
+  const driversOnOtherActiveTrucks = new Set(
+    data.trucks
+      .filter(t => t.status === 'Active' && t.driver_user_id && t.id !== editingTruckId)
+      .map(t => t.driver_user_id as string)
+  );
+  const driverOptions = data.users
+    .filter(u => u.role === 'Salesperson' && u.status === 'Active' && !driversOnOtherActiveTrucks.has(u.id))
+    .map(u => ({ label: u.name, value: u.id }));
+  // "Unassigned" (value '') is always the first option so Edit Truck can
+  // explicitly clear the driver - trucksApi.update() accepts an empty
+  // driver_user_id and the backend normalizes it to null (see
+  // updateTruckSchema in trucks.controller.ts); Register New Truck still
+  // requires picking a real driver before it'll save (see handleSaveTruck).
+  const truckFormDriverOptionsBase = driverOptions.some(o => o.value === truckForm.driver_user_id)
     ? driverOptions
     : [...driverOptions, ...data.users.filter(u => u.id === truckForm.driver_user_id).map(u => ({ label: `${u.name} (Inactive)`, value: u.id }))];
+  const truckFormDriverOptions = [{ label: 'Unassigned', value: '' }, ...truckFormDriverOptionsBase];
 
   const handleOpenAddTruck = () => {
     setTruckForm({ vehicle_number: '', driver_user_id: data.users.find(u => u.role === 'Salesperson')?.id || '', route: '', area: '' });
@@ -210,7 +271,11 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   };
 
   const handleOpenEditTruck = (t: Truck) => {
-    setTruckForm({ vehicle_number: t.vehicle_number, driver_user_id: t.driver_user_id, route: t.route, area: t.area });
+    // Empty when null (a deactivated truck whose driver was auto-cleared -
+    // see Truck.driver_user_id in types.ts) so the driver dropdown comes up
+    // unselected and has to be re-picked before this form can be saved,
+    // rather than silently reusing a stale/no-longer-relevant driver id.
+    setTruckForm({ vehicle_number: t.vehicle_number, driver_user_id: t.driver_user_id ?? '', route: t.route, area: t.area });
     setEditingTruckId(t.id);
     setTruckFormMode('edit');
   };
@@ -218,6 +283,14 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   const handleSaveTruck = async () => {
     if (!truckForm.vehicle_number.trim() || !truckForm.area.trim()) {
       showAlert('Vehicle number and area are required.');
+      return;
+    }
+    // Only Register New Truck requires a driver - Edit Truck can save with
+    // "Unassigned" selected (see truckFormDriverOptions above), matching
+    // what the backend actually allows per mode (createTruckSchema vs.
+    // updateTruckSchema in trucks.controller.ts).
+    if (truckFormMode === 'add' && !truckForm.driver_user_id.trim()) {
+      showAlert('A driver must be assigned to register a new truck.');
       return;
     }
 
@@ -252,8 +325,8 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       // "removed" message when it actually happened.
       const result = await trucksApi.setStatus(truckId, 'Inactive');
       await refreshData();
-      const returnMsg = result.returnedUnits > 0
-        ? ` ${result.returnedUnits} unit(s) of loaded cargo (${result.returnedSummary}) were automatically returned to warehouse stock.`
+      const returnMsg = (result.returnedUnits > 0 || result.returnedPieces > 0)
+        ? ` ${formatQty({ boxes: result.returnedUnits, pieces: result.returnedPieces ?? 0 })} of loaded cargo (${result.returnedSummary}) were automatically returned to warehouse stock.`
         : '';
       addNotification('stock_update', `Truck ${truck.vehicle_number} was removed from the active fleet.${returnMsg}`, 'truck', truckId);
       showAlert({ type: 'success', message: `"${truck.vehicle_number}" has been removed from the active fleet.${returnMsg}` });
@@ -309,10 +382,10 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   };
 
   const [warehouseForm, setWarehouseForm] = useState<'list' | 'receive_stock'>('list');
-  const emptyPurchaseItem = { product_id: '', quantity: 100, mrp: 0, purchase_discount_pct: 0, wholesale_discount_pct: 0, retail_discount_pct: 0, purchase_price: 0, wholesale_price: 0, retail_price: 0, mfg_date: '2026-06-27', expiry_date: '2026-12-24' };
+  const emptyPurchaseItem = { product_id: '', quantity: 100, quantity_pieces: 0, mrp: 0, box_mrp: 0, purchase_discount_pct: 0, wholesale_discount_pct: 0, retail_discount_pct: 0, purchase_price: 0, wholesale_price: 0, retail_price: 0, mfg_date: '2026-06-27', expiry_date: '2026-12-24' };
   type PurchaseFormItem = typeof emptyPurchaseItem;
   const [purchaseForm, setPurchaseForm] = useState({
-    supplier_id: '', invoice_number: '', date: '2026-06-27',
+    supplier_id: '', invoice_number: '', date: todayIso,
     items: [{ ...emptyPurchaseItem }]
   });
 
@@ -337,12 +410,19 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   // currently typed into that row - not the product's last-saved catalog
   // values once the admin starts editing them here. Used whenever mrp/%
   // changes (or a different product is picked) - price flows FROM %.
-  const withRecalculatedPrice = (item: typeof emptyPurchaseItem) => ({
-    ...item,
-    purchase_price: parseFloat(priceFromDiscount(item.mrp, item.purchase_discount_pct).toFixed(2)),
-    wholesale_price: parseFloat(priceFromDiscount(item.mrp, item.wholesale_discount_pct).toFixed(2)),
-    retail_price: parseFloat(priceFromDiscount(item.mrp, item.retail_discount_pct).toFixed(2)),
-  });
+  // Box MRP is likewise re-derived here from mrp * pieces_per_box (the
+  // product's fixed box/piece conversion factor), matching the same
+  // MRP <-> Box MRP relationship kept in AdminProducts.tsx.
+  const withRecalculatedPrice = (item: typeof emptyPurchaseItem) => {
+    const piecesPerBox = data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1;
+    return {
+      ...item,
+      box_mrp: boxMrpFromMrp(item.mrp, piecesPerBox),
+      purchase_price: parseFloat(priceFromDiscount(item.mrp, item.purchase_discount_pct).toFixed(2)),
+      wholesale_price: parseFloat(priceFromDiscount(item.mrp, item.wholesale_discount_pct).toFixed(2)),
+      retail_price: parseFloat(priceFromDiscount(item.mrp, item.retail_discount_pct).toFixed(2)),
+    };
+  };
 
   const handleOpenReceiveStock = () => {
     if (data.suppliers.length === 0) {
@@ -352,7 +432,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     setPurchaseForm({
       supplier_id: data.suppliers[0].id,
       invoice_number: 'SUP-INV-' + Math.floor(Math.random() * 9000 + 1000),
-      date: '2026-06-27',
+      date: todayIso,
       items: [{ ...emptyPurchaseItem }]
     });
     setPendingPOForReceive(null);
@@ -374,7 +454,9 @@ export default function AdminWarehouse({ data, setData, addNotification, current
         ...emptyPurchaseItem,
         product_id: i.product_id,
         quantity: i.order_case,
+        quantity_pieces: i.order_case_pieces,
         mrp,
+        box_mrp: boxMrpFromMrp(mrp, product?.pieces_per_box || 1),
         purchase_discount_pct,
         wholesale_discount_pct,
         retail_discount_pct,
@@ -386,7 +468,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     setPurchaseForm({
       supplier_id: request.supplier_id,
       invoice_number: 'SUP-INV-' + Math.floor(Math.random() * 9000 + 1000),
-      date: '2026-06-27',
+      date: todayIso,
       items,
     });
     setPendingPOForReceive(request);
@@ -402,6 +484,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     }
     setPoSupplierId(data.suppliers.find(s => s.status === 'Active')!.id);
     setPoOrderCase({});
+    setPoOrderCasePieces({});
     setPoSearch('');
     setEditingPORequestId(null);
     setShowPurchaseOrderExport(true);
@@ -412,8 +495,10 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   const handleOpenEditPendingPO = (request: PurchaseOrderRequest) => {
     setPoSupplierId(request.supplier_id);
     const caseMap: Record<string, string> = {};
-    request.items.forEach(i => { caseMap[i.product_id] = String(i.order_case); });
+    const casePiecesMap: Record<string, string> = {};
+    request.items.forEach(i => { caseMap[i.product_id] = String(i.order_case); casePiecesMap[i.product_id] = String(i.order_case_pieces || ''); });
     setPoOrderCase(caseMap);
+    setPoOrderCasePieces(casePiecesMap);
     setPoSearch('');
     setEditingPORequestId(request.id);
     setShowPendingPOList(false);
@@ -431,7 +516,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       showAlert('Please select which supplier you are sending this order to.');
       return;
     }
-    const selectedProducts = data.products.filter(p => Number(poOrderCase[p.id]) > 0);
+    const selectedProducts = data.products.filter(p => Number(poOrderCase[p.id]) > 0 || Number(poOrderCasePieces[p.id]) > 0);
     if (selectedProducts.length === 0) {
       showAlert('Select at least one product and enter its order case quantity.');
       return;
@@ -443,7 +528,8 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       category: p.category,
       code: p.code,
       description: `${p.name} (${p.unit_value}${p.unit_type})`,
-      orderCase: Number(poOrderCase[p.id]),
+      orderCase: Number(poOrderCase[p.id]) || 0,
+      orderCasePieces: Number(poOrderCasePieces[p.id]) || 0,
     }));
     const workbook = buildPurchaseOrderWorkbook(excelItems, orderRef);
     // Close before showing the result alert - two RN <Modal>s open at once
@@ -454,7 +540,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     try {
       await purchaseOrderRequestsApi.update(requestId, {
         supplier_id: poSupplierId,
-        items: selectedProducts.map(p => ({ product_id: p.id, order_case: Number(poOrderCase[p.id]) })),
+        items: selectedProducts.map(p => ({ product_id: p.id, order_case: Number(poOrderCase[p.id]) || 0, order_case_pieces: Number(poOrderCasePieces[p.id]) || 0 })),
       });
       await refreshData();
     } catch (e: any) {
@@ -483,7 +569,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       showAlert('Please select which supplier you are sending this order to.');
       return;
     }
-    const selectedProducts = data.products.filter(p => Number(poOrderCase[p.id]) > 0);
+    const selectedProducts = data.products.filter(p => Number(poOrderCase[p.id]) > 0 || Number(poOrderCasePieces[p.id]) > 0);
     if (selectedProducts.length === 0) {
       showAlert('Select at least one product and enter its order case quantity.');
       return;
@@ -493,7 +579,8 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       category: p.category,
       code: p.code,
       description: `${p.name} (${p.unit_value}${p.unit_type})`,
-      orderCase: Number(poOrderCase[p.id]),
+      orderCase: Number(poOrderCase[p.id]) || 0,
+      orderCasePieces: Number(poOrderCasePieces[p.id]) || 0,
     }));
     const workbook = buildPurchaseOrderWorkbook(excelItems, orderRef);
     // Close this modal before showing the result alert - two RN <Modal>s open
@@ -506,7 +593,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       await purchaseOrderRequestsApi.create({
         order_ref: orderRef,
         supplier_id: poSupplierId,
-        items: selectedProducts.map(p => ({ product_id: p.id, order_case: Number(poOrderCase[p.id]) })),
+        items: selectedProducts.map(p => ({ product_id: p.id, order_case: Number(poOrderCase[p.id]) || 0, order_case_pieces: Number(poOrderCasePieces[p.id]) || 0 })),
       });
       await refreshData();
     } catch (e: any) {
@@ -527,7 +614,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       return false;
     }
     if (purchaseForm.items.some(item => item.mrp <= 0)) {
-      showAlert('Please enter a valid MRP greater than zero for every item before confirming receipt.');
+      showAlert('Please enter a valid Piece MRP greater than zero for every item before confirming receipt.');
       return false;
     }
     return true;
@@ -544,7 +631,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     try {
       const createdPurchase = await purchasesApi.create({
         ...purchaseForm,
-        items: purchaseForm.items.map(({ mrp, purchase_discount_pct, wholesale_discount_pct, retail_discount_pct, wholesale_price, retail_price, ...rest }) => rest),
+        items: purchaseForm.items.map(({ mrp, box_mrp, purchase_discount_pct, wholesale_discount_pct, retail_discount_pct, wholesale_price, retail_price, ...rest }) => rest),
         bill_file_url: billFile?.dataUri,
         bill_file_name: billFile?.name,
         bill_file_type: billFile?.mimeType,
@@ -628,6 +715,14 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     newItems[index] = { ...current, [`${field}_price`]: price, [`${field}_discount_pct`]: discountFromPrice(current.mrp, price) };
     setPurchaseForm({ ...purchaseForm, items: newItems });
   };
+  // Box MRP -> MRP direction: editing Box MRP recomputes mrp (via
+  // mrpFromBoxMrp) and routes through updatePurchaseItem so the
+  // purchase/wholesale/retail prices stay in sync too.
+  const updatePurchaseItemBoxMrp = (index: number, boxMrp: number) => {
+    const item = purchaseForm.items[index];
+    const piecesPerBox = data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1;
+    updatePurchaseItem(index, { mrp: mrpFromBoxMrp(boxMrp, piecesPerBox) });
+  };
 
   useEffect(() => {
     if (swapFromTruckId === swapToTruckId) {
@@ -637,42 +732,53 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   }, [swapFromTruckId, swapToTruckId, data.trucks]);
 
   useEffect(() => {
-    const sourceCargo = data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && ti.quantity > 0);
+    const sourceCargo = data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && isPositiveQty(readQtyField(ti, 'quantity', 'quantity_pieces')));
     if (sourceCargo.length > 0) {
-      setSwapItems([{ product_id: sourceCargo[0].product_id, qty: Math.min(sourceCargo[0].quantity, 10) }]);
+      const ppb = data.products.find(p => p.id === sourceCargo[0].product_id)?.pieces_per_box ?? 1;
+      const available = readQtyField(sourceCargo[0], 'quantity', 'quantity_pieces');
+      const initial = compareQty({ boxes: 10, pieces: 0 }, available, ppb) > 0 ? available : { boxes: 10, pieces: 0 };
+      setSwapItems([{ product_id: sourceCargo[0].product_id, qty: initial }]);
     } else {
       setSwapItems([]);
     }
   }, [swapFromTruckId, data.truck_inventory]);
 
+  const warehousePoolQty = (prodId: string, source: 'available_qty' | 'reserved_qty'): BoxPieceQty => {
+    const inv = data.warehouse_inventory.find(i => i.product_id === prodId);
+    if (!inv) return { boxes: 0, pieces: 0 };
+    return source === 'reserved_qty' ? { boxes: inv.reserved_qty, pieces: inv.reserved_pieces } : { boxes: inv.available_qty, pieces: inv.available_pieces };
+  };
+
   const updateDispatchItem = (index: number, field: 'product_id' | 'qty' | 'source', value: any) => {
     const updated = [...dispatchItems];
     if (field === 'product_id') {
-      const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === value);
-      const availableQty = warehouseInv ? (updated[index].source === 'reserved_qty' ? warehouseInv.reserved_qty : warehouseInv.available_qty) : 0;
+      const ppb = data.products.find(p => p.id === value)?.pieces_per_box ?? 1;
+      const availableQty = warehousePoolQty(value, updated[index].source);
       const currentQty = updated[index].qty;
-      const nextQty = availableQty === 0 ? 0 : Math.min(availableQty, Math.max(1, currentQty));
+      const fallback = { boxes: 1, pieces: 0 };
+      const nextQty = !isPositiveQty(availableQty) ? { boxes: 0, pieces: 0 }
+        : compareQty(currentQty, availableQty, ppb) > 0 ? availableQty
+        : (isPositiveQty(currentQty) ? currentQty : fallback);
       updated[index] = { ...updated[index], product_id: value, qty: nextQty };
     } else if (field === 'qty') {
       const prodId = updated[index].product_id;
       const prodName = data.products.find(p => p.id === prodId)?.name || 'This product';
-      const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === prodId);
-      const availableQty = warehouseInv ? (updated[index].source === 'reserved_qty' ? warehouseInv.reserved_qty : warehouseInv.available_qty) : 0;
-      const maxAllowed = Math.max(0, availableQty);
-      const cleanStr = String(value).replace(/\D/g, '');
-      const requested = cleanStr === '' ? 0 : parseInt(cleanStr, 10);
-      if (requested > maxAllowed) {
-        showAlert(maxAllowed === 0
+      const ppb = data.products.find(p => p.id === prodId)?.pieces_per_box ?? 1;
+      const maxAllowed = warehousePoolQty(prodId, updated[index].source);
+      const requested: BoxPieceQty = value;
+      if (compareQty(requested, maxAllowed, ppb) > 0) {
+        showAlert(!isPositiveQty(maxAllowed)
           ? `${prodName} has none available in that pool right now.`
-          : `Limit exceeded! Only ${maxAllowed} units of ${prodName} are available in that pool.`);
+          : `Limit exceeded! Only ${formatQty(maxAllowed)} of ${prodName} are available in that pool.`);
       }
-      const nextQty = Math.min(maxAllowed, Math.max(0, requested));
+      const nextQty = compareQty(requested, maxAllowed, ppb) > 0 ? maxAllowed : requested;
       updated[index] = { ...updated[index], qty: nextQty };
     } else if (field === 'source') {
       const prodId = updated[index].product_id;
-      const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === prodId);
-      const availableQty = warehouseInv ? (value === 'reserved_qty' ? warehouseInv.reserved_qty : warehouseInv.available_qty) : 0;
-      const nextQty = availableQty === 0 ? 0 : Math.min(availableQty, 10);
+      const ppb = data.products.find(p => p.id === prodId)?.pieces_per_box ?? 1;
+      const availableQty = warehousePoolQty(prodId, value);
+      const tenBoxes = { boxes: 10, pieces: 0 };
+      const nextQty = !isPositiveQty(availableQty) ? { boxes: 0, pieces: 0 } : (compareQty(tenBoxes, availableQty, ppb) > 0 ? availableQty : tenBoxes);
       updated[index] = { ...updated[index], source: value, qty: nextQty };
     }
     setDispatchItems(updated);
@@ -683,9 +789,10 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     const activeProducts = data.products.filter(p => p.status === 'Active');
     const unusedProduct = activeProducts.find(p => !selectedIds.includes(p.id));
     const nextId = unusedProduct ? unusedProduct.id : (activeProducts[0]?.id || '');
-    const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === nextId);
-    const availableQty = warehouseInv ? warehouseInv.available_qty : 0;
-    const initialQty = availableQty === 0 ? 0 : Math.min(availableQty, 10);
+    const ppb = data.products.find(p => p.id === nextId)?.pieces_per_box ?? 1;
+    const availableQty = warehousePoolQty(nextId, 'available_qty');
+    const tenBoxes = { boxes: 10, pieces: 0 };
+    const initialQty = !isPositiveQty(availableQty) ? { boxes: 0, pieces: 0 } : (compareQty(tenBoxes, availableQty, ppb) > 0 ? availableQty : tenBoxes);
     setDispatchItems([...dispatchItems, { product_id: nextId, qty: initialQty, source: 'available_qty' }]);
   };
 
@@ -693,28 +800,31 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     setDispatchItems(dispatchItems.filter((_, i) => i !== index));
   };
 
-  const handleAddPreBookingItemToDispatch = (productId: string, qty: number, preBookingId: string) => {
+  const handleAddPreBookingItemToDispatch = (productId: string, qty: BoxPieceQty, preBookingId: string) => {
+    const ppb = data.products.find(p => p.id === productId)?.pieces_per_box ?? 1;
     setDispatchItems(prev => {
       const existingIdx = prev.findIndex(item => item.product_id === productId && item.preBookingId === preBookingId);
       if (existingIdx >= 0) {
         const updated = [...prev];
-        updated[existingIdx] = { ...updated[existingIdx], qty: updated[existingIdx].qty + qty };
+        updated[existingIdx] = { ...updated[existingIdx], qty: addQty(updated[existingIdx].qty, qty, ppb) };
         return updated;
       }
       return [...prev, { product_id: productId, qty, source: 'reserved_qty' as const, preBookingId }];
     });
-    showAlert({ type: 'success', message: `Added ${qty} unit(s) of ${data.products.find(p => p.id === productId)?.name || 'product'} to the dispatch queue from the reserved pool.` });
+    showAlert({ type: 'success', message: `Added ${formatQty(qty)} of ${data.products.find(p => p.id === productId)?.name || 'product'} to the dispatch queue from the reserved pool.` });
   };
 
-  const handleAddAllPreBookingItemsToDispatch = (items: { product_id: string; quantity: number }[], preBookingId: string) => {
+  const handleAddAllPreBookingItemsToDispatch = (items: { product_id: string; quantity: number; quantity_pieces: number }[], preBookingId: string) => {
     setDispatchItems(prev => {
       let updated = [...prev];
       items.forEach(item => {
+        const ppb = data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1;
+        const itemQty: BoxPieceQty = { boxes: item.quantity, pieces: item.quantity_pieces };
         const existingIdx = updated.findIndex(di => di.product_id === item.product_id && di.preBookingId === preBookingId);
         if (existingIdx >= 0) {
-          updated[existingIdx] = { ...updated[existingIdx], qty: updated[existingIdx].qty + item.quantity };
+          updated[existingIdx] = { ...updated[existingIdx], qty: addQty(updated[existingIdx].qty, itemQty, ppb) };
         } else {
-          updated.push({ product_id: item.product_id, qty: item.quantity, source: 'reserved_qty' as const, preBookingId });
+          updated.push({ product_id: item.product_id, qty: itemQty, source: 'reserved_qty' as const, preBookingId });
         }
       });
       return updated;
@@ -722,26 +832,32 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     showAlert({ type: 'success', message: 'Added all pre-booked items to the dispatch queue from the reserved pool.' });
   };
 
+  const truckCargoQty = (truckId: string, prodId: string): BoxPieceQty => {
+    const inv = data.truck_inventory.find(ti => ti.truck_id === truckId && ti.product_id === prodId);
+    return inv ? { boxes: inv.quantity, pieces: inv.quantity_pieces } : { boxes: 0, pieces: 0 };
+  };
+
   const updateSwapItem = (index: number, field: 'product_id' | 'qty', value: any) => {
     const updated = [...swapItems];
     if (field === 'product_id') {
-      const sourceInv = data.truck_inventory.find(ti => ti.truck_id === swapFromTruckId && ti.product_id === value);
-      const available = sourceInv ? sourceInv.quantity : 0;
+      const ppb = data.products.find(p => p.id === value)?.pieces_per_box ?? 1;
+      const available = truckCargoQty(swapFromTruckId, value);
       const currentQty = updated[index].qty;
-      const nextQty = available === 0 ? 0 : Math.min(available, Math.max(1, currentQty));
+      const fallback = { boxes: 1, pieces: 0 };
+      const nextQty = !isPositiveQty(available) ? { boxes: 0, pieces: 0 }
+        : compareQty(currentQty, available, ppb) > 0 ? available
+        : (isPositiveQty(currentQty) ? currentQty : fallback);
       updated[index] = { ...updated[index], product_id: value, qty: nextQty };
     } else {
       const prodId = updated[index].product_id;
       const prodName = data.products.find(p => p.id === prodId)?.name || 'This product';
-      const sourceInv = data.truck_inventory.find(ti => ti.truck_id === swapFromTruckId && ti.product_id === prodId);
-      const available = sourceInv ? sourceInv.quantity : 0;
-      const maxAllowed = Math.max(0, available);
-      const cleanStr = String(value).replace(/\D/g, '');
-      const requested = cleanStr === '' ? 0 : parseInt(cleanStr, 10);
-      if (requested > maxAllowed) {
-        showAlert(`Limit exceeded! Only ${maxAllowed} units of ${prodName} are loaded on the source truck.`);
+      const ppb = data.products.find(p => p.id === prodId)?.pieces_per_box ?? 1;
+      const maxAllowed = truckCargoQty(swapFromTruckId, prodId);
+      const requested: BoxPieceQty = value;
+      if (compareQty(requested, maxAllowed, ppb) > 0) {
+        showAlert(`Limit exceeded! Only ${formatQty(maxAllowed)} of ${prodName} are loaded on the source truck.`);
       }
-      const nextQty = Math.min(maxAllowed, Math.max(0, requested));
+      const nextQty = compareQty(requested, maxAllowed, ppb) > 0 ? maxAllowed : requested;
       updated[index] = { ...updated[index], qty: nextQty };
     }
     setSwapItems(updated);
@@ -749,9 +865,13 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
   const addSwapItem = () => {
     const selectedIds = swapItems.map(item => item.product_id);
-    const unusedCargo = data.truck_inventory.find(ti => ti.truck_id === swapFromTruckId && ti.quantity > 0 && !selectedIds.includes(ti.product_id));
+    const unusedCargo = data.truck_inventory.find(ti => ti.truck_id === swapFromTruckId && isPositiveQty(readQtyField(ti, 'quantity', 'quantity_pieces')) && !selectedIds.includes(ti.product_id));
     if (!unusedCargo) return;
-    setSwapItems([...swapItems, { product_id: unusedCargo.product_id, qty: Math.min(unusedCargo.quantity, 10) }]);
+    const ppb = data.products.find(p => p.id === unusedCargo.product_id)?.pieces_per_box ?? 1;
+    const available = readQtyField(unusedCargo, 'quantity', 'quantity_pieces');
+    const tenBoxes = { boxes: 10, pieces: 0 };
+    const initial = compareQty(tenBoxes, available, ppb) > 0 ? available : tenBoxes;
+    setSwapItems([...swapItems, { product_id: unusedCargo.product_id, qty: initial }]);
   };
 
   const removeSwapItem = (index: number) => {
@@ -763,10 +883,10 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     const inv = data.warehouse_inventory.find(i => i.product_id === productId);
     setCorrectionForm({
       product_id: productId,
-      available_qty: String(inv?.available_qty ?? 0),
-      reserved_qty: String(inv?.reserved_qty ?? 0),
-      damaged_qty: String(inv?.damaged_qty ?? 0),
-      expired_qty: String(inv?.expired_qty ?? 0),
+      available_qty: { boxes: inv?.available_qty ?? 0, pieces: inv?.available_pieces ?? 0 },
+      reserved_qty: { boxes: inv?.reserved_qty ?? 0, pieces: inv?.reserved_pieces ?? 0 },
+      damaged_qty: { boxes: inv?.damaged_qty ?? 0, pieces: inv?.damaged_pieces ?? 0 },
+      expired_qty: { boxes: inv?.expired_qty ?? 0, pieces: inv?.expired_pieces ?? 0 },
       comment: '',
     });
     setShowCorrectionModal(true);
@@ -776,10 +896,10 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     try {
       await warehouseApi.correct({
         product_id: correctionForm.product_id,
-        available_qty: Math.max(0, Number(correctionForm.available_qty) || 0),
-        reserved_qty: Math.max(0, Number(correctionForm.reserved_qty) || 0),
-        damaged_qty: Math.max(0, Number(correctionForm.damaged_qty) || 0),
-        expired_qty: Math.max(0, Number(correctionForm.expired_qty) || 0),
+        available_qty: correctionForm.available_qty,
+        reserved_qty: correctionForm.reserved_qty,
+        damaged_qty: correctionForm.damaged_qty,
+        expired_qty: correctionForm.expired_qty,
         comment: correctionForm.comment,
       });
       await refreshData();
@@ -797,8 +917,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       return;
     }
     for (const item of dispatchItems) {
-      const q = Number(item.qty);
-      if (isNaN(q) || q <= 0) {
+      if (!isPositiveQty(item.qty)) {
         showAlert('All dispatch quantities must be greater than zero.');
         return;
       }
@@ -808,7 +927,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     try {
       await dispatchApi.load({
         truck_id: dispatchTruckId,
-        items: dispatchItems.map(item => ({ product_id: item.product_id, qty: Number(item.qty), source: item.source, pre_booking_id: item.preBookingId })),
+        items: dispatchItems.map(item => ({ product_id: item.product_id, qty: item.qty, source: item.source, pre_booking_id: item.preBookingId })),
       });
       await refreshData();
       addNotification('delivery', `Truck Batch Loaded: Loaded ${dispatchItems.length} product(s) onto vehicle ${truckNum}`);
@@ -819,13 +938,12 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     }
   };
 
-  const handleReturnStock = async (truckId: string, productId: string, qty: number) => {
+  const handleReturnStock = async (truckId: string, productId: string, qty: BoxPieceQty) => {
     if (currentUser?.role !== 'Admin' && currentUser?.role !== 'Warehouse') {
       showAlert('Unauthorized: Only Admin or Warehouse operators can return stock to the warehouse.');
       return;
     }
-    const returnQty = Number(qty);
-    if (isNaN(returnQty) || returnQty <= 0) {
+    if (!isPositiveQty(qty)) {
       showAlert('Please enter a valid return quantity.');
       return;
     }
@@ -833,9 +951,9 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     try {
       const prodName = data.products.find(p => p.id === productId)?.name || 'Product';
       const truckNum = data.trucks.find(t => t.id === truckId)?.vehicle_number || 'Truck';
-      await dispatchApi.returnStock(truckId, productId, returnQty);
+      await dispatchApi.returnStock(truckId, productId, qty);
       await refreshData();
-      addNotification('delivery', `Stock returned: recalled ${returnQty} units of ${prodName} from ${truckNum}`);
+      addNotification('delivery', `Stock returned: recalled ${formatQty(qty)} of ${prodName} from ${truckNum}`);
       showAlert('Stock successfully returned to warehouse.');
     } catch (error: any) {
       showAlert(`Transaction failed: ${error.message}. All changes rolled back.`);
@@ -854,12 +972,14 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     }
 
     try {
-      const returnedCount = truckCargo.reduce((sum, c) => sum + Number(c.quantity), 0);
+      const returnedBoxes = truckCargo.reduce((sum, c) => sum + Number(c.quantity), 0);
+      const returnedPieces = truckCargo.reduce((sum, c) => sum + Number(c.quantity_pieces), 0);
+      const returnedLabel = formatQty({ boxes: returnedBoxes, pieces: returnedPieces });
       const truckNum = data.trucks.find(t => t.id === truckId)?.vehicle_number || 'Truck';
       await dispatchApi.returnAll(truckId);
       await refreshData();
-      addNotification('delivery', `Stock returned: recalled ALL (${returnedCount} units) products from Truck ${truckNum}`);
-      showAlert(`Successfully returned all ${returnedCount} units back to the warehouse.`);
+      addNotification('delivery', `Stock returned: recalled ALL (${returnedLabel}) products from Truck ${truckNum}`);
+      showAlert(`Successfully returned all ${returnedLabel} back to the warehouse.`);
     } catch (error: any) {
       showAlert(`Transaction failed: ${error.message}. All changes rolled back.`);
     }
@@ -876,8 +996,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     }
 
     for (const item of swapItems) {
-      const q = Number(item.qty);
-      if (isNaN(q) || q <= 0) {
+      if (!isPositiveQty(item.qty)) {
         showAlert('All transfer quantities must be greater than zero.');
         return;
       }
@@ -890,12 +1009,12 @@ export default function AdminWarehouse({ data, setData, addNotification, current
       await dispatchApi.transfer({
         from_truck_id: swapFromTruckId,
         to_truck_id: swapToTruckId,
-        items: swapItems.map(item => ({ product_id: item.product_id, qty: Number(item.qty) })),
+        items: swapItems.map(item => ({ product_id: item.product_id, qty: item.qty })),
       });
       await refreshData();
       addNotification('delivery', `Inter-truck stock batch transfer: Moved ${swapItems.length} product(s) from ${sourceNum} to ${destNum}`);
       showAlert('Inter-truck batch transfer successful!');
-      setSwapItems([{ product_id: data.products[0]?.id || '', qty: 10 }]);
+      setSwapItems([{ product_id: data.products[0]?.id || '', qty: { boxes: 10, pieces: 0 } }]);
     } catch (e: any) {
       showAlert(e.message ?? 'Unable to transfer stock between trucks.');
     }
@@ -912,7 +1031,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   // in the Ice Cream Catalog, making the two screens disagree on what exists.
   const activeWarehouseInventory: WarehouseInventory[] = data.products
     .filter(p => p.status === 'Active')
-    .map(p => data.warehouse_inventory.find(inv => inv.product_id === p.id) ?? { product_id: p.id, available_qty: 0, reserved_qty: 0, damaged_qty: 0, expired_qty: 0 });
+    .map(p => data.warehouse_inventory.find(inv => inv.product_id === p.id) ?? { product_id: p.id, available_qty: 0, available_pieces: 0, reserved_qty: 0, reserved_pieces: 0, damaged_qty: 0, damaged_pieces: 0, expired_qty: 0, expired_pieces: 0 });
   const oosFlavorCount = activeWarehouseInventory.filter(i => i.available_qty === 0).length;
   const lowFlavorCount = activeWarehouseInventory.filter(i => i.available_qty > 0 && i.available_qty <= 100).length;
   // Client-side filter over the already-loaded product list (no network
@@ -921,17 +1040,21 @@ export default function AdminWarehouse({ data, setData, addNotification, current
   // badges above intentionally keep counting the FULL list regardless of
   // this search, since they're a warehouse-wide health signal, not scoped
   // to whatever's currently being searched for.
-  const filteredWarehouseInventory = activeWarehouseInventory.filter(inv => {
-    const q = warehouseSearch.trim().toLowerCase();
+  // Debounced so typing/backspacing doesn't re-filter and re-render the
+  // whole warehouse stock list on every keystroke - see useDebouncedValue.
+  const debouncedWarehouseSearch = useDebouncedValue(warehouseSearch, 150);
+  const filteredWarehouseInventory = useMemo(() => activeWarehouseInventory.filter(inv => {
+    const q = debouncedWarehouseSearch.trim().toLowerCase();
     if (!q) return true;
     const product = data.products.find(p => p.id === inv.product_id);
     return !!product && (product.name.toLowerCase().includes(q) || product.code.toLowerCase().includes(q));
-  });
+  }), [activeWarehouseInventory, data.products, debouncedWarehouseSearch]);
+  const warehouseSearchSuggestions = useMemo(() => data.products.filter(p => p.status === 'Active').map(p => p.name), [data.products]);
   const truckOptions = data.trucks.filter(t => t.status === 'Active').map(t => ({ label: `${t.vehicle_number} (${t.area})`, value: t.id }));
   const supplierOptions = data.suppliers.filter(s => s.status === 'Active').map(s => ({ label: s.name, value: s.id }));
   const pendingPurchaseOrders = data.purchaseOrderRequests.filter(r => r.status === 'Pending');
   const inputClass = "w-full bg-slate-50 border border-slate-200 rounded-lg p-2 text-xs text-slate-800";
-  const retailEnabled = isRetailPricingEnabled(data.rolePermissions);
+  const retailEnabled = isRetailPricingEnabled(currentUser, data.rolePermissions, data.userPermissions);
 
   if (warehouseForm === 'receive_stock') {
     return (
@@ -1001,17 +1124,16 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                     },
                   },
                   {
-                    key: 'qty', label: 'Qty', width: 70, align: 'center',
+                    key: 'qty', label: 'Qty', width: 130, align: 'center',
                     render: item => {
                       const index = purchaseForm.items.indexOf(item);
+                      const piecesPerBox = data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1;
                       return (
-                        <TextInput
-                          keyboardType="number-pad"
-                          value={item.quantity === 0 ? '' : String(item.quantity)}
-                          onChangeText={v => updatePurchaseItem(index, { quantity: Number(v) || 0 })}
-                          placeholder="0"
-                          placeholderTextColor="#94a3b8"
-                          className="w-full bg-white border border-slate-200 rounded p-1.5 text-xs text-center"
+                        <BoxPieceInput
+                          value={{ boxes: item.quantity, pieces: item.quantity_pieces }}
+                          onChange={q => updatePurchaseItem(index, { quantity: q.boxes, quantity_pieces: q.pieces })}
+                          piecesPerBox={piecesPerBox}
+                          compact
                         />
                       );
                     },
@@ -1031,10 +1153,17 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                     },
                   },
                   {
-                    key: 'mrp', label: 'MRP', width: 80, align: 'center',
+                    key: 'mrp', label: 'Pc MRP', width: 80, align: 'center',
                     render: item => {
                       const index = purchaseForm.items.indexOf(item);
                       return <TextInput keyboardType="decimal-pad" value={item.mrp === 0 ? '' : String(item.mrp)} onChangeText={v => updatePurchaseItem(index, { mrp: Number(v) || 0 })} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded p-1.5 text-xs text-center" />;
+                    },
+                  },
+                  {
+                    key: 'box_mrp', label: 'Box MRP', width: 80, align: 'center',
+                    render: item => {
+                      const index = purchaseForm.items.indexOf(item);
+                      return <TextInput keyboardType="decimal-pad" value={item.box_mrp === 0 ? '' : String(item.box_mrp)} onChangeText={v => updatePurchaseItemBoxMrp(index, Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded p-1.5 text-xs text-center" />;
                     },
                   },
                   {
@@ -1149,15 +1278,12 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                     </View>
 
                     <View className="flex-row gap-1.5">
-                      <View className="w-14">
+                      <View>
                         <Text className="font-bold text-slate-400 text-[9px] mb-1">Qty</Text>
-                        <TextInput
-                          keyboardType="number-pad"
-                          value={item.quantity === 0 ? '' : String(item.quantity)}
-                          onChangeText={v => updateItem({ quantity: Number(v) || 0 })}
-                          placeholder="0"
-                          placeholderTextColor="#94a3b8"
-                          className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs text-center"
+                        <BoxPieceInput
+                          value={{ boxes: item.quantity, pieces: item.quantity_pieces }}
+                          onChange={q => updateItem({ quantity: q.boxes, quantity_pieces: q.pieces })}
+                          piecesPerBox={data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1}
                         />
                       </View>
                       <View className="flex-1 min-w-0">
@@ -1179,8 +1305,12 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                         <Text className="font-bold text-slate-400 text-[9px] uppercase">Pricing for this product</Text>
                         <View className="flex-row flex-wrap gap-1.5">
                           <View className="w-[48%]">
-                            <Text className="font-bold text-slate-400 text-[9px] mb-1">MRP (Rs)</Text>
+                            <Text className="font-bold text-slate-400 text-[9px] mb-1">Piece MRP (Rs)</Text>
                             <TextInput keyboardType="decimal-pad" value={item.mrp === 0 ? '' : String(item.mrp)} onChangeText={v => updateItem({ mrp: Number(v) || 0 })} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs text-center" />
+                          </View>
+                          <View className="w-[48%]">
+                            <Text className="font-bold text-slate-400 text-[9px] mb-1">Box MRP (Rs)</Text>
+                            <TextInput keyboardType="decimal-pad" value={item.box_mrp === 0 ? '' : String(item.box_mrp)} onChangeText={v => updatePurchaseItemBoxMrp(index, Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs text-center" />
                           </View>
                           <View className="w-[48%]">
                             <Text className="font-bold text-slate-400 text-[9px] mb-1">Purchase %</Text>
@@ -1263,13 +1393,22 @@ export default function AdminWarehouse({ data, setData, addNotification, current
     );
   }
 
+  if (visibleTabs.length === 0) {
+    return (
+      <View className="items-center justify-center py-20 gap-2">
+        <Text className="text-slate-500 font-bold text-sm text-center">You don't currently have access to any Warehouse & Fleet screens.</Text>
+        <Text className="text-slate-400 text-xs text-center">Contact your administrator.</Text>
+      </View>
+    );
+  }
+
   return (
     <View className="gap-3">
       <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
-        {(['warehouse', 'transfers', 'trucks', 'audits'] as const).map(t => (
+        {visibleTabs.map(t => (
           <Pressable key={t} onPress={() => setActiveTab(t)} className={`py-1.5 px-3 rounded-lg items-center ${activeTab === t ? 'bg-indigo-600' : ''}`}>
             <Text className={`text-[10px] font-extrabold capitalize ${activeTab === t ? 'text-white' : 'text-slate-500'}`}>
-              {t === 'transfers' ? 'Load & Transfer' : t === 'audits' ? 'Movement Logs' : t}
+              {t === 'transfers' ? 'Load & Transfer' : t === 'audits' ? 'Movement Logs' : t === 'assets' ? 'Assets & Freezer Boxes' : t}
             </Text>
           </Pressable>
         ))}
@@ -1301,7 +1440,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
             </View>
           </View>
 
-          {/* {!hideAdminControls && (
+          {!hideAdminControls && (
             <View className="bg-amber-50 p-2 rounded-xl border border-amber-200 flex-row items-center justify-between">
               <View className="flex-row items-center gap-1.5">
                 <RefreshCw size={14} color="#92400e" />
@@ -1311,7 +1450,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                 <Text className="text-white text-[9px] font-extrabold">Reset / Clear All Values</Text>
               </Pressable>
             </View>
-          )} */}
+          )}
 
           <View className="bg-white rounded-2xl border border-slate-200 p-2.5">
             <View className="flex-row items-center justify-between flex-wrap gap-1.5 mb-1.5 px-0.5">
@@ -1333,21 +1472,18 @@ export default function AdminWarehouse({ data, setData, addNotification, current
               </View>
             </View>
 
-            <View className="flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 mb-1.5">
+            <View className="flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 mb-1.5 z-20">
               <Search size={14} color="#94a3b8" />
-              <TextInput
+              <AutocompleteInput
                 value={warehouseSearch}
                 onChangeText={setWarehouseSearch}
+                suggestions={warehouseSearchSuggestions}
                 placeholder="Search product name or SKU code..."
                 placeholderTextColor="#94a3b8"
-                className="flex-1 text-xs text-slate-800 py-2.5"
+                containerClassName="flex-1"
+                className="text-xs text-slate-800 py-2.5"
                 style={{ outlineStyle: 'none' } as any}
               />
-              {warehouseSearch.length > 0 && (
-                <Pressable onPress={() => setWarehouseSearch('')} hitSlop={8}>
-                  <X size={14} color="#94a3b8" />
-                </Pressable>
-              )}
             </View>
 
             <View className="mb-1.5">
@@ -1365,16 +1501,16 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                     render: inv => <Text numberOfLines={1} className="font-bold text-slate-800 text-[11px]">{data.products.find(p => p.id === inv.product_id)?.name || 'Unknown'}</Text>,
                   },
                   {
-                    key: 'available', label: 'Avail', width: 70, align: 'center',
+                    key: 'available', label: 'Avail', width: 80, align: 'center',
                     render: inv => {
                       const isOOS = inv.available_qty === 0;
                       const isLow = inv.available_qty > 0 && inv.available_qty <= 100;
-                      return <Text className={`text-center text-[11px] font-black ${isOOS ? 'text-red-500' : isLow ? 'text-amber-500' : 'text-slate-800'}`}>{inv.available_qty}</Text>;
+                      return <Text className={`text-center text-[11px] font-black ${isOOS ? 'text-red-500' : isLow ? 'text-amber-500' : 'text-slate-800'}`}>{formatQtyShort({ boxes: inv.available_qty, pieces: inv.available_pieces })}</Text>;
                     },
                   },
-                  { key: 'reserved', label: 'Reserved', width: 70, align: 'center', render: inv => <Text className="text-center text-slate-600 text-[11px] font-black">{inv.reserved_qty}</Text> },
-                  { key: 'damaged', label: 'Damaged', width: 70, align: 'center', render: inv => <Text className="text-center text-red-500 text-[11px] font-black">{inv.damaged_qty}</Text> },
-                  { key: 'expired', label: 'Expired', width: 70, align: 'center', render: inv => <Text className="text-center text-purple-500 text-[11px] font-black">{inv.expired_qty}</Text> },
+                  { key: 'reserved', label: 'Reserved', width: 80, align: 'center', render: inv => <Text className="text-center text-slate-600 text-[11px] font-black">{formatQtyShort({ boxes: inv.reserved_qty, pieces: inv.reserved_pieces })}</Text> },
+                  { key: 'damaged', label: 'Damaged', width: 80, align: 'center', render: inv => <Text className="text-center text-red-500 text-[11px] font-black">{formatQtyShort({ boxes: inv.damaged_qty, pieces: inv.damaged_pieces })}</Text> },
+                  { key: 'expired', label: 'Expired', width: 80, align: 'center', render: inv => <Text className="text-center text-purple-500 text-[11px] font-black">{formatQtyShort({ boxes: inv.expired_qty, pieces: inv.expired_pieces })}</Text> },
                   {
                     key: 'status', label: 'Status', width: 70, align: 'center', grow: false,
                     render: inv => {
@@ -1400,9 +1536,9 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                 ] as DataTableColumn<typeof activeWarehouseInventory[number]>[]}
               />
             ) : (
-              <View className="gap-3 md:flex-row md:flex-wrap">
+              <View className={`gap-3 md:flex-row md:flex-wrap ${filteredWarehouseInventory.length === 0 ? 'flex-1' : ''}`}>
                 {filteredWarehouseInventory.length === 0 ? (
-                  <Text className="w-full py-6 text-center text-slate-400 italic text-xs">{warehouseSearch.trim() ? 'No products match your search.' : 'No warehouse stock records found.'}</Text>
+                  <EmptyState message={warehouseSearch.trim() ? 'No products match your search.' : 'No warehouse stock records found.'} />
                 ) : (
                   filteredWarehouseInventory.map(inv => {
                     const product = data.products.find(p => p.id === inv.product_id);
@@ -1430,19 +1566,19 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                           <View className="flex-row justify-between pt-1.5 border-t border-slate-50">
                             <View className="flex-1 items-start">
                               <Text className="text-slate-400 text-[8px] font-bold uppercase">Avail</Text>
-                              <Text className={`font-black text-[12px] ${isOOS ? 'text-red-500' : isLow ? 'text-amber-500' : 'text-slate-800'}`}>{inv.available_qty}</Text>
+                              <Text className={`font-black text-[12px] ${isOOS ? 'text-red-500' : isLow ? 'text-amber-500' : 'text-slate-800'}`}>{formatQtyShort({ boxes: inv.available_qty, pieces: inv.available_pieces })}</Text>
                             </View>
                             <View className="flex-1 items-center">
                               <Text className="text-slate-400 text-[8px] font-bold uppercase">Reserved</Text>
-                              <Text className="font-black text-[12px] text-slate-600">{inv.reserved_qty}</Text>
+                              <Text className="font-black text-[12px] text-slate-600">{formatQtyShort({ boxes: inv.reserved_qty, pieces: inv.reserved_pieces })}</Text>
                             </View>
                             <View className="flex-1 items-center">
                               <Text className="text-slate-400 text-[8px] font-bold uppercase">Damaged</Text>
-                              <Text className="font-black text-[12px] text-red-500">{inv.damaged_qty}</Text>
+                              <Text className="font-black text-[12px] text-red-500">{formatQtyShort({ boxes: inv.damaged_qty, pieces: inv.damaged_pieces })}</Text>
                             </View>
                             <View className="flex-1 items-end">
                               <Text className="text-slate-400 text-[8px] font-bold uppercase">Expired</Text>
-                              <Text className="font-black text-[12px] text-purple-500">{inv.expired_qty}</Text>
+                              <Text className="font-black text-[12px] text-purple-500">{formatQtyShort({ boxes: inv.expired_qty, pieces: inv.expired_pieces })}</Text>
                             </View>
                           </View>
                         </View>
@@ -1553,7 +1689,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                   }
 
                   return (
-                    <View className="gap-2 md:flex-row md:flex-wrap">
+                    <View className={`gap-2 md:flex-row md:flex-wrap ${filteredTrucks.length === 0 ? 'flex-1' : ''}`}>
                       {filteredTrucks.map(t => {
                         const driver = data.users.find(u => u.id === t.driver_user_id);
                         const isInactive = t.status === 'Inactive';
@@ -1585,7 +1721,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                         );
                       })}
                       {filteredTrucks.length === 0 && (
-                        <Text className="w-full text-[10px] text-slate-400 italic py-2 text-center">{emptyText}</Text>
+                        <EmptyState message={emptyText} />
                       )}
                     </View>
                   );
@@ -1674,42 +1810,27 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
               const renderStepper = (ti: typeof truckCargo[number]) => {
                 const prod = data.products.find(p => p.id === ti.product_id)!;
-                const currentInputVal = returnQuantities[ti.product_id] !== undefined ? returnQuantities[ti.product_id] : '1';
+                const cargoQty: BoxPieceQty = { boxes: ti.quantity, pieces: ti.quantity_pieces };
+                const currentVal = returnQuantities[ti.product_id] ?? { boxes: 1, pieces: 0 };
                 return (
                   <View className="flex-row items-center gap-1.5 bg-white p-1 rounded-lg border border-slate-200">
-                    <Pressable
-                      onPress={() => { const currNum = Number(currentInputVal) || 1; setReturnQuantities(prev => ({ ...prev, [ti.product_id]: String(Math.max(1, currNum - 1)) })); }}
-                      className="w-7 h-7 bg-slate-100 rounded items-center justify-center active:bg-slate-200"
-                    >
-                      <Text className="font-black text-slate-700 text-xs">-</Text>
-                    </Pressable>
-                    <TextInput
-                      keyboardType="number-pad"
-                      value={currentInputVal}
-                      onChangeText={v => {
-                        const num = Number(v);
-                        if (v === '') setReturnQuantities(prev => ({ ...prev, [ti.product_id]: '' }));
-                        else if (!isNaN(num)) {
-                          if (num > ti.quantity) showAlert(`Only ${ti.quantity} units of ${prod.name} are loaded on this truck.`);
-                          setReturnQuantities(prev => ({ ...prev, [ti.product_id]: String(Math.max(1, Math.min(ti.quantity, num))) }));
-                        }
+                    <BoxPieceInput
+                      value={currentVal}
+                      onChange={q => {
+                        if (compareQty(q, cargoQty, prod.pieces_per_box) > 0) showAlert(`Only ${formatQty(cargoQty)} of ${prod.name} are loaded on this truck.`);
+                        const clamped = compareQty(q, cargoQty, prod.pieces_per_box) > 0 ? cargoQty : q;
+                        setReturnQuantities(prev => ({ ...prev, [ti.product_id]: clamped }));
                       }}
-                      className="w-12 bg-white border border-slate-200 rounded p-1 text-center font-bold text-[11px]"
+                      piecesPerBox={prod.pieces_per_box}
+                      compact
                     />
                     <Pressable
-                      onPress={() => { const currNum = Number(currentInputVal) || 1; setReturnQuantities(prev => ({ ...prev, [ti.product_id]: String(Math.min(ti.quantity, currNum + 1)) })); }}
-                      className="w-7 h-7 bg-slate-100 rounded items-center justify-center active:bg-slate-200"
-                    >
-                      <Text className="font-black text-slate-700 text-xs">+</Text>
-                    </Pressable>
-                    <Pressable
                       onPress={() => {
-                        const val = Number(currentInputVal);
-                        if (!isNaN(val) && val > 0 && val <= ti.quantity) {
-                          handleReturnStock(activeTruckId, ti.product_id, val);
+                        if (isPositiveQty(currentVal) && compareQty(currentVal, cargoQty, prod.pieces_per_box) <= 0) {
+                          handleReturnStock(activeTruckId, ti.product_id, currentVal);
                           setReturnQuantities(prev => { const next = { ...prev }; delete next[ti.product_id]; return next; });
                         } else {
-                          showAlert(`Please enter a quantity between 1 and ${ti.quantity}`);
+                          showAlert(`Please enter a quantity between 1 pc and ${formatQty(cargoQty)}`);
                         }
                       }}
                       className="py-1.5 px-2.5 bg-indigo-500 rounded-md items-center active:bg-indigo-600"
@@ -1717,7 +1838,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                       <Text className="text-white text-[9px] font-extrabold">Return Qty</Text>
                     </Pressable>
                     <Pressable
-                      onPress={() => { handleReturnStock(activeTruckId, ti.product_id, Number(ti.quantity)); setReturnQuantities(prev => { const next = { ...prev }; delete next[ti.product_id]; return next; }); }}
+                      onPress={() => { handleReturnStock(activeTruckId, ti.product_id, cargoQty); setReturnQuantities(prev => { const next = { ...prev }; delete next[ti.product_id]; return next; }); }}
                       className="py-1.5 px-2 bg-slate-200 rounded-md items-center active:bg-slate-300"
                     >
                       <Text className="text-slate-600 text-[9px] font-extrabold">All</Text>
@@ -1745,7 +1866,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                           );
                         },
                       },
-                      { key: 'qty', label: 'Qty Loaded', width: 90, align: 'center', grow: false, render: ti => <Text className="font-black text-rose-500 bg-rose-50 px-2 py-0.5 rounded text-[10px] text-center">{ti.quantity}</Text> },
+                      { key: 'qty', label: 'Qty Loaded', width: 90, align: 'center', grow: false, render: ti => <Text className="font-black text-rose-500 bg-rose-50 px-2 py-0.5 rounded text-[10px] text-center">{formatQtyShort({ boxes: ti.quantity, pieces: ti.quantity_pieces })}</Text> },
                       { key: 'return', label: 'Return Quantity', width: 260, grow: false, render: renderStepper },
                     ] as DataTableColumn<typeof truckCargo[number]>[]}
                   />
@@ -1753,7 +1874,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
               }
 
               return truckCargo.length === 0 ? (
-                <Text className="py-6 text-center text-slate-400 italic text-xs">This truck has no cargo stock loaded currently.</Text>
+                <EmptyState message="This truck has no cargo stock loaded currently." />
               ) : (
                 <View className="gap-2 md:flex-row md:flex-wrap">
                   {truckCargo.map(ti => {
@@ -1765,7 +1886,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                             <Text className="font-bold text-slate-800 text-xs">{prod.name}</Text>
                             <Text className="text-[9px] text-slate-400 uppercase font-mono">{ti.product_id}</Text>
                           </View>
-                          <Text className="font-black text-rose-500 bg-rose-50 px-2 py-0.5 rounded text-[10px]">{ti.quantity} units loaded</Text>
+                          <Text className="font-black text-rose-500 bg-rose-50 px-2 py-0.5 rounded text-[10px]">{formatQty({ boxes: ti.quantity, pieces: ti.quantity_pieces })} loaded</Text>
                         </View>
                         {renderStepper(ti)}
                       </View>
@@ -1831,14 +1952,17 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                 const bMatch = b.salesperson_id === dispatchDriverId ? 0 : 1;
                 return aMatch - bMatch;
               });
-              const totalUnits = pendingPreBookings.reduce((sum, pb) => sum + pb.items.reduce((s, i) => s + i.quantity, 0), 0);
+              const totalUnits = formatQty({
+                boxes: pendingPreBookings.reduce((sum, pb) => sum + pb.items.reduce((s, i) => s + i.quantity, 0), 0),
+                pieces: pendingPreBookings.reduce((sum, pb) => sum + pb.items.reduce((s, i) => s + i.quantity_pieces, 0), 0),
+              });
               return (
                 <View className="bg-amber-50 border border-amber-200 rounded-xl p-3 gap-2">
                   <Pressable onPress={() => setShowDispatchPreBookings(!showDispatchPreBookings)} className="flex-row items-center justify-between">
                     <View className="flex-row items-center gap-2 flex-1">
                       <ClipboardList size={16} color="#b45309" />
                       <Text className="text-[11px] font-bold text-amber-800 flex-1">
-                        {pendingPreBookings.length} pre-booked order(s) ({totalUnits} units) still reserved and waiting to be loaded onto a truck - don't forget to dispatch this cargo!
+                        {pendingPreBookings.length} pre-booked order(s) ({totalUnits}) still reserved and waiting to be loaded onto a truck - don't forget to dispatch this cargo!
                       </Text>
                     </View>
                     <Text className="text-[10px] font-bold text-amber-700 underline">{showDispatchPreBookings ? 'Hide' : 'Invoice Draft & Preview'}</Text>
@@ -1867,9 +1991,9 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                               const alreadyAdded = dispatchItems.some(di => di.product_id === item.product_id && di.preBookingId === pb.id);
                               return (
                                 <View key={idx} className="flex-row items-center justify-between bg-slate-50 rounded-lg px-2 py-1">
-                                  <Text className="text-[10px] text-slate-600 flex-1">{product?.name || item.product_id} x {item.quantity}</Text>
+                                  <Text className="text-[10px] text-slate-600 flex-1">{product?.name || item.product_id} x {formatQty({ boxes: item.quantity, pieces: item.quantity_pieces })}</Text>
                                   <Pressable
-                                    onPress={() => !alreadyAdded && handleAddPreBookingItemToDispatch(item.product_id, item.quantity, pb.id)}
+                                    onPress={() => !alreadyAdded && handleAddPreBookingItemToDispatch(item.product_id, { boxes: item.quantity, pieces: item.quantity_pieces }, pb.id)}
                                     disabled={alreadyAdded}
                                     className={`py-0.5 px-2 rounded border ${alreadyAdded ? 'bg-slate-100 border-slate-200' : 'bg-indigo-50 border-indigo-200 active:bg-indigo-100'}`}
                                   >
@@ -1918,16 +2042,14 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                       key: 'product', label: 'Product', width: 220,
                       render: item => {
                         const index = dispatchItems.indexOf(item);
-                        const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === item.product_id);
-                        const isEmpty = (warehouseInv ? (item.source === 'reserved_qty' ? warehouseInv.reserved_qty : warehouseInv.available_qty) : 0) <= 0;
+                        const isEmpty = !isPositiveQty(warehousePoolQty(item.product_id, item.source));
                         return (
                           <SelectField
                             value={item.product_id}
                             onValueChange={v => updateDispatchItem(index, 'product_id', v)}
                             options={data.products.filter(p => p.status === 'Active' || p.id === item.product_id).map(p => {
-                              const pInv = data.warehouse_inventory.find(inv => inv.product_id === p.id);
-                              const pQty = pInv ? (item.source === 'reserved_qty' ? pInv.reserved_qty : pInv.available_qty) : 0;
-                              return { label: `${p.name} (${pQty === 0 ? 'Out of stock' : pQty + ' in pool'})`, value: p.id };
+                              const pQty = warehousePoolQty(p.id, item.source);
+                              return { label: `${p.name} (${!isPositiveQty(pQty) ? 'Out of stock' : formatQty(pQty) + ' in pool'})`, value: p.id };
                             })}
                             title="Select Product"
                             searchable
@@ -1940,14 +2062,13 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                       key: 'pool', label: 'Pool', width: 170,
                       render: item => {
                         const index = dispatchItems.indexOf(item);
-                        const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === item.product_id);
                         return (
                           <SelectField
                             value={item.source}
                             onValueChange={v => updateDispatchItem(index, 'source', v)}
                             options={[
-                              { label: `Available (${warehouseInv?.available_qty || 0})`, value: 'available_qty' },
-                              { label: `Reserved (${warehouseInv?.reserved_qty || 0})`, value: 'reserved_qty' },
+                              { label: `Available (${formatQty(warehousePoolQty(item.product_id, 'available_qty'))})`, value: 'available_qty' },
+                              { label: `Reserved (${formatQty(warehousePoolQty(item.product_id, 'reserved_qty'))})`, value: 'reserved_qty' },
                             ]}
                             title="Select Pool"
                             className="bg-white border border-slate-200 rounded-lg p-1.5 flex-row items-center justify-between"
@@ -1956,20 +2077,16 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                       },
                     },
                     {
-                      key: 'qty', label: 'Qty', width: 90,
+                      key: 'qty', label: 'Qty', width: 140,
                       render: item => {
                         const index = dispatchItems.indexOf(item);
-                        const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === item.product_id);
-                        const maxAllowedStock = warehouseInv ? (item.source === 'reserved_qty' ? warehouseInv.reserved_qty : warehouseInv.available_qty) : 0;
-                        const isEmpty = maxAllowedStock <= 0;
+                        const isEmpty = !isPositiveQty(warehousePoolQty(item.product_id, item.source));
                         return (
-                          <TextInput
-                            keyboardType="number-pad"
-                            value={item.qty === 0 ? '' : String(item.qty)}
-                            onChangeText={v => updateDispatchItem(index, 'qty', v)}
-                            placeholder="0"
-                            placeholderTextColor="#94a3b8"
-                            className={`w-16 bg-white border rounded-lg p-1.5 text-xs text-center font-extrabold ${isEmpty ? 'border-rose-300 text-rose-600' : 'border-slate-200 text-slate-800'}`}
+                          <BoxPieceInput
+                            value={item.qty}
+                            onChange={q => updateDispatchItem(index, 'qty', q)}
+                            piecesPerBox={data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1}
+                            compact
                           />
                         );
                       },
@@ -1977,16 +2094,15 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                     {
                       key: 'status', label: 'Pool Status', width: 160, grow: false,
                       render: item => {
-                        const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === item.product_id);
-                        const maxAllowedStock = warehouseInv ? (item.source === 'reserved_qty' ? warehouseInv.reserved_qty : warehouseInv.available_qty) : 0;
-                        const isEmpty = maxAllowedStock <= 0;
+                        const maxAllowedStock = warehousePoolQty(item.product_id, item.source);
+                        const isEmpty = !isPositiveQty(maxAllowedStock);
                         return isEmpty ? (
                           <View className="flex-row items-center gap-1">
                             <AlertTriangle size={12} color="#e11d48" />
                             <Text className="text-[9px] text-rose-600 font-extrabold">Pool empty!</Text>
                           </View>
                         ) : (
-                          <Text className="text-[10px] text-slate-500 font-bold">Avail: <Text className="text-slate-700">{maxAllowedStock}</Text></Text>
+                          <Text className="text-[10px] text-slate-500 font-bold">Avail: <Text className="text-slate-700">{formatQty(maxAllowedStock)}</Text></Text>
                         );
                       },
                     },
@@ -2005,18 +2121,16 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                 />
               ) : (
                 dispatchItems.map((item, index) => {
-                  const warehouseInv = data.warehouse_inventory.find(inv => inv.product_id === item.product_id);
-                  const maxAllowedStock = warehouseInv ? (item.source === 'reserved_qty' ? warehouseInv.reserved_qty : warehouseInv.available_qty) : 0;
-                  const isEmpty = maxAllowedStock <= 0;
+                  const maxAllowedStock = warehousePoolQty(item.product_id, item.source);
+                  const isEmpty = !isPositiveQty(maxAllowedStock);
                   return (
                     <View key={index} className="gap-1.5 p-2.5 bg-slate-50 rounded-xl border border-slate-100">
                       <SelectField
                         value={item.product_id}
                         onValueChange={v => updateDispatchItem(index, 'product_id', v)}
                         options={data.products.filter(p => p.status === 'Active' || p.id === item.product_id).map(p => {
-                          const pInv = data.warehouse_inventory.find(inv => inv.product_id === p.id);
-                          const pQty = pInv ? (item.source === 'reserved_qty' ? pInv.reserved_qty : pInv.available_qty) : 0;
-                          return { label: `${p.name} (${pQty === 0 ? 'Out of stock' : pQty + ' in pool'})`, value: p.id };
+                          const pQty = warehousePoolQty(p.id, item.source);
+                          return { label: `${p.name} (${!isPositiveQty(pQty) ? 'Out of stock' : formatQty(pQty) + ' in pool'})`, value: p.id };
                         })}
                         title="Select Product"
                         searchable
@@ -2028,20 +2142,17 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                             value={item.source}
                             onValueChange={v => updateDispatchItem(index, 'source', v)}
                             options={[
-                              { label: `Available Pool (${warehouseInv?.available_qty || 0})`, value: 'available_qty' },
-                              { label: `Reserved Pool (${warehouseInv?.reserved_qty || 0})`, value: 'reserved_qty' },
+                              { label: `Available Pool (${formatQty(warehousePoolQty(item.product_id, 'available_qty'))})`, value: 'available_qty' },
+                              { label: `Reserved Pool (${formatQty(warehousePoolQty(item.product_id, 'reserved_qty'))})`, value: 'reserved_qty' },
                             ]}
                             title="Select Pool"
                             className="bg-white border border-slate-200 rounded-lg p-1.5 flex-row items-center justify-between"
                           />
                         </View>
-                        <TextInput
-                          keyboardType="number-pad"
-                          value={item.qty === 0 ? '' : String(item.qty)}
-                          onChangeText={v => updateDispatchItem(index, 'qty', v)}
-                          placeholder="0"
-                          placeholderTextColor="#94a3b8"
-                          className={`w-16 bg-white border rounded-lg p-1.5 text-xs text-center font-extrabold ${isEmpty ? 'border-rose-300 text-rose-600' : 'border-slate-200 text-slate-800'}`}
+                        <BoxPieceInput
+                          value={item.qty}
+                          onChange={q => updateDispatchItem(index, 'qty', q)}
+                          piecesPerBox={data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1}
                         />
                         <Pressable onPress={() => removeDispatchItem(index)} className="p-2 active:bg-rose-50 rounded-lg">
                           <Trash2 size={16} color="#f43f5e" />
@@ -2053,7 +2164,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                           <Text className="text-[10px] text-rose-600 font-extrabold">Selected pool is empty for this product!</Text>
                         </View>
                       ) : (
-                        <Text className="text-[10px] text-slate-400 font-bold px-1">Available in Selected Pool: <Text className="text-slate-600">{maxAllowedStock}</Text></Text>
+                        <Text className="text-[10px] text-slate-400 font-bold px-1">Available in Selected Pool: <Text className="text-slate-600">{formatQty(maxAllowedStock)}</Text></Text>
                       )}
                     </View>
                   );
@@ -2111,16 +2222,15 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                       key: 'product', label: 'Product', width: 220,
                       render: item => {
                         const index = swapItems.indexOf(item);
-                        const sourceInv = data.truck_inventory.find(ti => ti.truck_id === swapFromTruckId && ti.product_id === item.product_id);
-                        const isEmpty = (sourceInv ? sourceInv.quantity : 0) <= 0;
-                        const availableItems = data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && ti.quantity > 0);
+                        const isEmpty = !isPositiveQty(truckCargoQty(swapFromTruckId, item.product_id));
+                        const availableItems = data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && isPositiveQty(readQtyField(ti, 'quantity', 'quantity_pieces')));
                         return (
                           <SelectField
                             value={item.product_id}
                             onValueChange={v => updateSwapItem(index, 'product_id', v)}
                             options={availableItems.map(ti => {
                               const p = data.products.find(pp => pp.id === ti.product_id);
-                              return { label: `${p?.name || 'Product'} (${ti.quantity} loaded)`, value: ti.product_id };
+                              return { label: `${p?.name || 'Product'} (${formatQty({ boxes: ti.quantity, pieces: ti.quantity_pieces })} loaded)`, value: ti.product_id };
                             })}
                             title="Select Product"
                             searchable
@@ -2130,27 +2240,24 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                       },
                     },
                     {
-                      key: 'qty', label: 'Quantity', width: 100,
+                      key: 'qty', label: 'Quantity', width: 140,
                       render: item => {
                         const index = swapItems.indexOf(item);
                         return (
-                          <TextInput
-                            keyboardType="number-pad"
-                            value={item.qty === 0 ? '' : String(item.qty)}
-                            onChangeText={v => updateSwapItem(index, 'qty', v)}
-                            placeholder="0"
-                            placeholderTextColor="#94a3b8"
-                            className="w-16 bg-white border border-slate-200 rounded-lg p-1.5 text-xs text-center font-extrabold text-slate-800"
+                          <BoxPieceInput
+                            value={item.qty}
+                            onChange={q => updateSwapItem(index, 'qty', q)}
+                            piecesPerBox={data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1}
+                            compact
                           />
                         );
                       },
                     },
                     {
                       key: 'loaded', label: 'Loaded on Source', width: 150, grow: false,
-                      render: item => {
-                        const sourceInv = data.truck_inventory.find(ti => ti.truck_id === swapFromTruckId && ti.product_id === item.product_id);
-                        return <Text className="text-[10px] text-slate-400 font-bold">Loaded: <Text className="text-slate-600">{sourceInv ? sourceInv.quantity : 0}</Text></Text>;
-                      },
+                      render: item => (
+                        <Text className="text-[10px] text-slate-400 font-bold">Loaded: <Text className="text-slate-600">{formatQty(truckCargoQty(swapFromTruckId, item.product_id))}</Text></Text>
+                      ),
                     },
                     {
                       key: 'actions', label: '', width: 50, align: 'center', grow: false,
@@ -2167,10 +2274,9 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                 />
               ) : (
                 swapItems.map((item, index) => {
-                  const sourceInv = data.truck_inventory.find(ti => ti.truck_id === swapFromTruckId && ti.product_id === item.product_id);
-                  const availableOnSource = sourceInv ? sourceInv.quantity : 0;
-                  const isEmpty = availableOnSource <= 0;
-                  const availableItems = data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && ti.quantity > 0);
+                  const availableOnSource = truckCargoQty(swapFromTruckId, item.product_id);
+                  const isEmpty = !isPositiveQty(availableOnSource);
+                  const availableItems = data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && isPositiveQty(readQtyField(ti, 'quantity', 'quantity_pieces')));
                   return (
                     <View key={index} className="gap-1.5 p-2.5 bg-slate-50 rounded-xl border border-slate-100">
                       <SelectField
@@ -2178,26 +2284,23 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                         onValueChange={v => updateSwapItem(index, 'product_id', v)}
                         options={availableItems.map(ti => {
                           const p = data.products.find(pp => pp.id === ti.product_id);
-                          return { label: `${p?.name || 'Product'} (${ti.quantity} loaded)`, value: ti.product_id };
+                          return { label: `${p?.name || 'Product'} (${formatQty({ boxes: ti.quantity, pieces: ti.quantity_pieces })} loaded)`, value: ti.product_id };
                         })}
                         title="Select Product"
                         searchable
                         className={`bg-white border rounded-lg p-1.5 flex-row items-center justify-between ${isEmpty ? 'border-rose-300' : 'border-slate-200'}`}
                       />
                       <View className="flex-row items-center gap-2">
-                        <TextInput
-                          keyboardType="number-pad"
-                          value={item.qty === 0 ? '' : String(item.qty)}
-                          onChangeText={v => updateSwapItem(index, 'qty', v)}
-                          placeholder="0"
-                          placeholderTextColor="#94a3b8"
-                          className="flex-1 bg-white border border-slate-200 rounded-lg p-1.5 text-xs text-center font-extrabold text-slate-800"
+                        <BoxPieceInput
+                          value={item.qty}
+                          onChange={q => updateSwapItem(index, 'qty', q)}
+                          piecesPerBox={data.products.find(p => p.id === item.product_id)?.pieces_per_box ?? 1}
                         />
                         <Pressable onPress={() => removeSwapItem(index)} disabled={swapItems.length <= 1} className="p-2 active:bg-rose-50 rounded-lg">
                           <Trash2 size={16} color={swapItems.length <= 1 ? '#cbd5e1' : '#f43f5e'} />
                         </Pressable>
                       </View>
-                      <Text className="text-[10px] text-slate-400 font-bold px-1">Loaded on Source Truck: <Text className="text-slate-600">{availableOnSource}</Text></Text>
+                      <Text className="text-[10px] text-slate-400 font-bold px-1">Loaded on Source Truck: <Text className="text-slate-600">{formatQty(availableOnSource)}</Text></Text>
                     </View>
                   );
                 })
@@ -2207,7 +2310,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
             <View className="flex-row justify-between items-center pt-2">
               <Pressable
                 onPress={addSwapItem}
-                disabled={swapItems.length === 0 || swapItems.length >= data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && ti.quantity > 0).length}
+                disabled={swapItems.length === 0 || swapItems.length >= data.truck_inventory.filter(ti => ti.truck_id === swapFromTruckId && isPositiveQty(readQtyField(ti, 'quantity', 'quantity_pieces'))).length}
                 className="py-1 px-3 bg-slate-100 rounded-lg active:bg-slate-200"
               >
                 <Text className="text-slate-700 font-extrabold text-[10px]">+ Add Another Product</Text>
@@ -2221,7 +2324,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
           </View>
           )}
         </View>
-      ) : (
+      ) : activeTab === 'audits' ? (
         <View className="bg-white p-4 rounded-2xl border border-slate-200 gap-3">
           <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
             <Text className="font-bold text-slate-800 text-xs">Inventory Logistics Audit Trail</Text>
@@ -2245,10 +2348,21 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                 { label: 'User', value: 'User' },
                 { label: 'Category', value: 'Category' },
                 { label: 'Area', value: 'Area' },
+                { label: 'Partner Type', value: 'PartnerType' },
+                { label: 'Asset Type', value: 'AssetType' },
+                { label: 'Asset', value: 'Asset' },
                 { label: 'Warehouse', value: 'Warehouse' },
                 { label: 'System', value: 'System' },
               ]}
               title="Record Type"
+              className={FILTER_PILL_CLASS}
+              textClassName={FILTER_PILL_TEXT_CLASS}
+            />
+            <SelectField
+              value={auditUserFilter}
+              onValueChange={setAuditUserFilter}
+              options={[{ label: 'All Users', value: 'All' }, ...data.users.map(u => ({ label: `${u.name} (${u.role})`, value: u.id }))]}
+              title="By"
               className={FILTER_PILL_CLASS}
               textClassName={FILTER_PILL_TEXT_CLASS}
             />
@@ -2299,9 +2413,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
               ] as DataTableColumn<ERPAuditLog>[]}
             />
           ) : auditLogs.data.length === 0 ? (
-            <View className="flex-1 items-center justify-center">
-              <Text className="text-center text-slate-400 italic text-xs">No audit log entries recorded yet.</Text>
-            </View>
+            <EmptyState message="No audit log entries recorded yet." />
           ) : (
             <View className="gap-2 md:flex-row md:flex-wrap">
               {auditLogs.data.map(l => {
@@ -2336,6 +2448,17 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
           <PaginationFooter mode="offset" page={auditLogs.page} totalPages={auditLogs.totalPages} total={auditLogs.total} loading={auditLogs.loading} onPageChange={auditLogs.goToPage} />
         </View>
+      ) : (
+        <AdminAssets
+          data={data}
+          setData={setData}
+          addNotification={addNotification}
+          currentUser={currentUser}
+          showAlert={showAlert}
+          pendingNotificationTarget={pendingNotificationTarget}
+          onConsumePendingNotificationTarget={onConsumePendingNotificationTarget}
+          onCreateOrderForPartner={onCreateOrderForPartner}
+        />
       )}
 
       <ConfirmModal
@@ -2367,8 +2490,9 @@ export default function AdminWarehouse({ data, setData, addNotification, current
         title="Remove Truck?"
         message={(() => {
           const truckName = data.trucks.find(t => t.id === deleteTruckConfirmId)?.vehicle_number || 'this truck';
-          const loadedUnits = data.truck_inventory.filter(ti => ti.truck_id === deleteTruckConfirmId).reduce((sum, ti) => sum + ti.quantity, 0);
-          const cargoNote = loadedUnits > 0 ? ` This truck currently has ${loadedUnits} unit(s) of cargo loaded - it will be automatically returned to warehouse stock as part of removing the truck.` : '';
+          const cargo = data.truck_inventory.filter(ti => ti.truck_id === deleteTruckConfirmId);
+          const loadedQty = { boxes: cargo.reduce((sum, ti) => sum + ti.quantity, 0), pieces: cargo.reduce((sum, ti) => sum + ti.quantity_pieces, 0) };
+          const cargoNote = isPositiveQty(loadedQty) ? ` This truck currently has ${formatQty(loadedQty)} of cargo loaded - it will be automatically returned to warehouse stock as part of removing the truck.` : '';
           return `Are you sure you want to remove "${truckName}" from the active fleet?${cargoNote} It will be hidden from dispatch/transfer selection but its history is preserved and it can be reactivated later.`;
         })()}
         confirmLabel="Yes, Remove Truck"
@@ -2396,19 +2520,19 @@ export default function AdminWarehouse({ data, setData, addNotification, current
             <View className="flex-row flex-wrap gap-2.5">
               <View className="w-[48%]">
                 <Text className="font-bold text-slate-500 mb-1 text-xs">Available Qty</Text>
-                <TextInput keyboardType="number-pad" value={correctionForm.available_qty} onChangeText={v => setCorrectionForm({ ...correctionForm, available_qty: v.replace(/[^0-9]/g, '') })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass + ' text-center font-bold'} />
+                <BoxPieceInput value={correctionForm.available_qty} onChange={q => setCorrectionForm({ ...correctionForm, available_qty: q })} piecesPerBox={data.products.find(p => p.id === correctionForm.product_id)?.pieces_per_box ?? 1} />
               </View>
               <View className="w-[48%]">
                 <Text className="font-bold text-slate-500 mb-1 text-xs">Reserved Qty</Text>
-                <TextInput keyboardType="number-pad" value={correctionForm.reserved_qty} onChangeText={v => setCorrectionForm({ ...correctionForm, reserved_qty: v.replace(/[^0-9]/g, '') })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass + ' text-center font-bold'} />
+                <BoxPieceInput value={correctionForm.reserved_qty} onChange={q => setCorrectionForm({ ...correctionForm, reserved_qty: q })} piecesPerBox={data.products.find(p => p.id === correctionForm.product_id)?.pieces_per_box ?? 1} />
               </View>
               <View className="w-[48%]">
                 <Text className="font-bold text-slate-500 mb-1 text-xs">Damaged Qty</Text>
-                <TextInput keyboardType="number-pad" value={correctionForm.damaged_qty} onChangeText={v => setCorrectionForm({ ...correctionForm, damaged_qty: v.replace(/[^0-9]/g, '') })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass + ' text-center font-bold'} />
+                <BoxPieceInput value={correctionForm.damaged_qty} onChange={q => setCorrectionForm({ ...correctionForm, damaged_qty: q })} piecesPerBox={data.products.find(p => p.id === correctionForm.product_id)?.pieces_per_box ?? 1} />
               </View>
               <View className="w-[48%]">
                 <Text className="font-bold text-slate-500 mb-1 text-xs">Expired Qty</Text>
-                <TextInput keyboardType="number-pad" value={correctionForm.expired_qty} onChangeText={v => setCorrectionForm({ ...correctionForm, expired_qty: v.replace(/[^0-9]/g, '') })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass + ' text-center font-bold'} />
+                <BoxPieceInput value={correctionForm.expired_qty} onChange={q => setCorrectionForm({ ...correctionForm, expired_qty: q })} piecesPerBox={data.products.find(p => p.id === correctionForm.product_id)?.pieces_per_box ?? 1} />
               </View>
             </View>
 
@@ -2534,44 +2658,43 @@ export default function AdminWarehouse({ data, setData, addNotification, current
               <SelectField value={poSupplierId} onValueChange={setPoSupplierId} options={supplierOptions} title="Select Supplier" searchable className={inputClass + ' flex-row items-center justify-between'} />
             </View>
 
-            <View className="flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 mb-3">
+            <View className="flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 mb-3 z-20">
               <Search size={14} color="#94a3b8" />
-              <TextInput
+              <AutocompleteInput
                 value={poSearch}
                 onChangeText={setPoSearch}
+                suggestions={warehouseSearchSuggestions}
                 placeholder="Search product name or code..."
                 placeholderTextColor="#94a3b8"
-                className="flex-1 text-xs text-slate-800 py-2.5"
+                containerClassName="flex-1"
+                className="text-xs text-slate-800 py-2.5"
                 style={{ outlineStyle: 'none' } as any}
               />
-              {poSearch.length > 0 && (
-                <Pressable onPress={() => setPoSearch('')} hitSlop={8}>
-                  <X size={14} color="#94a3b8" />
-                </Pressable>
-              )}
             </View>
 
             <ScrollView className="flex-1 mb-3">
               <View className="gap-1.5">
                 {data.products
                   .filter(p => p.status === 'Active')
-                  .filter(p => p.name.toLowerCase().includes(poSearch.trim().toLowerCase()) || p.code.toLowerCase().includes(poSearch.trim().toLowerCase()))
+                  .filter(p => p.name.toLowerCase().includes(debouncedPoSearch.trim().toLowerCase()) || p.code.toLowerCase().includes(debouncedPoSearch.trim().toLowerCase()))
                   .map(p => {
                     const qty = poOrderCase[p.id] || '';
-                    const isSelected = Number(qty) > 0;
+                    const qtyPieces = poOrderCasePieces[p.id] || '';
+                    const isSelected = Number(qty) > 0 || Number(qtyPieces) > 0;
                     return (
                       <View key={p.id} className={`flex-row items-center justify-between gap-2 p-2 rounded-lg border ${isSelected ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-100'}`}>
                         <View className="flex-1 min-w-0">
                           <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{p.name}</Text>
                           <Text className="text-slate-400 text-[9px]">{p.category} - {p.code} - {p.unit_value}{p.unit_type}</Text>
                         </View>
-                        <TextInput
-                          keyboardType="number-pad"
-                          value={qty}
-                          onChangeText={v => setPoOrderCase({ ...poOrderCase, [p.id]: v.replace(/\D/g, '') })}
-                          placeholder="Cases"
-                          placeholderTextColor="#94a3b8"
-                          className="w-20 bg-white border border-slate-200 rounded-lg p-1.5 text-xs text-center"
+                        <BoxPieceInput
+                          value={{ boxes: Number(qty) || 0, pieces: Number(qtyPieces) || 0 }}
+                          onChange={q => {
+                            setPoOrderCase({ ...poOrderCase, [p.id]: q.boxes === 0 ? '' : String(q.boxes) });
+                            setPoOrderCasePieces({ ...poOrderCasePieces, [p.id]: q.pieces === 0 ? '' : String(q.pieces) });
+                          }}
+                          piecesPerBox={p.pieces_per_box}
+                          compact
                         />
                       </View>
                     );
@@ -2584,7 +2707,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
 
             <View className="flex-row items-center justify-between mb-3 px-0.5">
               <Text className="text-[10px] font-bold text-slate-500 uppercase">
-                {Object.values(poOrderCase).filter(v => Number(v) > 0).length} product(s) selected
+                {data.products.filter(p => Number(poOrderCase[p.id]) > 0 || Number(poOrderCasePieces[p.id]) > 0).length} product(s) selected
               </Text>
             </View>
 
@@ -2618,7 +2741,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
             </View>
 
             <ScrollView className="flex-1">
-              <View className="gap-2">
+              <View className={`gap-2 ${pendingPurchaseOrders.length === 0 ? 'flex-1' : ''}`}>
                 {pendingPurchaseOrders.map(req => {
                   const supplier = data.suppliers.find(s => s.id === req.supplier_id);
                   const isConfirmingDelete = confirmDeletePOId === req.id;
@@ -2661,7 +2784,7 @@ export default function AdminWarehouse({ data, setData, addNotification, current
                   );
                 })}
                 {pendingPurchaseOrders.length === 0 && (
-                  <Text className="text-[10px] text-slate-400 italic py-4 text-center">No pending purchase orders.</Text>
+                  <EmptyState message="No pending purchase orders." />
                 )}
               </View>
             </ScrollView>

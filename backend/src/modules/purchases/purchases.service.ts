@@ -4,10 +4,12 @@ import { logAudit } from '../../lib/audit';
 import { num, dateOnly } from '../../utils/serialize';
 import { ApiError } from '../../utils/ApiError';
 import { parsePageParams, parseDateRangeParams, containsInsensitive, buildPagedResult } from '../../utils/pagination';
+import { addQty, readQtyField, formatQty } from '../../utils/pieceQty';
 
 interface PurchaseItemInput {
   product_id: string;
   quantity: number;
+  quantity_pieces?: number;
   purchase_price: number;
   mfg_date?: string;
   expiry_date?: string;
@@ -16,7 +18,7 @@ interface PurchaseItemInput {
 function serializePurchase(p: {
   id: string; supplier_id: string; invoice_number: string; date: Date;
   bill_file_url?: string | null; bill_file_name?: string | null; bill_file_type?: string | null;
-  items: { product_id: string; quantity: number; purchase_price: any; mfg_date: Date | null; expiry_date: Date | null }[];
+  items: { product_id: string; quantity: number; quantity_pieces: number; purchase_price: any; mfg_date: Date | null; expiry_date: Date | null }[];
 }) {
   return {
     id: p.id,
@@ -29,6 +31,7 @@ function serializePurchase(p: {
     items: p.items.map(i => ({
       product_id: i.product_id,
       quantity: i.quantity,
+      quantity_pieces: i.quantity_pieces,
       purchase_price: num(i.purchase_price),
       mfg_date: dateOnly(i.mfg_date),
       expiry_date: dateOnly(i.expiry_date),
@@ -100,6 +103,7 @@ export async function createPurchase(
           create: input.items.map(i => ({
             product_id: i.product_id,
             quantity: i.quantity,
+            quantity_pieces: i.quantity_pieces ?? 0,
             purchase_price: i.purchase_price,
             mfg_date: i.mfg_date ? new Date(i.mfg_date) : null,
             expiry_date: i.expiry_date ? new Date(i.expiry_date) : null,
@@ -109,11 +113,19 @@ export async function createPurchase(
       include: { items: true },
     });
 
+    const products = await tx.product.findMany({ where: { id: { in: input.items.map(i => i.product_id) } } });
+    const piecesPerBoxOf = new Map(products.map(p => [p.id, p.pieces_per_box]));
+
     for (const item of input.items) {
+      const piecesPerBox = piecesPerBoxOf.get(item.product_id) ?? 1;
+      const existing = await tx.warehouseInventory.findUnique({ where: { product_id: item.product_id } });
+      const current = existing ? readQtyField(existing, 'available_qty', 'available_pieces') : { boxes: 0, pieces: 0 };
+      const next = addQty(current, { boxes: Number(item.quantity), pieces: Number(item.quantity_pieces ?? 0) }, piecesPerBox);
+
       await tx.warehouseInventory.upsert({
         where: { product_id: item.product_id },
-        update: { available_qty: { increment: Number(item.quantity) } },
-        create: { product_id: item.product_id, available_qty: Number(item.quantity) },
+        update: { available_qty: next.boxes, available_pieces: next.pieces },
+        create: { product_id: item.product_id, available_qty: next.boxes, available_pieces: next.pieces },
       });
     }
 

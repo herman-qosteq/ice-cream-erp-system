@@ -1,5 +1,4 @@
 import { Platform } from 'react-native';
-import * as ImagePicker from 'expo-image-picker';
 
 // Picks an image from the device gallery and returns it as a data URI so it
 // can be stored directly in local ERPData (no backend to upload to).
@@ -10,6 +9,13 @@ export async function pickImageAsDataUri(showAlert: (opts: any) => void): Promis
     showAlert('Choosing a photo from the gallery is currently available on mobile and web only. Support for this platform is planned.');
     return null;
   }
+
+  // Required lazily (never on Windows/macOS, see guard above) - expo-image-picker
+  // pulls in expo-modules-core, whose top-level init reads globalThis.expo,
+  // installed by Expo's native JSI bridge, which doesn't exist on Windows.
+  // A static top-level import would crash the whole bundle before this guard
+  // ever ran.
+  const ImagePicker = require('expo-image-picker') as typeof import('expo-image-picker');
 
   try {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();

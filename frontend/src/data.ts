@@ -1,4 +1,9 @@
-import { Invoice, Order, Purchase, Store } from './types';
+import type { Invoice, Order, Purchase, Store, Product } from './types';
+import { toTotalPieces } from './utils/qty';
+
+function piecesPerBoxOf(productId: string, products: Product[]): number {
+  return products.find(p => p.id === productId)?.pieces_per_box ?? 1;
+}
 
 // Calculate Customer Health Score based on parameters: Outstanding, Ranking, Refill delay
 export function calculateStoreHealthScore(store: Store): number {
@@ -12,7 +17,7 @@ export function calculateStoreHealthScore(store: Store): number {
 
   // Overdue status
   const nextRefill = new Date(store.next_refill_date);
-  const today = new Date('2026-06-27');
+  const today = new Date();
   if (nextRefill < today) {
     const diffDays = Math.ceil((today.getTime() - nextRefill.getTime()) / (1000 * 60 * 60 * 24));
     score -= Math.min(25, diffDays * 5); // lose 5 points per overdue day, max 25
@@ -27,7 +32,7 @@ export function calculateStoreHealthScore(store: Store): number {
 }
 
 // Get store metrics
-export function getStoreMetrics(storeId: string, ordersList: Order[], purchases: Purchase[] = [], invoices: Invoice[] = []) {
+export function getStoreMetrics(storeId: string, ordersList: Order[], purchases: Purchase[] = [], invoices: Invoice[] = [], products: Product[] = []) {
   const storeOrders = ordersList.filter(o => o.store_id === storeId && o.status === 'Delivered');
   const count = storeOrders.length;
 
@@ -36,10 +41,12 @@ export function getStoreMetrics(storeId: string, ordersList: Order[], purchases:
 
   storeOrders.forEach(o => {
     o.items.forEach(item => {
-      totalRevenue += item.quantity * item.unit_price;
+      // unit_price is a per-piece rate (MRP is printed per individual
+      // sellable piece) - bill the total piece count, not the raw box count.
+      totalRevenue += toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, piecesPerBoxOf(item.product_id, products)) * item.unit_price;
     });
     const invoice = invoices.find(i => i.order_id === o.id);
-    totalProfit += calculateDeliveredOrderProfit(o, purchases, invoice);
+    totalProfit += calculateDeliveredOrderProfit(o, purchases, products, invoice);
   });
 
   const avgOrderVal = count > 0 ? totalRevenue / count : 0;
@@ -71,11 +78,22 @@ export function getLatestPurchasePrice(productId: string, purchases: Purchase[] 
 // a fully-paid one contributes the full margin, and a partially-paid one
 // contributes that same proportion of the margin, so partial collections are
 // still reflected instead of being invisible until "Paid" is reached.
-export function calculateDeliveredOrderProfit(order: Order, purchases: Purchase[], invoice?: { grand_total: number; paid_amount?: number }): number {
+export function calculateDeliveredOrderProfit(order: Order, purchases: Purchase[], products: Product[] = [], invoice?: { grand_total: number; paid_amount?: number }): number {
   const fullMargin = order.items.reduce((sum, item) => {
-    const costPrice = getLatestPurchasePrice(item.product_id, purchases);
-    const revenue = item.unit_price * item.quantity;
-    const cost = costPrice * item.quantity;
+    // Fall back to the product's own reference cost (derived from MRP *
+    // purchase discount %) when it has no purchase-history entries yet - e.g.
+    // stock added via Warehouse "Adjust" and sold before any Purchase was
+    // ever recorded for it. Without this, costPrice silently comes out 0 and
+    // the item's full revenue gets counted as profit.
+    const costPrice = getLatestPurchasePrice(item.product_id, purchases)
+      || products.find(p => p.id === item.product_id)?.purchase_price
+      || 0;
+    // unit_price/costPrice are both per-piece rates - bill/cost the total
+    // piece count (whole boxes worth, plus any loose pieces), not the raw
+    // box count, or margins come out wildly wrong whenever a box is sold.
+    const totalPieces = toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, piecesPerBoxOf(item.product_id, products));
+    const revenue = item.unit_price * totalPieces;
+    const cost = costPrice * totalPieces;
     return sum + (revenue - cost);
   }, 0);
 
@@ -84,16 +102,16 @@ export function calculateDeliveredOrderProfit(order: Order, purchases: Purchase[
   return fullMargin * collectedFraction;
 }
 
-export function getAveragePurchasePrice(productId: string, purchases: Purchase[] = []): number {
+export function getAveragePurchasePrice(productId: string, purchases: Purchase[] = [], piecesPerBox: number = 1): number {
   const purchaseItems = purchases
     .flatMap(purchase => purchase.items)
     .filter(item => item.product_id === productId);
 
-  const totalQty = purchaseItems.reduce((sum, item) => sum + item.quantity, 0);
-  if (totalQty <= 0) {
+  const totalPieces = purchaseItems.reduce((sum, item) => sum + toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, piecesPerBox), 0);
+  if (totalPieces <= 0) {
     return getLatestPurchasePrice(productId, purchases);
   }
 
-  const totalCost = purchaseItems.reduce((sum, item) => sum + (item.quantity * item.purchase_price), 0);
-  return totalCost / totalQty;
+  const totalCost = purchaseItems.reduce((sum, item) => sum + toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, piecesPerBox) * item.purchase_price, 0);
+  return totalCost / totalPieces;
 }

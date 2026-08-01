@@ -12,20 +12,20 @@ const BRAND_TAGLINE = 'Premium Distribution & Logistics Network ERP';
 const BRAND_GSTIN_LINE = `GSTIN: 27AAAAA1111A1Z1 | Support: ${BRAND_SUPPORT_PHONE}`;
 
 export const PDF_STYLE = `
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 22px; color: #1e293b; }
-  .brand { color: #c2410c; font-weight: 800; font-size: 20px; }
-  .muted { color: #64748b; font-size: 9px; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 22px; color: #1e293b; font-size: 11px; }
+  .brand { color: #c2410c; font-weight: 800; font-size: 16px; }
+  .muted { color: #64748b; font-size: 8px; }
   hr { margin: 6px 0; border: none; border-top: 1px solid #cbd5e1; }
   .doc-title { margin-top: 6px; }
-  .doc-title strong { font-size: 13px; color: #0f172a; }
-  .doc-title span { font-size: 10px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 11px; }
-  th { background: #f8fafc; text-align: left; padding: 5px 6px; border-bottom: 2px solid #cbd5e1; font-size: 9px; text-transform: uppercase; color: #475569; }
+  .doc-title strong { font-size: 11px; color: #0f172a; }
+  .doc-title span { font-size: 8px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 9px; }
+  th { background: #f8fafc; text-align: left; padding: 5px 6px; border-bottom: 2px solid #cbd5e1; font-size: 8px; text-transform: uppercase; color: #475569; }
   td { padding: 5px 6px; border-bottom: 1px solid #e2e8f0; }
-  .box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
-  .section-title { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.4px; color: #475569; margin-top: 14px; margin-bottom: 3px; }
+  .box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 10px; margin-top: 8px; font-size: 10px; }
+  .section-title { font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.4px; color: #475569; margin-top: 14px; margin-bottom: 3px; }
   .info-table td { border: none; vertical-align: top; width: 50%; padding: 0; }
-  .summary-line { display: flex; flex-wrap: wrap; column-gap: 26px; row-gap: 3px; margin: 8px 0 2px 0; padding: 6px 0; border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; font-size: 11px; }
+  .summary-line { display: flex; flex-wrap: wrap; column-gap: 26px; row-gap: 3px; margin: 8px 0 2px 0; padding: 6px 0; border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; font-size: 9px; }
   .summary-line .s-label { color: #64748b; font-weight: 700; margin-right: 4px; }
   .summary-line .s-value { font-weight: 800; color: #0f172a; }
   .summary-line .s-value.accent { color: #c2410c; }

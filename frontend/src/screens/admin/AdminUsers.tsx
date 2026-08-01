@@ -1,93 +1,41 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, TextInput, Pressable, Modal } from 'react-native';
-import { Shield, Key, ToggleLeft, ToggleRight, Bell, Edit, AlertTriangle, Sliders, RotateCcw } from 'lucide-react-native';
+import { Shield, Key, ToggleLeft, ToggleRight, Edit, RotateCcw, UserCog } from 'lucide-react-native';
 import { ERPData } from '../../storage';
-import { User, AppNotification, NotificationEntityType, RolePermission } from '../../types';
+import { User, AppNotification, NotificationEntityType } from '../../types';
 import { useAppContext } from '../../context/AppContext';
-import { usersApi, notificationsApi, settingsApi } from '../../api/endpoints';
-import { RETAIL_PRICING_FEATURE } from '../../utils/pricing';
-import { formatBadgeCount, formatDateTime12h } from '../../utils/format';
+import { usersApi, settingsApi } from '../../api/endpoints';
 import ViewToggle from '../../components/common/ViewToggle';
 import DataTable, { DataTableColumn } from '../../components/common/DataTable';
-import ScrollableSection from '../../components/common/ScrollableSection';
-import PaginationFooter from '../../components/common/PaginationFooter';
+import EmptyState from '../../components/common/EmptyState';
 import { useViewMode } from '../../context/ViewModeContext';
 import { useResetScrollOnChange } from '../../context/ScrollResetContext';
-import { usePaginatedList } from '../../hooks/usePaginatedList';
-import { useResponsiveTableHeight } from '../../hooks/useResponsiveTableHeight';
-
-// Admin-grantable feature flags. Most are role-scoped (roles not listed
-// already have the feature unconditionally, e.g. Admin/Warehouse already see
-// the GST toggle in their own order form). A feature scoped to just
-// ['Admin'] is effectively a single global on/off switch instead - Admin
-// flips it once and it applies app-wide for every role.
-const ROLE_FEATURES: { key: string; label: string; description: string; roles: RolePermission['role'][] }[] = [
-  {
-    key: 'gst_toggle',
-    label: 'With GST / Without GST Order Toggle',
-    description: 'Lets a Salesperson choose GST or non-GST pricing when creating an order or pre-booking, instead of always applying the product\'s default tax rate.',
-    roles: ['Salesperson'],
-  },
-  {
-    key: RETAIL_PRICING_FEATURE,
-    label: 'Retail / Selling Price Tier',
-    description: 'Global switch (applies to every role). Off by default: hides the Retail/Selling discount field in pricing forms, the Wholesale/Selling pricing-mode toggle in order and pre-booking creation, and Selling-price columns on product cards and reports — the app runs Wholesale-only. Turn on to bring retail pricing back everywhere.',
-    roles: ['Admin'],
-  },
-];
+import ManagePermissionsModal from '../../components/permissions/ManagePermissionsModal';
 
 interface AdminUsersProps {
   data: ERPData;
   setData: (updater: ERPData | ((prev: ERPData) => ERPData)) => void;
   addNotification: (type: AppNotification['type'], message: string, entityType?: NotificationEntityType, entityId?: string) => void;
   currentUser: any;
-  activeScreen?: string;
   showAlert: (opts: any) => void;
   pendingNotificationTarget?: { entityType: NotificationEntityType; entityId: string } | null;
   onConsumePendingNotificationTarget?: () => void;
-  onNotificationNavigate?: (n: AppNotification) => void;
 }
 
-const notifTypeLabels: Record<string, string> = {
-  low_stock: 'Low Stock',
-  out_of_stock: 'Out Of Stock',
-  expiry: 'Expiry',
-  refill: 'Refill',
-  payment_due: 'Payment Due',
-  payment_received: 'Payment Received',
-  credit_exceeded: 'Credit Exceeded',
-  new_order: 'New Order',
-  order_update: 'Order Update',
-  delivery: 'Delivery',
-  partner_update: 'Partner Update',
-  product_update: 'Catalog Update',
-  user_update: 'Operator Account',
-  stock_update: 'Stock Movement',
-  system: 'System',
-};
-
-const notifTypeStyle: Record<string, { bg: string; color: string; icon: 'bell' | 'alert' }> = {
-  low_stock: { bg: 'bg-amber-50', color: '#f59e0b', icon: 'bell' },
-  out_of_stock: { bg: 'bg-amber-50', color: '#f59e0b', icon: 'bell' },
-  expiry: { bg: 'bg-purple-50', color: '#a855f7', icon: 'bell' },
-  refill: { bg: 'bg-pink-50', color: '#ec4899', icon: 'bell' },
-  payment_due: { bg: 'bg-red-50', color: '#ef4444', icon: 'bell' },
-  payment_received: { bg: 'bg-emerald-50', color: '#10b981', icon: 'bell' },
-  credit_exceeded: { bg: 'bg-red-50', color: '#dc2626', icon: 'alert' },
-  new_order: { bg: 'bg-blue-50', color: '#3b82f6', icon: 'bell' },
-  order_update: { bg: 'bg-indigo-50', color: '#6366f1', icon: 'bell' },
-  delivery: { bg: 'bg-teal-50', color: '#0d9488', icon: 'bell' },
-  partner_update: { bg: 'bg-sky-50', color: '#0284c7', icon: 'bell' },
-  product_update: { bg: 'bg-orange-50', color: '#ea580c', icon: 'bell' },
-  user_update: { bg: 'bg-violet-50', color: '#7c3aed', icon: 'bell' },
-  stock_update: { bg: 'bg-cyan-50', color: '#0891b2', icon: 'bell' },
-  system: { bg: 'bg-slate-100', color: '#475569', icon: 'alert' },
-};
-
-export default function AdminUsers({ data, setData, addNotification, currentUser, activeScreen, showAlert, pendingNotificationTarget, onConsumePendingNotificationTarget, onNotificationNavigate }: AdminUsersProps) {
-  const { refreshData, notifyResourceChanged } = useAppContext();
+// Operator Accounts - split out of what used to be a combined Users +
+// Notifications component (AdminUsers previously bundled "System Alert Hub"
+// behind an internal tab bar). Each is now its own standalone screen/page,
+// mounted independently by AdminFlow.tsx per its own registry-granted
+// screen key ('Users' here, 'Notifications' in AdminNotifications.tsx) -
+// see permissionsRegistry.ts. This also closes a real permission gap: the
+// old shared tab bar was never itself permission-gated, so an Admin operator
+// granted only 'Notifications' (and explicitly denied 'Users' via Manage
+// Permissions) could still reach the Operator Accounts tab from within that
+// same mounted component. With two separate components, AdminFlow only ever
+// mounts the one the operator was actually granted.
+export default function AdminUsers({ data, setData, addNotification, currentUser, showAlert, pendingNotificationTarget, onConsumePendingNotificationTarget }: AdminUsersProps) {
+  const { refreshData } = useAppContext();
   const { viewMode } = useViewMode();
-  const [activeTab, setActiveTab] = useState<'users' | 'notifications' | 'permissions'>(activeScreen === 'Notifications' ? 'notifications' : 'users');
   const [activeForm, setActiveForm] = useState<'list' | 'add_user' | 'edit_user'>('list');
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [resetPasswordUserId, setResetPasswordUserId] = useState<string | null>(null);
@@ -97,37 +45,14 @@ export default function AdminUsers({ data, setData, addNotification, currentUser
   // hidden behind this still-open Modal (which needs to stay open for the
   // user to retry) until manually closed.
   const [resetPasswordError, setResetPasswordError] = useState<string | null>(null);
+  const [permissionsUserId, setPermissionsUserId] = useState<string | null>(null);
   const [userListTab, setUserListTab] = useState<'active' | 'inactive'>('active');
-  useResetScrollOnChange(activeTab, activeForm, userListTab);
-
-  const notifications = usePaginatedList<AppNotification, {}>({
-    resource: 'notifications',
-    mode: 'offset',
-    pageSize: 25,
-    enabled: activeTab === 'notifications',
-    filters: {},
-    fetcher: params => notificationsApi.listPaged(params),
-  });
-  const notificationsTableHeight = useResponsiveTableHeight(280);
-
-  useEffect(() => {
-    if (activeScreen === 'Notifications') setActiveTab('notifications');
-    else if (activeScreen === 'Users') setActiveTab('users');
-    // Any still-open Add/Edit User form or Reset Password popup must not
-    // survive an explicit navigation away from this screen - see the
-    // matching comment in AdminSales.tsx's activeScreen effect.
-    setActiveForm('list');
-    setResetPasswordUserId(null);
-    setResetPasswordError(null);
-  }, [activeScreen]);
+  useResetScrollOnChange(activeForm, userListTab);
 
   useEffect(() => {
     if (!pendingNotificationTarget || pendingNotificationTarget.entityType !== 'user') return;
     const user = data.users.find(u => u.id === pendingNotificationTarget.entityId);
-    if (user) {
-      setActiveTab('users');
-      handleOpenEditUser(user);
-    }
+    if (user) handleOpenEditUser(user);
     onConsumePendingNotificationTarget?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingNotificationTarget]);
@@ -217,384 +142,253 @@ export default function AdminUsers({ data, setData, addNotification, currentUser
     }
   };
 
-  const handleMarkAsRead = async (notifId: string) => {
-    setData(prev => ({ ...prev, notifications: prev.notifications.map(n => (n.id === notifId ? { ...n, is_read: true } : n)) }));
-    notificationsApi.markRead(notifId).then(() => notifyResourceChanged('notifications')).catch(() => {});
-  };
+  const handleOpenManagePermissions = (userId: string) => setPermissionsUserId(userId);
 
-  const handleNotificationPress = (n: AppNotification) => {
-    handleMarkAsRead(n.id);
-    onNotificationNavigate?.(n);
-  };
-
-  const handleClearAllNotifications = async () => {
-    setData(prev => ({ ...prev, notifications: [] }));
-    notificationsApi.clearAll().then(() => notifyResourceChanged('notifications')).catch(() => {});
-  };
-
-  const isRoleFeatureEnabled = (role: RolePermission['role'], feature: string) =>
-    data.rolePermissions.some(rp => rp.role === role && rp.feature === feature && rp.enabled);
-
-  const handleToggleRoleFeature = async (role: RolePermission['role'], feature: string, label: string) => {
-    const nextEnabled = !isRoleFeatureEnabled(role, feature);
+  const handleSavePermissions = async (permissions: { feature: string; enabled: boolean }[]) => {
+    if (!permissionsUserId) return;
+    const target = data.users.find(u => u.id === permissionsUserId);
     try {
-      await settingsApi.setPermission({ role, feature, enabled: nextEnabled });
+      await settingsApi.setUserPermissions(permissionsUserId, permissions);
       await refreshData();
-      addNotification('user_update', `${label} was ${nextEnabled ? 'enabled' : 'disabled'} for the ${role} role.`);
+      addNotification('user_update', `Permission overrides updated for ${target?.name ?? 'an operator'}.`, 'user', permissionsUserId);
+      showAlert('Permissions updated successfully.');
     } catch (e: any) {
-      showAlert(e.message ?? 'Unable to update permission.');
+      showAlert(e.message ?? 'Unable to update permissions.');
     }
   };
 
-  const unreadCount = data.notifications.filter(n => !n.is_read).length;
+  const handleResetPermissions = async () => {
+    if (!permissionsUserId) return;
+    const target = data.users.find(u => u.id === permissionsUserId);
+    try {
+      await settingsApi.resetUserPermissions(permissionsUserId);
+      await refreshData();
+      addNotification('user_update', `Permission overrides reset to role default for ${target?.name ?? 'an operator'}.`, 'user', permissionsUserId);
+      showAlert('Permissions reset to role default.');
+    } catch (e: any) {
+      showAlert(e.message ?? 'Unable to reset permissions.');
+    }
+  };
+
   const inputClass = "w-full bg-slate-50 border border-slate-200 rounded p-2 text-xs text-slate-800";
 
   return (
     <View className="gap-4">
-      <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
-        <Pressable onPress={() => { setActiveTab('users'); setActiveForm('list'); }} className={`py-1.5 px-3 rounded-lg items-center justify-center ${activeTab === 'users' ? 'bg-indigo-600' : ''}`}>
-          <Text className={`text-[10px] font-extrabold ${activeTab === 'users' ? 'text-white' : 'text-slate-500'}`}>User Representatives</Text>
-        </Pressable>
-        <Pressable onPress={() => setActiveTab('notifications')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${activeTab === 'notifications' ? 'bg-indigo-600' : ''}`}>
-          <Bell size={14} color={activeTab === 'notifications' ? '#ffffff' : '#64748b'} />
-          <Text className={`text-[10px] font-extrabold ${activeTab === 'notifications' ? 'text-white' : 'text-slate-500'}`}>Notification Hub</Text>
-          {unreadCount > 0 && (
-            <View className="bg-red-500 rounded-full px-1.5 py-0.5">
-              <Text className="text-white font-extrabold text-[8px]">{formatBadgeCount(unreadCount)}</Text>
-            </View>
-          )}
-        </Pressable>
-        <Pressable onPress={() => setActiveTab('permissions')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${activeTab === 'permissions' ? 'bg-indigo-600' : ''}`}>
-          <Sliders size={14} color={activeTab === 'permissions' ? '#ffffff' : '#64748b'} />
-          <Text className={`text-[10px] font-extrabold ${activeTab === 'permissions' ? 'text-white' : 'text-slate-500'}`}>Role Permissions</Text>
-        </Pressable>
-      </View>
-
-      {activeTab === 'users' ? (
-        activeForm === 'add_user' || activeForm === 'edit_user' ? (
-          <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-4 w-full lg:max-w-2xl lg:self-center">
-            <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
-              <Text className="font-extrabold text-slate-800 text-sm">
-                {activeForm === 'add_user' ? 'Register Representative User' : 'Modify Operator Details'}
-              </Text>
-              <Pressable onPress={() => setActiveForm('list')}>
-                <Text className="text-slate-400 text-xs">Cancel</Text>
-              </Pressable>
-            </View>
-
-            <View className="gap-3">
-              <View>
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Full Name</Text>
-                <TextInput value={userForm.name} onChangeText={v => setUserForm({ ...userForm, name: v })} placeholder="e.g. Anil Kumar" placeholderTextColor="#94a3b8" className={inputClass} />
-              </View>
-
-              <View className="flex-row gap-2">
-                <View className="flex-1">
-                  <Text className="font-bold text-slate-500 mb-1 text-xs">Phone / Username</Text>
-                  <TextInput value={userForm.phone} onChangeText={v => setUserForm({ ...userForm, phone: v })} placeholder="e.g. driver3 or name" placeholderTextColor="#94a3b8" className={inputClass} />
-                </View>
-                <View className="flex-1">
-                  <Text className="font-bold text-slate-500 mb-1 text-xs">Password</Text>
-                  <TextInput value={userForm.password_hash} onChangeText={v => setUserForm({ ...userForm, password_hash: v })} placeholder="e.g. 123456" placeholderTextColor="#94a3b8" className={inputClass} />
-                </View>
-              </View>
-
-              <View>
-                <Text className="font-bold text-slate-500 mb-1 text-xs">System Role</Text>
-                <View className="flex-row gap-1.5">
-                  {(['Admin', 'Salesperson', 'Warehouse'] as const).map(role => (
-                    <Pressable key={role} onPress={() => setUserForm({ ...userForm, role })} className={`flex-1 py-2 rounded-lg items-center ${userForm.role === role ? 'bg-indigo-600' : 'bg-slate-50 border border-slate-200'}`}>
-                      <Text className={`text-[10px] font-bold ${userForm.role === role ? 'text-white' : 'text-slate-600'}`}>{role}</Text>
-                    </Pressable>
-                  ))}
-                </View>
-              </View>
-
-              <View>
-                <Text className="font-bold text-slate-500 mb-1 text-xs">Operator Status</Text>
-                <View className="flex-row gap-1.5">
-                  {(['Active', 'Inactive'] as const).map(st => (
-                    <Pressable key={st} onPress={() => setUserForm({ ...userForm, status: st })} className={`flex-1 py-2 rounded-lg items-center ${userForm.status === st ? 'bg-slate-800' : 'bg-slate-50 border border-slate-200'}`}>
-                      <Text className={`text-[10px] font-bold ${userForm.status === st ? 'text-white' : 'text-slate-600'}`}>{st}</Text>
-                    </Pressable>
-                  ))}
-                </View>
-              </View>
-            </View>
-
-            <Pressable onPress={handleSaveUser} className="w-full py-2.5 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
-              <Text className="text-white font-bold text-xs">
-                {activeForm === 'add_user' ? 'Confirm Representative Registration' : 'Save Operator Changes'}
-              </Text>
+      {activeForm === 'add_user' || activeForm === 'edit_user' ? (
+        <View className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 gap-4 w-full lg:max-w-2xl lg:self-center">
+          <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
+            <Text className="font-extrabold text-slate-800 text-sm">
+              {activeForm === 'add_user' ? 'Register Representative User' : 'Modify Operator Details'}
+            </Text>
+            <Pressable onPress={() => setActiveForm('list')}>
+              <Text className="text-slate-400 text-xs">Cancel</Text>
             </Pressable>
           </View>
-        ) : (
+
           <View className="gap-3">
-            <View className="flex-row justify-between items-center bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-              <Text className="font-bold text-slate-500 text-[11px] flex-1 mr-2">Add/manage staff logins:</Text>
-              <Pressable onPress={handleOpenAddUser} className="py-1 px-2.5 bg-rose-50 border border-rose-100 rounded-lg active:bg-rose-100">
-                <Text className="text-rose-600 font-extrabold text-[9px]">+ Register Operator</Text>
-              </Pressable>
+            <View>
+              <Text className="font-bold text-slate-500 mb-1 text-xs">Full Name</Text>
+              <TextInput value={userForm.name} onChangeText={v => setUserForm({ ...userForm, name: v })} placeholder="e.g. Anil Kumar" placeholderTextColor="#94a3b8" className={inputClass} />
             </View>
 
-            <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
-              <Pressable onPress={() => setUserListTab('active')} className={`py-1.5 px-3 rounded-lg items-center justify-center ${userListTab === 'active' ? 'bg-indigo-600' : ''}`}>
-                <Text className={`text-[10px] font-extrabold ${userListTab === 'active' ? 'text-white' : 'text-slate-500'}`}>Active Staff</Text>
-              </Pressable>
-              <Pressable onPress={() => setUserListTab('inactive')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${userListTab === 'inactive' ? 'bg-indigo-600' : ''}`}>
-                <RotateCcw size={13} color={userListTab === 'inactive' ? '#ffffff' : '#64748b'} />
-                <Text className={`text-[10px] font-extrabold ${userListTab === 'inactive' ? 'text-white' : 'text-slate-500'}`}>Disabled Staff</Text>
-                {data.users.filter(u => u.status === 'Inactive').length > 0 && (
-                  <View className="bg-red-500 rounded-full px-1.5 py-0.5">
-                    <Text className="text-white font-extrabold text-[8px]">{data.users.filter(u => u.status === 'Inactive').length}</Text>
-                  </View>
-                )}
-              </Pressable>
+            <View className="flex-row gap-2">
+              <View className="flex-1">
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Phone / Username</Text>
+                <TextInput value={userForm.phone} onChangeText={v => setUserForm({ ...userForm, phone: v })} placeholder="e.g. driver3 or name" placeholderTextColor="#94a3b8" className={inputClass} />
+              </View>
+              <View className="flex-1">
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Password</Text>
+                <TextInput value={userForm.password_hash} onChangeText={v => setUserForm({ ...userForm, password_hash: v })} placeholder="e.g. 123456" placeholderTextColor="#94a3b8" className={inputClass} />
+              </View>
             </View>
 
-            <ViewToggle />
+            <View>
+              <Text className="font-bold text-slate-500 mb-1 text-xs">System Role</Text>
+              <View className="flex-row gap-1.5">
+                {(['Admin', 'Salesperson', 'Warehouse'] as const).map(role => (
+                  <Pressable key={role} onPress={() => setUserForm({ ...userForm, role })} className={`flex-1 py-2 rounded-lg items-center ${userForm.role === role ? 'bg-indigo-600' : 'bg-slate-50 border border-slate-200'}`}>
+                    <Text className={`text-[10px] font-bold ${userForm.role === role ? 'text-white' : 'text-slate-600'}`}>{role}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
 
-            {(() => {
-              const filteredUsers = data.users.filter(u => userListTab === 'inactive' ? u.status === 'Inactive' : u.status === 'Active');
-              const emptyText = userListTab === 'inactive' ? 'No disabled staff accounts. Anything you disable will show up here.' : 'No active staff accounts found.';
+            <View>
+              <Text className="font-bold text-slate-500 mb-1 text-xs">Operator Status</Text>
+              <View className="flex-row gap-1.5">
+                {(['Active', 'Inactive'] as const).map(st => (
+                  <Pressable key={st} onPress={() => setUserForm({ ...userForm, status: st })} className={`flex-1 py-2 rounded-lg items-center ${userForm.status === st ? 'bg-slate-800' : 'bg-slate-50 border border-slate-200'}`}>
+                    <Text className={`text-[10px] font-bold ${userForm.status === st ? 'text-white' : 'text-slate-600'}`}>{st}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          </View>
 
-              if (viewMode === 'table') {
-                return (
-                  <DataTable
-                    data={filteredUsers}
-                    keyExtractor={u => u.id}
-                    emptyText={emptyText}
-                    columns={[
-                      {
-                        key: 'name', label: 'Name', width: 180,
-                        render: u => (
-                          <View className="flex-row items-center gap-1.5">
-                            <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{u.name}</Text>
-                            {u.status === 'Inactive' && <Text className="text-[8px] font-black px-1 rounded-full bg-red-50 text-red-600">Inactive</Text>}
-                          </View>
-                        ),
-                      },
-                      { key: 'role', label: 'Role', width: 110, render: u => <Text className="text-[10px] text-slate-600">{u.role}</Text> },
-                      { key: 'phone', label: 'Phone / Username', width: 140, render: u => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{u.phone}</Text> },
-                      {
-                        key: 'actions', label: 'Actions', width: 110, grow: false,
-                        render: u => (
-                          <View className="flex-row items-center gap-1.5">
-                            <Pressable onPress={() => handleOpenEditUser(u)} className="p-1.5 bg-blue-50 border border-blue-100 rounded-lg active:bg-blue-100">
-                              <Edit size={13} color="#2563eb" />
-                            </Pressable>
-                            <Pressable onPress={() => handleOpenResetPassword(u.id)} className="p-1.5 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100">
-                              <Key size={13} color="#64748b" />
-                            </Pressable>
-                            <Pressable
-                              onPress={() => handleToggleUserStatus(u)}
-                              className={`p-1.5 rounded-lg border ${u.status === 'Active' ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}
-                            >
-                              {u.status === 'Active' ? <ToggleRight size={14} color="#059669" /> : <ToggleLeft size={14} color="#ef4444" />}
-                            </Pressable>
-                          </View>
-                        ),
-                      },
-                    ] as DataTableColumn<User>[]}
-                  />
-                );
-              }
+          <Pressable onPress={handleSaveUser} className="w-full py-2.5 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
+            <Text className="text-white font-bold text-xs">
+              {activeForm === 'add_user' ? 'Confirm Representative Registration' : 'Save Operator Changes'}
+            </Text>
+          </Pressable>
+        </View>
+      ) : (
+        <View className="gap-3">
+          <View className="flex-row justify-between items-center bg-slate-50 p-2.5 rounded-xl border border-slate-200">
+            <Text className="font-bold text-slate-500 text-[11px] flex-1 mr-2">Add/manage staff logins:</Text>
+            <Pressable onPress={handleOpenAddUser} className="py-1 px-2.5 bg-rose-50 border border-rose-100 rounded-lg active:bg-rose-100">
+              <Text className="text-rose-600 font-extrabold text-[9px]">+ Register Operator</Text>
+            </Pressable>
+          </View>
 
+          <View className="flex-row flex-wrap bg-slate-100 p-1 rounded-xl gap-1">
+            <Pressable onPress={() => setUserListTab('active')} className={`py-1.5 px-3 rounded-lg items-center justify-center ${userListTab === 'active' ? 'bg-indigo-600' : ''}`}>
+              <Text className={`text-[10px] font-extrabold ${userListTab === 'active' ? 'text-white' : 'text-slate-500'}`}>Active Staff</Text>
+            </Pressable>
+            <Pressable onPress={() => setUserListTab('inactive')} className={`py-1.5 px-3 rounded-lg items-center justify-center flex-row gap-1.5 ${userListTab === 'inactive' ? 'bg-indigo-600' : ''}`}>
+              <RotateCcw size={13} color={userListTab === 'inactive' ? '#ffffff' : '#64748b'} />
+              <Text className={`text-[10px] font-extrabold ${userListTab === 'inactive' ? 'text-white' : 'text-slate-500'}`}>Disabled Staff</Text>
+              {data.users.filter(u => u.status === 'Inactive').length > 0 && (
+                <View className="bg-red-500 rounded-full px-1.5 py-0.5">
+                  <Text className="text-white font-extrabold text-[8px]">{data.users.filter(u => u.status === 'Inactive').length}</Text>
+                </View>
+              )}
+            </Pressable>
+          </View>
+
+          <ViewToggle />
+
+          {(() => {
+            const filteredUsers = data.users.filter(u => userListTab === 'inactive' ? u.status === 'Inactive' : u.status === 'Active');
+            const emptyText = userListTab === 'inactive' ? 'No disabled staff accounts. Anything you disable will show up here.' : 'No active staff accounts found.';
+
+            if (viewMode === 'table') {
               return (
-                <View className="gap-2.5 md:flex-row md:flex-wrap">
-                  {filteredUsers.map(u => {
-                    const isInactive = u.status === 'Inactive';
-                    return (
-                      <View key={u.id} className={`w-full lg:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between ${isInactive ? 'opacity-60' : ''}`}>
-                        <View className="flex-row items-center gap-2.5 flex-1">
-                          <View className="p-2 bg-rose-50 rounded-xl">
-                            <Shield size={16} color="#f43f5e" />
-                          </View>
-                          <View className="flex-1">
-                            <View className="flex-row items-center gap-1.5">
-                              <Text className="font-bold text-slate-800 text-xs">{u.name}</Text>
-                              {isInactive && <Text className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-red-50 text-red-600">Inactive</Text>}
-                            </View>
-                            <Text className="text-[10px] text-slate-400 mt-0.5">Role: {u.role} - U: {u.phone} - P: ••••••••</Text>
-                          </View>
+                <DataTable
+                  data={filteredUsers}
+                  keyExtractor={u => u.id}
+                  emptyText={emptyText}
+                  columns={[
+                    {
+                      key: 'name', label: 'Name', width: 180,
+                      render: u => (
+                        <View className="flex-row items-center gap-1.5">
+                          <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{u.name}</Text>
+                          {u.status === 'Inactive' && <Text className="text-[8px] font-black px-1 rounded-full bg-red-50 text-red-600">Inactive</Text>}
                         </View>
-
+                      ),
+                    },
+                    { key: 'role', label: 'Role', width: 110, render: u => <Text className="text-[10px] text-slate-600">{u.role}</Text> },
+                    { key: 'phone', label: 'Phone / Username', width: 140, render: u => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{u.phone}</Text> },
+                    {
+                      key: 'actions', label: 'Actions', width: 145, grow: false,
+                      render: u => (
                         <View className="flex-row items-center gap-1.5">
                           <Pressable onPress={() => handleOpenEditUser(u)} className="p-1.5 bg-blue-50 border border-blue-100 rounded-lg active:bg-blue-100">
-                            <Edit size={14} color="#2563eb" />
+                            <Edit size={13} color="#2563eb" />
                           </Pressable>
                           <Pressable onPress={() => handleOpenResetPassword(u.id)} className="p-1.5 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100">
-                            <Key size={14} color="#64748b" />
+                            <Key size={13} color="#64748b" />
+                          </Pressable>
+                          <Pressable onPress={() => handleOpenManagePermissions(u.id)} className="p-1.5 bg-indigo-50 border border-indigo-100 rounded-lg active:bg-indigo-100">
+                            <UserCog size={13} color="#4f46e5" />
                           </Pressable>
                           <Pressable
                             onPress={() => handleToggleUserStatus(u)}
                             className={`p-1.5 rounded-lg border ${u.status === 'Active' ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}
                           >
-                            {u.status === 'Active' ? <ToggleRight size={16} color="#059669" /> : <ToggleLeft size={16} color="#ef4444" />}
+                            {u.status === 'Active' ? <ToggleRight size={14} color="#059669" /> : <ToggleLeft size={14} color="#ef4444" />}
                           </Pressable>
                         </View>
-                      </View>
-                    );
-                  })}
-                  {filteredUsers.length === 0 && (
-                    <Text className="w-full text-[10px] text-slate-400 italic py-4 text-center">{emptyText}</Text>
-                  )}
-                </View>
+                      ),
+                    },
+                  ] as DataTableColumn<User>[]}
+                />
               );
-            })()}
+            }
 
-            <Modal visible={!!resetPasswordUserId} transparent animationType="fade" onRequestClose={() => { setResetPasswordUserId(null); setResetPasswordError(null); }}>
-              <View className="flex-1 bg-slate-900/50 items-center justify-center p-6">
-                <View className="bg-white w-full max-w-sm rounded-2xl p-5 gap-3">
-                  <Text className="font-extrabold text-slate-800 text-sm">Reset Representative Password</Text>
-                  <TextInput
-                    value={resetPasswordValue}
-                    onChangeText={(text) => { setResetPasswordValue(text); setResetPasswordError(null); }}
-                    placeholder="Enter new password"
-                    placeholderTextColor="#94a3b8"
-                    className={inputClass}
-                    autoFocus
-                  />
-                  {resetPasswordError && (
-                    <Text className="text-rose-600 font-bold text-[10px]">{resetPasswordError}</Text>
-                  )}
-                  <View className="flex-row gap-2">
-                    <Pressable onPress={() => { setResetPasswordUserId(null); setResetPasswordError(null); }} className="flex-1 py-2 bg-slate-100 rounded-xl items-center active:bg-slate-200">
-                      <Text className="text-slate-700 font-bold text-xs">Cancel</Text>
-                    </Pressable>
-                    <Pressable onPress={handleConfirmResetPassword} className="flex-1 py-2 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
-                      <Text className="text-white font-bold text-xs">Confirm Reset</Text>
-                    </Pressable>
-                  </View>
-                </View>
-              </View>
-            </Modal>
-          </View>
-        )
-      ) : activeTab === 'notifications' ? (
-        <View className="gap-3">
-          <View className="flex-row justify-between items-center h-8">
-            <Text className="font-bold text-slate-700 text-xs">Central Alert Notifications Center</Text>
-            {notifications.total > 0 && (
-              <Pressable onPress={handleClearAllNotifications}>
-                <Text className="text-red-500 font-bold text-xs">Clear All Logs</Text>
-              </Pressable>
-            )}
-          </View>
-
-          <ViewToggle />
-
-          <ScrollableSection height={notificationsTableHeight}>
-          {notifications.loading && notifications.data.length === 0 ? (
-            <View className="flex-1 items-center justify-center"><Text className="text-center text-slate-400 italic text-xs">Loading notifications...</Text></View>
-          ) : notifications.error ? (
-            <View className="flex-1 items-center justify-center"><Text className="text-center text-red-500 italic text-xs">{notifications.error}</Text></View>
-          ) : viewMode === 'table' ? (
-            <DataTable
-              data={notifications.data}
-              keyExtractor={n => n.id}
-              onRowPress={handleNotificationPress}
-              emptyText="Notification center is quiet. Alerts show up here."
-              columns={[
-                {
-                  key: 'type', label: 'Type', width: 130,
-                  render: n => (
-                    <View className="flex-row items-center gap-1.5">
-                      {!n.is_read && <View className="w-1.5 h-1.5 rounded-full bg-rose-500 flex-shrink-0" />}
-                      <Text className={`font-bold text-[9px] uppercase tracking-wider ${n.is_read ? 'text-slate-500' : 'text-slate-800'}`} numberOfLines={1}>
-                        {notifTypeLabels[n.type] || n.type}
-                      </Text>
-                    </View>
-                  ),
-                },
-                {
-                  key: 'message', label: 'Message', width: 320,
-                  render: n => <Text className={`font-semibold text-[11px] ${n.is_read ? 'text-slate-500' : 'text-slate-800'}`} numberOfLines={2}>{n.message}</Text>,
-                },
-                { key: 'time', label: 'Time', width: 130, grow: false, render: n => <Text className="text-[9px] text-slate-400">{formatDateTime12h(n.created_at)}</Text> },
-                {
-                  key: 'nav', label: '', width: 60, grow: false, align: 'center',
-                  render: n => (n.entity_type && n.entity_id ? <Text className="text-indigo-500 font-extrabold text-[9px]">View →</Text> : null),
-                },
-              ] as DataTableColumn<AppNotification>[]}
-            />
-          ) : (
-            <View className={`gap-2 md:flex-row md:flex-wrap ${notifications.data.length === 0 ? 'flex-1' : ''}`}>
-              {notifications.data.map(n => (
-                <Pressable
-                  key={n.id}
-                  onPress={() => handleNotificationPress(n)}
-                  className={`w-full lg:w-[48%] xl:w-[32%] p-3 rounded-2xl border flex-row gap-3 ${n.is_read ? 'bg-slate-50 border-slate-200' : 'bg-white border-rose-200'}`}
-                >
-                  <View className={`p-2 rounded-xl h-fit ${(notifTypeStyle[n.type] || notifTypeStyle.new_order).bg}`}>
-                    {(notifTypeStyle[n.type] || notifTypeStyle.new_order).icon === 'alert'
-                      ? <AlertTriangle size={16} color={(notifTypeStyle[n.type] || notifTypeStyle.new_order).color} />
-                      : <Bell size={16} color={(notifTypeStyle[n.type] || notifTypeStyle.new_order).color} />}
-                  </View>
-                  <View className="flex-1">
-                    <View className="flex-row justify-between items-center gap-2">
-                      <View className="flex-row items-center gap-1.5 flex-shrink">
-                        {!n.is_read && <View className="w-1.5 h-1.5 rounded-full bg-rose-500 flex-shrink-0" />}
-                        <Text
-                          className={`font-bold text-[9px] uppercase tracking-wider ${n.is_read ? 'text-slate-500' : 'text-slate-800'}`}
-                          numberOfLines={1}
-                        >
-                          {notifTypeLabels[n.type] || n.type}
-                        </Text>
-                      </View>
-                      <Text className="text-[8px] text-slate-400 flex-shrink-0">{formatDateTime12h(n.created_at)}</Text>
-                    </View>
-                    <Text className={`mt-1 font-semibold leading-relaxed text-[11px] ${n.is_read ? 'text-slate-500' : 'text-slate-800'}`}>{n.message}</Text>
-                    {!!n.entity_type && !!n.entity_id && (
-                      <Text className="mt-1 text-indigo-500 font-extrabold text-[9px]">View →</Text>
-                    )}
-                  </View>
-                </Pressable>
-              ))}
-
-              {notifications.data.length === 0 && (
-                <View className="flex-1 items-center justify-center w-full py-8 bg-white rounded-2xl border border-slate-200">
-                  <Text className="text-slate-400 italic text-xs">Notification center is quiet. Alerts show up here.</Text>
-                </View>
-              )}
-            </View>
-          )}
-          </ScrollableSection>
-          <PaginationFooter mode="offset" page={notifications.page} totalPages={notifications.totalPages} total={notifications.total} loading={notifications.loading} onPageChange={notifications.goToPage} />
-        </View>
-      ) : (
-        <View className="gap-3">
-          <Text className="font-bold text-slate-700 text-xs">Grant Role-Specific Feature Access</Text>
-          <Text className="text-[10px] text-slate-400 leading-relaxed -mt-1.5">Some features are hidden from a role by default. Turn them on here to enable them for every user with that role.</Text>
-
-          <View className="gap-2.5 md:flex-row md:flex-wrap md:items-stretch">
-            {ROLE_FEATURES.map(feature => (
-              <View key={feature.key} className="w-full md:w-[48%] bg-white rounded-2xl p-3 border border-slate-200 justify-between gap-2.5">
-                <View className="gap-0.5">
-                  <Text className="font-bold text-slate-800 text-xs">{feature.label}</Text>
-                  <Text className="text-[10px] text-slate-400 leading-relaxed">{feature.description}</Text>
-                </View>
-                <View className="gap-1.5">
-                  {feature.roles.map(role => {
-                    const enabled = isRoleFeatureEnabled(role, feature.key);
-                    return (
-                      <Pressable
-                        key={role}
-                        onPress={() => handleToggleRoleFeature(role, feature.key, feature.label)}
-                        className={`flex-row items-center justify-between p-2 rounded-xl border ${enabled ? 'bg-emerald-50 border-emerald-100' : 'bg-slate-50 border-slate-200'}`}
-                      >
-                        <Text className="text-slate-700 font-bold text-[11px]">{role}</Text>
-                        <View className="flex-row items-center gap-1.5">
-                          <Text className={`text-[9px] font-extrabold uppercase ${enabled ? 'text-emerald-600' : 'text-slate-400'}`}>{enabled ? 'Enabled' : 'Disabled'}</Text>
-                          {enabled ? <ToggleRight size={18} color="#059669" /> : <ToggleLeft size={18} color="#94a3b8" />}
+            return (
+              <View className={`gap-2.5 md:flex-row md:flex-wrap ${filteredUsers.length === 0 ? 'flex-1' : ''}`}>
+                {filteredUsers.map(u => {
+                  const isInactive = u.status === 'Inactive';
+                  return (
+                    <View key={u.id} className={`w-full lg:w-[48%] xl:w-[32%] bg-white rounded-2xl p-3 border border-slate-200 flex-row items-center justify-between ${isInactive ? 'opacity-60' : ''}`}>
+                      <View className="flex-row items-center gap-2.5 flex-1">
+                        <View className="p-2 bg-rose-50 rounded-xl">
+                          <Shield size={16} color="#f43f5e" />
                         </View>
-                      </Pressable>
-                    );
-                  })}
+                        <View className="flex-1">
+                          <View className="flex-row items-center gap-1.5">
+                            <Text className="font-bold text-slate-800 text-xs">{u.name}</Text>
+                            {isInactive && <Text className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-red-50 text-red-600">Inactive</Text>}
+                          </View>
+                          <Text className="text-[10px] text-slate-400 mt-0.5">Role: {u.role} - U: {u.phone} - P: ••••••••</Text>
+                        </View>
+                      </View>
+
+                      <View className="flex-row items-center gap-1.5">
+                        <Pressable onPress={() => handleOpenEditUser(u)} className="p-1.5 bg-blue-50 border border-blue-100 rounded-lg active:bg-blue-100">
+                          <Edit size={14} color="#2563eb" />
+                        </Pressable>
+                        <Pressable onPress={() => handleOpenResetPassword(u.id)} className="p-1.5 bg-slate-50 border border-slate-200 rounded-lg active:bg-slate-100">
+                          <Key size={14} color="#64748b" />
+                        </Pressable>
+                        <Pressable onPress={() => handleOpenManagePermissions(u.id)} className="p-1.5 bg-indigo-50 border border-indigo-100 rounded-lg active:bg-indigo-100">
+                          <UserCog size={14} color="#4f46e5" />
+                        </Pressable>
+                        <Pressable
+                          onPress={() => handleToggleUserStatus(u)}
+                          className={`p-1.5 rounded-lg border ${u.status === 'Active' ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}
+                        >
+                          {u.status === 'Active' ? <ToggleRight size={16} color="#059669" /> : <ToggleLeft size={16} color="#ef4444" />}
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })}
+                {filteredUsers.length === 0 && (
+                  <EmptyState message={emptyText} />
+                )}
+              </View>
+            );
+          })()}
+
+          <Modal visible={!!resetPasswordUserId} transparent animationType="fade" onRequestClose={() => { setResetPasswordUserId(null); setResetPasswordError(null); }}>
+            <View className="flex-1 bg-slate-900/50 items-center justify-center p-6">
+              <View className="bg-white w-full max-w-sm rounded-2xl p-5 gap-3">
+                <Text className="font-extrabold text-slate-800 text-sm">Reset Representative Password</Text>
+                <TextInput
+                  value={resetPasswordValue}
+                  onChangeText={(text) => { setResetPasswordValue(text); setResetPasswordError(null); }}
+                  placeholder="Enter new password"
+                  placeholderTextColor="#94a3b8"
+                  className={inputClass}
+                  autoFocus
+                />
+                {resetPasswordError && (
+                  <Text className="text-rose-600 font-bold text-[10px]">{resetPasswordError}</Text>
+                )}
+                <View className="flex-row gap-2">
+                  <Pressable onPress={() => { setResetPasswordUserId(null); setResetPasswordError(null); }} className="flex-1 py-2 bg-slate-100 rounded-xl items-center active:bg-slate-200">
+                    <Text className="text-slate-700 font-bold text-xs">Cancel</Text>
+                  </Pressable>
+                  <Pressable onPress={handleConfirmResetPassword} className="flex-1 py-2 bg-indigo-600 rounded-xl items-center active:bg-indigo-700">
+                    <Text className="text-white font-bold text-xs">Confirm Reset</Text>
+                  </Pressable>
                 </View>
               </View>
-            ))}
-          </View>
+            </View>
+          </Modal>
+
+          <ManagePermissionsModal
+            visible={!!permissionsUserId}
+            onClose={() => setPermissionsUserId(null)}
+            targetUser={data.users.find(u => u.id === permissionsUserId) ?? null}
+            currentUser={currentUser}
+            rolePermissions={data.rolePermissions}
+            userPermissions={data.userPermissions.filter(up => up.user_id === permissionsUserId)}
+            onSave={handleSavePermissions}
+            onReset={handleResetPermissions}
+          />
         </View>
       )}
     </View>

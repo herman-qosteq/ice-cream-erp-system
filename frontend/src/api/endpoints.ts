@@ -1,4 +1,5 @@
 import { api } from './client';
+import { BoxPieceQty } from '../types';
 
 // Small shared helper for building query strings for the new paginated list
 // endpoints - undefined/empty values are simply omitted rather than sent as
@@ -43,6 +44,63 @@ export const areasApi = {
   remove: (id: string) => api.delete<any>(`/areas/${id}`),
 };
 
+// ---------- Villages ----------
+export const villagesApi = {
+  list: () => api.get<any[]>('/villages'),
+  create: (name: string) => api.post<any>('/villages', { name }),
+  rename: (id: string, name: string) => api.patch<any>(`/villages/${id}`, { name }),
+  remove: (id: string) => api.delete<any>(`/villages/${id}`),
+};
+
+// ---------- Partner Types ----------
+export const partnerTypesApi = {
+  list: () => api.get<any[]>('/partner-types'),
+  create: (name: string) => api.post<any>('/partner-types', { name }),
+  rename: (id: string, name: string) => api.patch<any>(`/partner-types/${id}`, { name }),
+  remove: (id: string) => api.delete<any>(`/partner-types/${id}`),
+};
+
+// ---------- Asset Types ----------
+export const assetTypesApi = {
+  list: () => api.get<any[]>('/asset-types'),
+  create: (name: string) => api.post<any>('/asset-types', { name }),
+  rename: (id: string, name: string) => api.patch<any>(`/asset-types/${id}`, { name }),
+  remove: (id: string) => api.delete<any>(`/asset-types/${id}`),
+};
+
+// ---------- Assets (freezer boxes, fridges, carts, ...) ----------
+export const assetsApi = {
+  list: () => api.get<any[]>('/assets'),
+  listPaged: (params: { page?: number; pageSize?: number; search?: string; status?: string; asset_type?: string; location_type?: string; dateFrom?: string; dateTo?: string }) =>
+    api.get<{ data: any[]; page: number; pageSize: number; total: number; totalPages: number }>(`/assets${toQueryString(params)}`),
+  create: (input: { name: string; code: string; asset_type: string; serial_number?: string; capacity?: string; notes?: string }) =>
+    api.post<any>('/assets', input),
+  update: (id: string, input: Partial<{ name: string; code: string; asset_type: string; serial_number: string; capacity: string; notes: string; last_service_date: string }>) =>
+    api.patch<any>(`/assets/${id}`, input),
+  assign: (id: string, input: { partner_id: string; notes?: string }) => api.post<any>(`/assets/${id}/assign`, input),
+  return: (id: string, input: { notes?: string } = {}) => api.post<any>(`/assets/${id}/return`, input),
+  maintenanceStart: (id: string, input: { notes?: string } = {}) => api.post<any>(`/assets/${id}/maintenance-start`, input),
+  maintenanceEnd: (id: string, input: { notes?: string } = {}) => api.post<any>(`/assets/${id}/maintenance-end`, input),
+  markLost: (id: string, input: { notes?: string } = {}) => api.post<any>(`/assets/${id}/mark-lost`, input),
+  reactivate: (id: string, input: { notes?: string } = {}) => api.post<any>(`/assets/${id}/reactivate`, input),
+  deactivate: (id: string, input: { notes?: string } = {}) => api.post<any>(`/assets/${id}/deactivate`, input),
+  history: (id: string) => api.get<any[]>(`/assets/${id}/history`),
+  inventory: (id: string) => api.get<any[]>(`/assets/${id}/inventory`),
+  inventorySummary: () => api.get<{ totalUnits: number }>('/assets/inventory-summary'),
+  allInventory: () => api.get<any[]>('/assets/inventory'),
+  allHistory: () => api.get<any[]>('/assets/history'),
+};
+
+// ---------- Inventory Movements (unified movement ledger) ----------
+export const inventoryMovementsApi = {
+  list: (params: { from_location_type?: string; to_location_type?: string; product_id?: string; dateFrom?: string; dateTo?: string } = {}) =>
+    api.get<any[]>(`/inventory-movements${toQueryString(params)}`),
+  listPaged: (params: { page?: number; pageSize?: number; from_location_type?: string; to_location_type?: string; product_id?: string; dateFrom?: string; dateTo?: string }) =>
+    api.get<{ data: any[]; page: number; pageSize: number; total: number; totalPages: number }>(`/inventory-movements${toQueryString(params)}`),
+  move: (input: { from_type: string; from_id?: string; to_type: string; to_id?: string; product_id: string; qty: BoxPieceQty; reason?: string }) =>
+    api.post<any>('/inventory-movements/move', input),
+};
+
 // ---------- Store-Specific Pricing Overrides ----------
 export const storePricingApi = {
   list: () => api.get<any[]>('/store-pricing'),
@@ -84,9 +142,9 @@ export const purchasesApi = {
 // ---------- Purchase Order Requests (saved PO Excel drafts) ----------
 export const purchaseOrderRequestsApi = {
   list: () => api.get<any[]>('/purchase-order-requests'),
-  create: (input: { order_ref: string; supplier_id: string; items: { product_id: string; order_case: number }[] }) =>
+  create: (input: { order_ref: string; supplier_id: string; items: { product_id: string; order_case: number; order_case_pieces?: number }[] }) =>
     api.post<any>('/purchase-order-requests', input),
-  update: (id: string, input: { supplier_id: string; items: { product_id: string; order_case: number }[] }) =>
+  update: (id: string, input: { supplier_id: string; items: { product_id: string; order_case: number; order_case_pieces?: number }[] }) =>
     api.patch<any>(`/purchase-order-requests/${id}`, input),
   cancel: (id: string) => api.patch<any>(`/purchase-order-requests/${id}/cancel`, {}),
 };
@@ -94,9 +152,9 @@ export const purchaseOrderRequestsApi = {
 // ---------- Warehouse ----------
 export const warehouseApi = {
   listInventory: () => api.get<any[]>('/warehouse/inventory'),
-  adjust: (input: { product_id: string; type: string; direction: 'add' | 'subtract'; qty: number; reason?: string }) =>
+  adjust: (input: { product_id: string; type: string; direction: 'add' | 'subtract'; qty: BoxPieceQty; reason?: string }) =>
     api.post<any>('/warehouse/inventory/adjust', input),
-  correct: (input: { product_id: string; available_qty: number; reserved_qty: number; damaged_qty: number; expired_qty: number; comment?: string }) =>
+  correct: (input: { product_id: string; available_qty: BoxPieceQty; reserved_qty: BoxPieceQty; damaged_qty: BoxPieceQty; expired_qty: BoxPieceQty; comment?: string }) =>
     api.post<any>('/warehouse/inventory/correct', input),
 };
 
@@ -112,12 +170,12 @@ export const trucksApi = {
 export const dispatchApi = {
   listAllTruckInventory: () => api.get<any[]>('/dispatch/trucks/inventory'),
   listTruckInventory: (truckId: string) => api.get<any[]>(`/dispatch/trucks/${truckId}/inventory`),
-  load: (input: { truck_id: string; items: { product_id: string; qty: number; source: 'available_qty' | 'reserved_qty'; pre_booking_id?: string }[] }) =>
+  load: (input: { truck_id: string; items: { product_id: string; qty: BoxPieceQty; source: 'available_qty' | 'reserved_qty'; pre_booking_id?: string }[] }) =>
     api.post<any>('/dispatch/load', input),
-  returnStock: (truckId: string, product_id: string, qty: number) =>
+  returnStock: (truckId: string, product_id: string, qty: BoxPieceQty) =>
     api.post<any>(`/dispatch/trucks/${truckId}/return`, { product_id, qty }),
   returnAll: (truckId: string) => api.post<any>(`/dispatch/trucks/${truckId}/return-all`, {}),
-  transfer: (input: { from_truck_id: string; to_truck_id: string; items: { product_id: string; qty: number }[] }) =>
+  transfer: (input: { from_truck_id: string; to_truck_id: string; items: { product_id: string; qty: BoxPieceQty }[] }) =>
     api.post<any>('/dispatch/transfer', input),
 };
 
@@ -135,7 +193,7 @@ export const storesApi = {
 // ---------- Orders ----------
 export const ordersApi = {
   list: () => api.get<any[]>('/orders'),
-  listPaged: (params: { page?: number; pageSize?: number; search?: string; status?: string; paymentStatus?: string; dateFrom?: string; dateTo?: string }) =>
+  listPaged: (params: { page?: number; pageSize?: number; search?: string; status?: string; paymentStatus?: string; partnerType?: string; salespersonId?: string; truckId?: string; area?: string; dateFrom?: string; dateTo?: string }) =>
     api.get<{ data: any[]; page: number; pageSize: number; total: number; totalPages: number }>(`/orders${toQueryString(params)}`),
   listInvoices: () => api.get<any[]>('/orders/invoices'),
   create: (input: { store_id: string; salesperson_id: string; truck_id?: string; items: any[] }) =>
@@ -146,7 +204,7 @@ export const ordersApi = {
   deliverConfirmed: (id: string) => api.post<{ order: any; invoice: any }>(`/orders/${id}/deliver`, {}),
   cancel: (id: string) => api.patch<any>(`/orders/${id}/cancel`, {}),
   // Admin-only: editing/deleting a Confirmed or Delivered order.
-  edit: (id: string, input: { items: { product_id: string; quantity: number; unit_price: number; tax_pct: number }[] }) =>
+  edit: (id: string, input: { items: { product_id: string; quantity: number; quantity_pieces?: number; unit_price: number; tax_pct: number }[] }) =>
     api.patch<{ order: any; invoice?: any }>(`/orders/${id}/edit`, input),
   remove: (id: string) => api.delete<{ id: string; deleted: true }>(`/orders/${id}`),
 };
@@ -154,7 +212,7 @@ export const ordersApi = {
 // ---------- Payments ----------
 export const paymentsApi = {
   list: () => api.get<any[]>('/payments'),
-  listPaged: (params: { page?: number; pageSize?: number; search?: string; method?: string; dateFrom?: string; dateTo?: string }) =>
+  listPaged: (params: { page?: number; pageSize?: number; search?: string; method?: string; partnerType?: string; dateFrom?: string; dateTo?: string }) =>
     api.get<{ data: any[]; page: number; pageSize: number; total: number; totalPages: number }>(`/payments${toQueryString(params)}`),
   create: (input: { store_id: string; invoice_id?: string; amount: number; method: string }) =>
     api.post<any>('/payments', input),
@@ -163,7 +221,7 @@ export const paymentsApi = {
 // ---------- PreBookings ----------
 export const preBookingsApi = {
   list: () => api.get<any[]>('/prebookings'),
-  listPaged: (params: { page?: number; pageSize?: number; search?: string; status?: string; dateFrom?: string; dateTo?: string }) =>
+  listPaged: (params: { page?: number; pageSize?: number; search?: string; status?: string; partnerType?: string; dateFrom?: string; dateTo?: string }) =>
     api.get<{ data: any[]; page: number; pageSize: number; total: number; totalPages: number }>(`/prebookings${toQueryString(params)}`),
   create: (input: { store_id: string; salesperson_id: string; scheduled_delivery_date: string; items: any[]; notes?: string }) =>
     api.post<any>('/prebookings', input),
@@ -174,7 +232,7 @@ export const preBookingsApi = {
   cancel: (id: string) => api.patch<any>(`/prebookings/${id}/cancel`, {}),
   // Admin-only: editing/deleting a Delivered booking (operates on the real
   // order it produced - see backend prebookings.service.ts).
-  editDelivered: (id: string, input: { items: { product_id: string; quantity: number; unit_price: number; tax_pct: number }[] }) =>
+  editDelivered: (id: string, input: { items: { product_id: string; quantity: number; quantity_pieces?: number; unit_price: number; tax_pct: number }[] }) =>
     api.patch<{ booking: any; order: any; invoice?: any }>(`/prebookings/${id}/edit-delivered`, input),
   removeDelivered: (id: string) => api.delete<{ id: string; deleted: true }>(`/prebookings/${id}`),
 };
@@ -182,7 +240,7 @@ export const preBookingsApi = {
 // ---------- Notifications ----------
 export const notificationsApi = {
   list: () => api.get<any[]>('/notifications'),
-  listPaged: (params: { page?: number; pageSize?: number; dateFrom?: string; dateTo?: string }) =>
+  listPaged: (params: { page?: number; pageSize?: number; search?: string; dateFrom?: string; dateTo?: string }) =>
     api.get<{ data: any[]; page: number; pageSize: number; total: number; totalPages: number }>(`/notifications${toQueryString(params)}`),
   create: (input: { type: string; message: string; entity_type?: string; entity_id?: string }) => api.post<any>('/notifications', input),
   markRead: (id: string) => api.patch<any>(`/notifications/${id}/read`, {}),
@@ -200,8 +258,12 @@ export const settingsApi = {
   getQr: () => api.get<{ image_url: string; is_enabled: boolean }>('/settings/qr-code'),
   updateQr: (input: { image_url?: string; is_enabled?: boolean }) => api.patch<any>('/settings/qr-code', input),
   listAuditLogs: () => api.get<any[]>('/settings/audit-logs'),
-  listAuditLogsPaged: (params: { page?: number; pageSize?: number; search?: string; action?: string; entity_type?: string; dateFrom?: string; dateTo?: string }) =>
+  listAuditLogsPaged: (params: { page?: number; pageSize?: number; search?: string; action?: string; entity_type?: string; user_id?: string; dateFrom?: string; dateTo?: string }) =>
     api.get<{ data: any[]; page: number; pageSize: number; total: number; totalPages: number }>(`/settings/audit-logs${toQueryString(params)}`),
   listPermissions: () => api.get<any[]>('/settings/permissions'),
   setPermission: (input: { role: 'Admin' | 'Salesperson' | 'Warehouse'; feature: string; enabled: boolean }) => api.patch<any>('/settings/permissions', input),
+  listUserPermissions: () => api.get<any[]>('/settings/user-permissions'),
+  setUserPermissions: (userId: string, permissions: { feature: string; enabled: boolean }[]) =>
+    api.patch<any>(`/settings/user-permissions/${userId}`, { permissions }),
+  resetUserPermissions: (userId: string) => api.delete<any>(`/settings/user-permissions/${userId}`),
 };

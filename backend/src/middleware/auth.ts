@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { verifyAuthToken, AuthTokenPayload } from '../lib/jwt';
 import { ApiError } from '../utils/ApiError';
 import { prisma } from '../lib/prisma';
+import { hasExplicitScreenGrant, isAnyScreenAllowedForUser, ScreenRef } from '../lib/permissions';
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -39,5 +40,48 @@ export function requireRole(...roles: AuthTokenPayload['role'][]) {
     if (!req.auth) return next(ApiError.unauthorized());
     if (!roles.includes(req.auth.role)) return next(ApiError.forbidden('Insufficient role'));
     next();
+  };
+}
+
+// Like requireRole, but also lets through an operator who isn't one of
+// nativeRoles when they've been individually granted one of the given
+// screens via Manage Permissions. Manage Permissions writes a UserPermission
+// row (see settings.service.ts / frontend's ManagePermissionsModal.tsx) that
+// the frontend's own nav already honors (see isForeignScreenGranted() in
+// frontend/src/utils/permissions.ts) - without this, granting e.g. the "Ice
+// Cream Catalog" screen to a Warehouse operator would let them see the
+// screen and its Create/Edit/Delete controls, but every write would still
+// 403 here because requireRole never looked at the grant at all.
+export function requireRoleOrScreenGrant(nativeRoles: AuthTokenPayload['role'][], ...screens: ScreenRef[]) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    if (!req.auth) return next(ApiError.unauthorized());
+    if (nativeRoles.includes(req.auth.role)) return next();
+    try {
+      const granted = await hasExplicitScreenGrant(req.auth.sub, screens);
+      if (!granted) return next(ApiError.forbidden('Insufficient role'));
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
+// Fully override-aware version of requireRoleOrScreenGrant: native-role
+// access here is ALSO individually revocable per operator (via an explicit
+// UserPermission row), and a screen's defaultForRoles can extend "native"
+// access to another role too (see isAnyScreenAllowedForUser). Used wherever
+// that finer-grained control actually matters - e.g. the Warehouse cluster,
+// where an Admin can revoke just "Trucks" for one Warehouse operator without
+// touching the rest.
+export function requireAnyScreenAccess(...screens: ScreenRef[]) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    if (!req.auth) return next(ApiError.unauthorized());
+    try {
+      const allowed = await isAnyScreenAllowedForUser(req.auth.sub, req.auth.role, screens);
+      if (!allowed) return next(ApiError.forbidden('Insufficient permission'));
+      next();
+    } catch (err) {
+      next(err);
+    }
   };
 }

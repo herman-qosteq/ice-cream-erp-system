@@ -1,3 +1,12 @@
+// Every stock quantity in this app is tracked as a whole-box count plus a
+// companion loose-pieces count (0 <= pieces < Product.pieces_per_box) so
+// stock can be handled in partial boxes, not just whole cases. See
+// src/utils/qty.ts for the shared math (add/subtract/compare/format).
+export interface BoxPieceQty {
+  boxes: number;
+  pieces: number;
+}
+
 export interface User {
   id: string;
   name: string;
@@ -12,6 +21,16 @@ export interface User {
 // is treated as disabled.
 export interface RolePermission {
   role: 'Admin' | 'Salesperson' | 'Warehouse';
+  feature: string;
+  enabled: boolean;
+}
+
+// Per-operator override of a role-default screen/tab or named feature flag
+// (see RolePermission above). Unlike RolePermission, absence of a row means
+// "no override — inherit the role default," not "disabled." `feature` is
+// namespaced by role (e.g. "Admin:Orders") - see permissionsRegistry.ts.
+export interface UserPermission {
+  user_id: string;
   feature: string;
   enabled: boolean;
 }
@@ -31,6 +50,27 @@ export interface Category {
 }
 
 export interface Area {
+  id: string;
+  name: string;
+}
+
+// Manageable list offered on the Partner form's "Village" dropdown, same
+// pattern as Area above.
+export interface Village {
+  id: string;
+  name: string;
+}
+
+// Manageable list offered on the Partner form's "Partner Type" dropdown.
+// 'Retail Shop' is the seeded default every existing/new partner backfills
+// to and can never be deleted.
+export interface PartnerType {
+  id: string;
+  name: string;
+}
+
+// Manageable list offered on the Asset form's "Asset Type" dropdown.
+export interface AssetType {
   id: string;
   name: string;
 }
@@ -60,10 +100,18 @@ export interface Product {
   purchase_price: number;
   wholesale_price: number;
   selling_price: number;
+  // Derived from mrp * pieces_per_box (computed server-side, see
+  // serializeProduct()). Never stored - box MRP is just pieces_per_box
+  // copies of the per-piece MRP, so it can never drift from it.
+  box_mrp: number;
   tax_pct: number;
   status: 'Active' | 'Inactive';
   unit_value: number;
   unit_type: 'ml' | 'L' | 'g' | 'kg' | 'pcs';
+  // How many individual pieces make up one box/case of this product (e.g. a
+  // box of 12 cones -> 12). Used to validate every quantity_pieces companion
+  // field below (0 <= pieces < pieces_per_box) and to render "N boxes, M pcs".
+  pieces_per_box: number;
   expiry_date?: string; // for expiry alerts simulation
   scheduled_prices?: ScheduledPrice[];
 }
@@ -92,6 +140,7 @@ export interface Purchase {
   items: {
     product_id: string;
     quantity: number;
+    quantity_pieces: number;
     purchase_price: number;
     mfg_date?: string;
     expiry_date?: string;
@@ -109,21 +158,28 @@ export interface PurchaseOrderRequest {
   status: 'Pending' | 'Fulfilled' | 'Cancelled';
   created_at: string;
   fulfilled_purchase_id?: string;
-  items: { product_id: string; order_case: number }[];
+  items: { product_id: string; order_case: number; order_case_pieces: number }[];
 }
 
 export interface WarehouseInventory {
   product_id: string;
   available_qty: number;
+  available_pieces: number;
   reserved_qty: number;
+  reserved_pieces: number;
   damaged_qty: number;
+  damaged_pieces: number;
   expired_qty: number;
+  expired_pieces: number;
 }
 
 export interface Truck {
   id: string;
   vehicle_number: string;
-  driver_user_id: string;
+  // Null once the truck has been deactivated ("deleted" in the UI) -
+  // trucks.service.ts's setStatus() clears it automatically on deactivation.
+  // Still required (non-empty) to create/edit a truck.
+  driver_user_id: string | null;
   route: string;
   area: string;
   status: 'Active' | 'Inactive';
@@ -133,6 +189,7 @@ export interface TruckInventory {
   truck_id: string;
   product_id: string;
   quantity: number;
+  quantity_pieces: number;
 }
 
 export interface InventoryTransfer {
@@ -156,6 +213,10 @@ export interface Store {
   alt_phone: string;
   address: string;
   area: string;
+  // Denormalized against Village.name (not a foreign key - same pattern as
+  // `area` above). Empty/undefined for stores registered before this field
+  // existed, unlike `area` which has always been required.
+  village?: string;
   city: string;
   state: string;
   pincode: string;
@@ -167,6 +228,9 @@ export interface Store {
   last_purchase_date: string;
   next_refill_date: string;
   ranking: 'Platinum' | 'Gold' | 'Silver' | 'Bronze';
+  // Denormalized against PartnerType.name (not a foreign key - same pattern
+  // as `area` above). Existing partners default to 'Retail Shop'.
+  partner_type: string;
   status: 'Active' | 'Inactive';
 }
 
@@ -183,6 +247,7 @@ export interface StoreVisit {
 export interface OrderItem {
   product_id: string;
   quantity: number;
+  quantity_pieces: number;
   unit_price: number;
   tax_pct: number;
 }
@@ -200,6 +265,7 @@ export interface Order {
 export interface PreBookingItem {
   product_id: string;
   quantity: number;
+  quantity_pieces: number;
   unit_price: number;
   tax_pct: number;
 }
@@ -213,7 +279,7 @@ export interface PreBookingOrder {
   status: 'Booked' | 'Delivered' | 'Cancelled';
   items: PreBookingItem[];
   notes?: string;
-  dispatched_items?: { product_id: string; quantity: number }[];
+  dispatched_items?: { product_id: string; quantity: number; quantity_pieces: number }[];
   // Set once delivered - the real Order this booking produced. Lets the
   // Admin-only Edit/Delete-delivered actions know there's something to
   // operate on (older, pre-existing deliveries won't have this).
@@ -259,7 +325,80 @@ export interface CreditLedger {
 // What kind of record entity_id points at, so a notification tap knows which
 // screen to switch to and which record to open there. Absent (undefined) for
 // notification types with nothing to navigate to, e.g. 'system'.
-export type NotificationEntityType = 'order' | 'prebooking' | 'purchase' | 'store' | 'supplier' | 'product' | 'user' | 'truck';
+export type NotificationEntityType = 'order' | 'prebooking' | 'purchase' | 'store' | 'supplier' | 'product' | 'user' | 'truck' | 'asset';
+
+export type StockLocationType = 'Warehouse' | 'Truck' | 'Partner' | 'Asset';
+
+// A physical unit of cold-chain hardware (freezer box, fridge, cart, ...)
+// FrostyFlow owns and places with partners.
+export interface Asset {
+  id: string;
+  name: string;
+  code: string;
+  // Denormalized against AssetType.name (not a foreign key - same pattern as
+  // Store.partner_type/area).
+  asset_type: string;
+  serial_number?: string;
+  capacity?: string;
+  status: 'Warehouse' | 'Assigned' | 'Maintenance' | 'Returned' | 'Lost' | 'Inactive';
+  location_type: StockLocationType;
+  location_id?: string | null;
+  assigned_partner_id?: string | null;
+  assigned_date?: string;
+  last_service_date?: string;
+  notes?: string;
+  created_at: string;
+}
+
+export interface AssetAssignmentHistory {
+  id: string;
+  asset_id: string;
+  event_type: 'Assigned' | 'Returned' | 'MaintenanceStart' | 'MaintenanceEnd' | 'MarkedLost' | 'Reactivated' | 'Deactivated';
+  partner_id?: string | null;
+  from_status?: string | null;
+  to_status: string;
+  date: string;
+  actor_name?: string;
+  actor_role?: string;
+  notes?: string;
+}
+
+// Live stock snapshot of what's currently placed with a partner outside of a
+// formal priced Order (e.g. consignment stock) - mirrors TruckInventory.
+export interface PartnerInventory {
+  partner_id: string;
+  product_id: string;
+  quantity: number;
+  quantity_pieces: number;
+}
+
+// Live stock snapshot for an asset that opts into its own stock tracking
+// (e.g. a Freezer Box) - mirrors TruckInventory.
+export interface AssetInventory {
+  asset_id: string;
+  product_id: string;
+  quantity: number;
+  quantity_pieces: number;
+}
+
+// One row in the generalized inventory-movement ledger (Warehouse/Truck/
+// Partner/Asset, every direction).
+export interface InventoryMovement {
+  id: string;
+  from_location_type: StockLocationType;
+  from_location_id?: string | null;
+  from_location_label?: string;
+  to_location_type: StockLocationType;
+  to_location_id?: string | null;
+  to_location_label?: string;
+  product_id: string;
+  quantity: number;
+  quantity_pieces: number;
+  reason?: string;
+  actor_name?: string;
+  actor_role?: string;
+  created_at: string;
+}
 
 export interface AppNotification {
   id: string;

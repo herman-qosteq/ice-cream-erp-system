@@ -5,8 +5,9 @@
 // tier can't write cell styles (bold, borders) at all.
 import { Platform } from 'react-native';
 import * as XLSX from 'xlsx-js-style';
-import { File, Paths } from 'expo-file-system';
-import * as Sharing from 'expo-sharing';
+// expo-file-system/expo-sharing are required lazily inside exportExcelWorkbook,
+// after its Windows/macOS guard - a static top-level import here would crash
+// the whole bundle on Windows (see imagePicker.ts).
 import { BRAND_NAME, BRAND_SUPPORT_PHONE } from './pdfTemplate';
 
 export interface PurchaseOrderItem {
@@ -14,6 +15,7 @@ export interface PurchaseOrderItem {
   code: string;
   description: string;
   orderCase: number;
+  orderCasePieces?: number;
 }
 
 const THIN_BORDER = { style: 'thin' as const, color: { rgb: '000000' } };
@@ -61,7 +63,8 @@ export function buildPurchaseOrderWorkbook(items: PurchaseOrderItem[], orderRef:
     setCell(ws, row, 0, item.category);
     setCell(ws, row, 1, item.code);
     setCell(ws, row, 2, item.description);
-    setCell(ws, row, 3, item.orderCase, { alignment: { horizontal: 'center' } });
+    const orderCaseValue = item.orderCasePieces ? `${item.orderCase} box, ${item.orderCasePieces} pcs` : item.orderCase;
+    setCell(ws, row, 3, orderCaseValue, { alignment: { horizontal: 'center' } });
   });
 
   const lastRow = headerRow + items.length;
@@ -92,12 +95,22 @@ export async function exportExcelWorkbook(workbook: XLSX.WorkBook, fileName: str
   try {
     const base64 = XLSX.write(workbook, { type: 'base64', bookType: 'xlsx' }) as string;
 
-    if (Platform.OS === 'windows' || Platform.OS === 'macos') {
+    if (Platform.OS === 'windows') {
+      const { saveFileOnWindows } = require('./windowsFileSave') as typeof import('./windowsFileSave');
+      const path = await saveFileOnWindows(base64, fileName);
+      showAlert(`Excel file saved to ${path}`);
+      return;
+    }
+
+    if (Platform.OS === 'macos') {
       // Same platform gap as PDF export (reportExport.ts) - expo-file-system's
-      // sharing story isn't officially supported on these targets yet.
+      // sharing story isn't officially supported on this target yet.
       showAlert('Excel export is currently available on mobile and web only. Support for this platform is planned.');
       return;
     }
+
+    const { File, Paths } = require('expo-file-system') as typeof import('expo-file-system');
+    const Sharing = require('expo-sharing') as typeof import('expo-sharing');
 
     if (Platform.OS === 'web') {
       const byteChars = atob(base64);

@@ -61,6 +61,27 @@ async function main() {
     await prisma.area.upsert({ where: { id: a.id }, update: { name: a.name }, create: a });
   }
 
+  // ---- Partner Types ----
+  // Offered on the Store form's "Partner Type" dropdown. 'Retail Shop' is the
+  // default new/existing stores backfill to (Store.partner_type's DB
+  // default) and can never be deleted (see partnerTypes.service.ts).
+  const partnerTypes = [
+    'Retail Shop', 'Auto Shop', 'Freezer Box Partner', 'Distributor', 'Super Market', 'Restaurant', 'Others',
+  ].map((name, i) => ({ id: `ptype${i + 1}`, name }));
+  for (const pt of partnerTypes) {
+    await prisma.partnerType.upsert({ where: { id: pt.id }, update: { name: pt.name }, create: pt });
+  }
+
+  // ---- Asset Types ----
+  // Offered on the Asset form's "Asset Type" dropdown.
+  const assetTypes = ['Freezer Box', 'Refrigerator', 'Deep Freezer', 'Ice Cream Cart'].map((name, i) => ({
+    id: `atype${i + 1}`,
+    name,
+  }));
+  for (const at of assetTypes) {
+    await prisma.assetType.upsert({ where: { id: at.id }, update: { name: at.name }, create: at });
+  }
+
   // ---- Users ----
   const users = [
     { id: 'u1', name: 'Aditya Sharma (Admin)', phone: '+91 7373674757', role: 'Admin' as const, password_hash: hash('admin'), status: 'Active' as const },
@@ -79,14 +100,14 @@ async function main() {
   const products = [
     // Percentage-based pricing: mrp is the base list price, and
     // purchase/wholesale/retail prices are each mrp discounted by their %.
-    { id: 'p1', name: 'Classic Vanilla Cup (100ml)', code: 'IC-VAN-100', category: 'Cups', brand: 'FrostyFlow Creamery', description: 'Smooth, rich vanilla bean ice cream cup.', image_url: 'https://images.unsplash.com/photo-1570145820259-b5b80c5c8bd6?w=200&auto=format&fit=crop', mrp: 28.00, purchase_discount_pct: 50.00, wholesale_discount_pct: 28.57, retail_discount_pct: 0, tax_pct: 18, unit_value: 100, unit_type: 'ml' as const },
-    { id: 'p2', name: 'Kesar Pista Cup (100ml)', code: 'IC-KSR-100', category: 'Cups', brand: 'FrostyFlow Creamery', description: 'Saffron and pistachio ice cream cup, a classic Indian favourite.', image_url: 'https://images.unsplash.com/photo-1497034825429-c343d7c6a68f?w=200&auto=format&fit=crop', mrp: 35.00, purchase_discount_pct: 48.57, wholesale_discount_pct: 25.71, retail_discount_pct: 0, tax_pct: 18, unit_value: 100, unit_type: 'ml' as const },
-    { id: 'p3', name: 'Chocolate Crunch Stick', code: 'IC-CHO-STK', category: 'Sticks', brand: 'FrostyFlow Creamery', description: 'Chocolate ice cream stick coated in a crunchy chocolate shell.', image_url: 'https://images.unsplash.com/photo-1501443762994-82bd5dace89a?w=200&auto=format&fit=crop', mrp: 20.00, purchase_discount_pct: 50.00, wholesale_discount_pct: 25.00, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const },
-    { id: 'p4', name: 'Mango Kulfi Stick', code: 'IC-KUL-STK', category: 'Sticks', brand: 'Rajwada Kulfi', description: 'Traditional mawa-mango kulfi on a stick.', image_url: 'https://images.unsplash.com/photo-1580915411954-282cb1bc3978?w=200&auto=format&fit=crop', mrp: 25.00, purchase_discount_pct: 52.00, wholesale_discount_pct: 28.00, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const },
-    { id: 'p5', name: 'Butterscotch Tub (1L)', code: 'IC-BUT-TUB', category: 'Tubs', brand: 'Creamy Royale', description: 'Buttery caramel ice cream loaded with praline crunch, family tub.', image_url: 'https://images.unsplash.com/photo-1563805042-7684c019e1cb?w=200&auto=format&fit=crop', mrp: 199.00, purchase_discount_pct: 44.72, wholesale_discount_pct: 24.62, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'L' as const },
-    { id: 'p6', name: 'Belgian Chocolate Tub (1L)', code: 'IC-CHO-TUB', category: 'Tubs', brand: 'Creamy Royale', description: 'Premium dark Belgian chocolate tub for family sharing.', image_url: 'https://images.unsplash.com/photo-1580915411954-282cb1bc3978?w=200&auto=format&fit=crop', mrp: 230.00, purchase_discount_pct: 43.48, wholesale_discount_pct: 23.91, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'L' as const },
-    { id: 'p7', name: 'Alphonso Mango Bar', code: 'IC-MNG-BAR', category: 'Bars', brand: 'Ratnagiri Fresh', description: '100% real Ratnagiri Alphonso mango pulp bar.', image_url: 'https://images.unsplash.com/photo-1505394033343-40a290cf7a0c?w=200&auto=format&fit=crop', mrp: 30.00, purchase_discount_pct: 50.00, wholesale_discount_pct: 26.67, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const },
-    { id: 'p8', name: 'Rose Falooda Popsicle', code: 'IC-ROS-POP', category: 'Popsicles', brand: 'Fruity Splash', description: 'Rose and falooda flavoured frozen popsicle.', image_url: 'https://images.unsplash.com/photo-1501443762994-82bd5dace89a?w=200&auto=format&fit=crop', mrp: 18.00, purchase_discount_pct: 55.56, wholesale_discount_pct: 33.33, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const },
+    { id: 'p1', name: 'Classic Vanilla Cup (100ml)', code: 'IC-VAN-100', category: 'Cups', brand: 'FrostyFlow Creamery', description: 'Smooth, rich vanilla bean ice cream cup.', image_url: 'https://images.unsplash.com/photo-1570145820259-b5b80c5c8bd6?w=200&auto=format&fit=crop', mrp: 28.00, purchase_discount_pct: 50.00, wholesale_discount_pct: 28.57, retail_discount_pct: 0, tax_pct: 18, unit_value: 100, unit_type: 'ml' as const, pieces_per_box: 24 },
+    { id: 'p2', name: 'Kesar Pista Cup (100ml)', code: 'IC-KSR-100', category: 'Cups', brand: 'FrostyFlow Creamery', description: 'Saffron and pistachio ice cream cup, a classic Indian favourite.', image_url: 'https://images.unsplash.com/photo-1497034825429-c343d7c6a68f?w=200&auto=format&fit=crop', mrp: 35.00, purchase_discount_pct: 48.57, wholesale_discount_pct: 25.71, retail_discount_pct: 0, tax_pct: 18, unit_value: 100, unit_type: 'ml' as const, pieces_per_box: 24 },
+    { id: 'p3', name: 'Chocolate Crunch Stick', code: 'IC-CHO-STK', category: 'Sticks', brand: 'FrostyFlow Creamery', description: 'Chocolate ice cream stick coated in a crunchy chocolate shell.', image_url: 'https://images.unsplash.com/photo-1501443762994-82bd5dace89a?w=200&auto=format&fit=crop', mrp: 20.00, purchase_discount_pct: 50.00, wholesale_discount_pct: 25.00, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const, pieces_per_box: 24 },
+    { id: 'p4', name: 'Mango Kulfi Stick', code: 'IC-KUL-STK', category: 'Sticks', brand: 'Rajwada Kulfi', description: 'Traditional mawa-mango kulfi on a stick.', image_url: 'https://images.unsplash.com/photo-1580915411954-282cb1bc3978?w=200&auto=format&fit=crop', mrp: 25.00, purchase_discount_pct: 52.00, wholesale_discount_pct: 28.00, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const, pieces_per_box: 20 },
+    { id: 'p5', name: 'Butterscotch Tub (1L)', code: 'IC-BUT-TUB', category: 'Tubs', brand: 'Creamy Royale', description: 'Buttery caramel ice cream loaded with praline crunch, family tub.', image_url: 'https://images.unsplash.com/photo-1563805042-7684c019e1cb?w=200&auto=format&fit=crop', mrp: 199.00, purchase_discount_pct: 44.72, wholesale_discount_pct: 24.62, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'L' as const, pieces_per_box: 6 },
+    { id: 'p6', name: 'Belgian Chocolate Tub (1L)', code: 'IC-CHO-TUB', category: 'Tubs', brand: 'Creamy Royale', description: 'Premium dark Belgian chocolate tub for family sharing.', image_url: 'https://images.unsplash.com/photo-1580915411954-282cb1bc3978?w=200&auto=format&fit=crop', mrp: 230.00, purchase_discount_pct: 43.48, wholesale_discount_pct: 23.91, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'L' as const, pieces_per_box: 6 },
+    { id: 'p7', name: 'Alphonso Mango Bar', code: 'IC-MNG-BAR', category: 'Bars', brand: 'Ratnagiri Fresh', description: '100% real Ratnagiri Alphonso mango pulp bar.', image_url: 'https://images.unsplash.com/photo-1505394033343-40a290cf7a0c?w=200&auto=format&fit=crop', mrp: 30.00, purchase_discount_pct: 50.00, wholesale_discount_pct: 26.67, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const, pieces_per_box: 24 },
+    { id: 'p8', name: 'Rose Falooda Popsicle', code: 'IC-ROS-POP', category: 'Popsicles', brand: 'Fruity Splash', description: 'Rose and falooda flavoured frozen popsicle.', image_url: 'https://images.unsplash.com/photo-1501443762994-82bd5dace89a?w=200&auto=format&fit=crop', mrp: 18.00, purchase_discount_pct: 55.56, wholesale_discount_pct: 33.33, retail_discount_pct: 0, tax_pct: 18, unit_value: 1, unit_type: 'pcs' as const, pieces_per_box: 30 },
   ];
   const categoryIdByName = Object.fromEntries(categories.map(c => [c.name, c.id]));
   for (const p of products) {

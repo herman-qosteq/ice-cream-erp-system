@@ -10,6 +10,9 @@ const permissionSchema = z.object({
   feature: z.string().min(1),
   enabled: z.boolean(),
 });
+const userPermissionsSchema = z.object({
+  permissions: z.array(z.object({ feature: z.string().min(1), enabled: z.boolean() })),
+});
 
 export async function getQr(req: Request, res: Response) {
   res.json(await settingsService.getQrCodeSettings());
@@ -39,4 +42,18 @@ export async function updatePermission(req: Request, res: Response) {
   const parsed = permissionSchema.safeParse(req.body);
   if (!parsed.success) throw ApiError.badRequest(parsed.error.errors[0]?.message ?? 'Invalid request');
   res.json(await settingsService.setRolePermission(parsed.data));
+}
+
+export async function listUserPermissions(req: Request, res: Response) {
+  res.json(await settingsService.listUserPermissions());
+}
+
+export async function updateUserPermissions(req: Request, res: Response) {
+  const parsed = userPermissionsSchema.safeParse(req.body);
+  if (!parsed.success) throw ApiError.badRequest(parsed.error.errors[0]?.message ?? 'Invalid request');
+  res.json(await settingsService.setUserPermissionsBulk(req.params.id, parsed.data.permissions, req.auth!.sub));
+}
+
+export async function resetUserPermissions(req: Request, res: Response) {
+  res.json(await settingsService.clearUserPermissions(req.params.id, req.auth!.sub));
 }

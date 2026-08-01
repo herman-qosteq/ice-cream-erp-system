@@ -3,13 +3,16 @@ import { z } from 'zod';
 import * as purchaseOrderRequestsService from './purchaseOrderRequests.service';
 import { ApiError } from '../../utils/ApiError';
 
+const requestItemSchema = z.object({
+  product_id: z.string().min(1),
+  order_case: z.number().int().min(0),
+  order_case_pieces: z.number().int().min(0).default(0),
+}).refine(i => i.order_case > 0 || i.order_case_pieces > 0, { message: 'Quantity must be greater than zero' });
+
 const createSchema = z.object({
   order_ref: z.string().min(1),
   supplier_id: z.string().min(1),
-  items: z.array(z.object({
-    product_id: z.string().min(1),
-    order_case: z.number().positive(),
-  })).min(1, 'Please select at least one product.'),
+  items: z.array(requestItemSchema).min(1, 'Please select at least one product.'),
 });
 
 export async function list(req: Request, res: Response) {
@@ -24,10 +27,7 @@ export async function create(req: Request, res: Response) {
 
 const updateSchema = z.object({
   supplier_id: z.string().min(1),
-  items: z.array(z.object({
-    product_id: z.string().min(1),
-    order_case: z.number().positive(),
-  })).min(1, 'Please select at least one product.'),
+  items: z.array(requestItemSchema).min(1, 'Please select at least one product.'),
 });
 
 export async function update(req: Request, res: Response) {

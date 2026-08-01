@@ -1,6 +1,8 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { parsePageParams, parseDateRangeParams, containsInsensitive, buildPagedResult } from '../../utils/pagination';
+import { logAudit } from '../../lib/audit';
+import { ApiError } from '../../utils/ApiError';
 
 export async function getQrCodeSettings() {
   const settings = await prisma.qrCodeSettings.findUnique({ where: { id: 1 } });
@@ -25,6 +27,7 @@ function buildAuditLogWhere(query: Record<string, unknown>): Prisma.AuditLogWher
   if (from || to) where.timestamp = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
   if (typeof query.action === 'string' && query.action) where.action = query.action;
   if (typeof query.entity_type === 'string' && query.entity_type) where.entity_type = query.entity_type;
+  if (typeof query.user_id === 'string' && query.user_id) where.user_id = query.user_id;
 
   const search = typeof query.search === 'string' ? query.search.trim() : '';
   if (search) {
@@ -64,4 +67,63 @@ export async function setRolePermission(input: { role: 'Admin' | 'Salesperson' |
     update: { enabled: input.enabled },
     create: input,
   });
+}
+
+// Per-operator overrides (see UserPermission in schema.prisma). Read by
+// every authenticated role - an operator needs their own overrides to
+// filter their own nav, the same reasoning listRolePermissions already
+// follows for role-level features.
+export async function listUserPermissions() {
+  return prisma.userPermission.findMany();
+}
+
+// A lone Admin disabling their own access to Operator Management would have
+// no UI path back (enforcement here is UI-only, so the button itself would
+// vanish) - block it the same way toggleUserStatus blocks self-deactivation.
+const SELF_LOCKOUT_KEY = 'Admin:Users';
+
+export async function setUserPermissionsBulk(
+  userId: string,
+  permissions: { feature: string; enabled: boolean }[],
+  actorId: string
+) {
+  const target = await prisma.user.findUnique({ where: { id: userId } });
+  if (!target) throw ApiError.notFound('User not found');
+
+  if (userId === actorId && permissions.some(p => p.feature === SELF_LOCKOUT_KEY && !p.enabled)) {
+    throw ApiError.badRequest('You cannot remove your own access to Operator Management!');
+  }
+
+  const rows = await prisma.$transaction(
+    permissions.map(p =>
+      prisma.userPermission.upsert({
+        where: { user_id_feature: { user_id: userId, feature: p.feature } },
+        update: { enabled: p.enabled },
+        create: { user_id: userId, feature: p.feature, enabled: p.enabled },
+      })
+    )
+  );
+  await logAudit({
+    action: 'USER_PERMISSIONS_UPDATE',
+    entity_type: 'User',
+    entity_id: userId,
+    user_id: actorId,
+    details: `Updated ${permissions.length} permission override(s) for operator: ${target.name}`,
+  });
+  return rows;
+}
+
+export async function clearUserPermissions(userId: string, actorId: string) {
+  const target = await prisma.user.findUnique({ where: { id: userId } });
+  if (!target) throw ApiError.notFound('User not found');
+
+  const result = await prisma.userPermission.deleteMany({ where: { user_id: userId } });
+  await logAudit({
+    action: 'USER_PERMISSIONS_RESET',
+    entity_type: 'User',
+    entity_id: userId,
+    user_id: actorId,
+    details: `Reset permission overrides to role default for operator: ${target.name}`,
+  });
+  return result;
 }

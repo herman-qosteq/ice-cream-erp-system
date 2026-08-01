@@ -77,8 +77,10 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   appWindow.Resize({1000, 1000});
 
   // Get the ReactViewOptions so we can set the initial RN component to load
+  // Must match the name Expo's registerRootComponent() uses (see index.ts),
+  // which is always "main", not the RNW project's own name.
   auto viewOptions{reactNativeWin32App.ReactViewOptions()};
-  viewOptions.ComponentName(L"IceCreamErp");
+  viewOptions.ComponentName(L"main");
 
   // Start the app
   reactNativeWin32App.Start();

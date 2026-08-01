@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback } from 'react';
-import { View, Text, Pressable } from 'react-native';
+import { View, Text, Pressable, Modal } from 'react-native';
 import { CheckCircle, XCircle, AlertTriangle, Info, X, Wifi } from 'lucide-react-native';
 
 type AlertType = 'success' | 'error' | 'warning' | 'info' | 'offline';
@@ -125,10 +125,22 @@ export function AppAlertProvider({ children }: { children: React.ReactNode }) {
     <AppAlertContext.Provider value={{ showAlert }}>
       {children}
 
+      {/* Mounted only while visible - react-native-web's <Modal> appends a
+          fresh DOM node to the very end of <body> the moment it mounts, and
+          leaves it there at that same position for as long as it stays
+          mounted (toggling `visible` only hides it with CSS, it does not
+          re-append it). This provider sits near the app root, so if this
+          Modal were always mounted, its node would forever sit *before* any
+          screen-specific Modal (e.g. Purchase Order) that mounts later when
+          the user opens it - and everything after it in <body> paints on
+          top, alert included. Mounting fresh each time an alert fires means
+          its node always lands at the very end of <body>, after whatever
+          else is currently open, so it always paints on top. */}
       {alert.visible && (
+      <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
         <Pressable
           onPress={dismiss}
-          className="absolute inset-0 z-[9999] items-center justify-center p-4"
+          className="flex-1 items-center justify-center p-4"
           style={{ backgroundColor: 'rgba(15,23,42,0.55)' }}
         >
           <Pressable
@@ -167,6 +179,7 @@ export function AppAlertProvider({ children }: { children: React.ReactNode }) {
             </View>
           </Pressable>
         </Pressable>
+      </Modal>
       )}
     </AppAlertContext.Provider>
   );

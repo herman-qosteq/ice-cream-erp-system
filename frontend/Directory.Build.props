@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <!--
+    Works around a react-native-windows + Windows App SDK 1.8.x issue: WinAppSDK
+    >=1.7 added new split packages (AI, ML, Widgets) that autolinked native
+    module projects (e.g. @react-native-async-storage/async-storage's Windows
+    project) don't declare, which trips WinAppSDK's own transitive-dependency
+    verification and fails the build with MSB4181 even though nothing is
+    actually broken. This is the escape hatch the WinAppSDK build target
+    itself recommends in the error text.
+    See: node_modules/react-native-windows/PropertySheets/WinUI.props (WinUI3Version)
+  -->
+  <PropertyGroup>
+    <WindowsAppSDKVerifyTransitiveDependencies>false</WindowsAppSDKVerifyTransitiveDependencies>
+  </PropertyGroup>
+</Project>

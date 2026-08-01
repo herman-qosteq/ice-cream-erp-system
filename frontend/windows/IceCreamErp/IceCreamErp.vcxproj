@@ -19,6 +19,17 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="ReactNativeWindowsProps">
     <ReactNativeWindowsDir Condition="'$(ReactNativeWindowsDir)' == ''">$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), 'node_modules\react-native-windows\package.json'))\node_modules\react-native-windows\</ReactNativeWindowsDir>
+    <!-- This app's entry point is index.ts (see package.json "main"), not
+         Bundle.props's default of index.js, which doesn't exist here and
+         made the Metro bundling step fail silently (ContinueOnError=true)
+         before Hermes tried to compile a bundle that was never produced.
+         Explicitly index.windows.ts (not index.ts, and not extension-less,
+         since the bundler CLI's entry-file flag doesn't apply Metro's
+         platform-extension resolution the way a require() call or the dev
+         server's HTTP endpoint does) because the Windows entry point must bypass
+         Expo's registerRootComponent, which crashes on Windows (see
+         index.windows.ts). -->
+    <BundleEntryFile>index.windows.ts</BundleEntryFile>
   </PropertyGroup>
   <Import Project="$(ReactNativeWindowsDir)\PropertySheets\External\Microsoft.ReactNative.WindowsSdk.Default.props" />
   <ItemGroup Label="ProjectConfigurations">
@@ -50,7 +61,7 @@
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <CharacterSet>Unicode</CharacterSet>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
     <UseDebugLibraries>true</UseDebugLibraries>
@@ -105,10 +116,12 @@
     <ClInclude Include="AutolinkedNativeModules.g.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="targetver.h" />
+    <ClInclude Include="FileSaveModule.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="IceCreamErp.cpp" />
     <ClCompile Include="AutolinkedNativeModules.g.cpp" />
+    <ClCompile Include="FileSaveModule.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>

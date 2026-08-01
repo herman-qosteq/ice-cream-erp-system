@@ -10,6 +10,7 @@ const storeSchema = z.object({
   alt_phone: z.string().optional(),
   address: z.string().default(''),
   area: z.string().default(''),
+  village: z.string().optional(),
   city: z.string().default(''),
   state: z.string().default(''),
   pincode: z.string().default(''),
@@ -18,6 +19,7 @@ const storeSchema = z.object({
   refill_frequency: z.enum(['Weekly', '15 Days', 'Monthly', 'Custom']),
   custom_days: z.number().positive().optional(),
   ranking: z.enum(['Platinum', 'Gold', 'Silver', 'Bronze']),
+  partner_type: z.string().min(1).default('Retail Shop'),
 });
 
 const statusSchema = z.object({ status: z.enum(['Active', 'Inactive']) });

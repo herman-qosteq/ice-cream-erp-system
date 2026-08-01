@@ -5,8 +5,16 @@ import { num, dateOnly } from '../../utils/serialize';
 import { ApiError } from '../../utils/ApiError';
 import { computeInvoiceTotals } from '../../utils/billing';
 import { parsePageParams, parseDateRangeParams, containsInsensitive, buildPagedResult } from '../../utils/pagination';
+import { BoxPieceQty, addQty, subtractQty, compareQty, toTotalPieces, fromTotalPieces, formatQty, readQtyField } from '../../utils/pieceQty';
 
-const TODAY = new Date('2026-06-27');
+// Must be computed fresh at the point of use, not once at module load - a
+// module-level `new Date()` would still freeze at server-start time and
+// silently drift stale exactly like the literal date this replaced, just
+// less obviously (it broke "Today"-filtered views like the Refill tab and
+// the Supplier Purchase Report the moment the real clock moved past it).
+function today(): Date {
+  return new Date();
+}
 
 function refillDaysFor(refill_frequency: string, custom_days?: number | null): number {
   if (refill_frequency === 'Weekly') return 7;
@@ -14,6 +22,13 @@ function refillDaysFor(refill_frequency: string, custom_days?: number | null): n
   if (refill_frequency === 'Monthly') return 30;
   if (refill_frequency === 'Custom') return custom_days || 7;
   return 7;
+}
+
+// Single place every function in this file uses to look up each involved
+// product's pieces_per_box, needed to carry box/pieces math correctly.
+async function piecesPerBoxMap<T extends { product: { findMany: (args: any) => Promise<{ id: string; pieces_per_box: number }[]> } }>(client: T, productIds: string[]): Promise<Map<string, number>> {
+  const products = await client.product.findMany({ where: { id: { in: productIds } } });
+  return new Map(products.map(p => [p.id, p.pieces_per_box]));
 }
 
 function serializeOrder(o: any) {
@@ -24,7 +39,7 @@ function serializeOrder(o: any) {
     truck_id: o.truck_id ?? '',
     status: o.status,
     created_at: o.created_at,
-    items: o.items.map((i: any) => ({ product_id: i.product_id, quantity: i.quantity, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) })),
+    items: o.items.map((i: any) => ({ product_id: i.product_id, quantity: i.quantity, quantity_pieces: i.quantity_pieces, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) })),
   };
 }
 
@@ -88,6 +103,22 @@ function buildOrdersWhere(query: Record<string, unknown>): Prisma.OrderWhereInpu
     });
   }
 
+  // Billing page filters (requirement: Partner Type / Salesperson / Truck /
+  // Area) - partner_type/area are never denormalized onto Order itself, so
+  // they're always read via the existing store_id join, exactly like the
+  // store name/owner_name search above.
+  const partnerType = typeof query.partnerType === 'string' && query.partnerType !== 'All' ? query.partnerType : '';
+  if (partnerType) and.push({ store: { partner_type: partnerType } });
+
+  const salespersonId = typeof query.salespersonId === 'string' ? query.salespersonId : '';
+  if (salespersonId) and.push({ salesperson_id: salespersonId });
+
+  const truckId = typeof query.truckId === 'string' ? query.truckId : '';
+  if (truckId) and.push({ truck_id: truckId });
+
+  const area = typeof query.area === 'string' && query.area !== 'All' ? query.area : '';
+  if (area) and.push({ store: { area } });
+
   return and.length ? { AND: and } : {};
 }
 
@@ -110,28 +141,38 @@ export async function listOrdersPaged(query: Record<string, unknown>) {
 interface OrderItemInput {
   product_id: string;
   quantity: number;
+  quantity_pieces?: number;
   unit_price: number;
   tax_pct: number;
+}
+
+function itemQty(item: OrderItemInput): BoxPieceQty {
+  return { boxes: item.quantity, pieces: item.quantity_pieces ?? 0 };
 }
 
 // Mirrors handleFinalizeOrderOnly(): an instant truck-stock sale. Deducts the
 // truck's cargo, generates the invoice, and adds the full grand_total to the
 // store's outstanding balance (settled down later via settleOrder()).
 export async function createOrder(input: { store_id: string; salesperson_id: string; truck_id?: string | null; items: OrderItemInput[] }, actorId: string) {
-  const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(input.items);
-
   const store = await prisma.store.findUnique({ where: { id: input.store_id } });
   if (!store) throw ApiError.notFound('Store not found');
+
+  const ppbMap = await piecesPerBoxMap(prisma, input.items.map(i => i.product_id));
+  const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(
+    input.items.map(i => ({ quantity: i.quantity, quantity_pieces: i.quantity_pieces, pieces_per_box: ppbMap.get(i.product_id) ?? 1, unit_price: i.unit_price, tax_pct: i.tax_pct }))
+  );
 
   const result = await prisma.$transaction(async tx => {
     if (input.truck_id) {
       // Salesperson/Driver flow: sell straight out of the truck's loaded cargo.
       const truckId = input.truck_id;
       for (const item of input.items) {
+        const ppb = ppbMap.get(item.product_id) ?? 1;
         const truckInv = await tx.truckInventory.findUnique({ where: { truck_id_product_id: { truck_id: truckId, product_id: item.product_id } } });
-        const remaining = (truckInv?.quantity ?? 0) - item.quantity;
-        if (remaining > 0) {
-          await tx.truckInventory.update({ where: { truck_id_product_id: { truck_id: truckId, product_id: item.product_id } }, data: { quantity: remaining } });
+        const current = truckInv ? readQtyField(truckInv, 'quantity', 'quantity_pieces') : { boxes: 0, pieces: 0 };
+        const remaining = subtractQty(current, itemQty(item), ppb);
+        if (remaining.boxes > 0 || remaining.pieces > 0) {
+          await tx.truckInventory.update({ where: { truck_id_product_id: { truck_id: truckId, product_id: item.product_id } }, data: { quantity: remaining.boxes, quantity_pieces: remaining.pieces } });
         } else if (truckInv) {
           await tx.truckInventory.delete({ where: { truck_id_product_id: { truck_id: truckId, product_id: item.product_id } } });
         }
@@ -139,12 +180,15 @@ export async function createOrder(input: { store_id: string; salesperson_id: str
     } else {
       // Admin flow: sell directly out of warehouse stock, no truck involved.
       for (const item of input.items) {
+        const ppb = ppbMap.get(item.product_id) ?? 1;
         const wh = await tx.warehouseInventory.findUnique({ where: { product_id: item.product_id } });
-        if (!wh || wh.available_qty < item.quantity) {
+        const current = wh ? readQtyField(wh, 'available_qty', 'available_pieces') : { boxes: 0, pieces: 0 };
+        if (compareQty(current, itemQty(item), ppb) < 0) {
           const product = await tx.product.findUnique({ where: { id: item.product_id } });
-          throw ApiError.conflict(`Insufficient warehouse stock for ${product?.name ?? item.product_id}. Only ${wh?.available_qty ?? 0} units available, but ${item.quantity} requested.`);
+          throw ApiError.conflict(`Insufficient warehouse stock for ${product?.name ?? item.product_id}. Only ${formatQty(current)} available, but ${formatQty(itemQty(item))} requested.`);
         }
-        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: { decrement: item.quantity } } });
+        const next = subtractQty(current, itemQty(item), ppb);
+        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: next.boxes, available_pieces: next.pieces } });
       }
     }
 
@@ -154,7 +198,7 @@ export async function createOrder(input: { store_id: string; salesperson_id: str
         salesperson_id: input.salesperson_id,
         truck_id: input.truck_id || null,
         status: 'Delivered',
-        items: { create: input.items.map((item, idx) => ({ ...item, position: idx })) },
+        items: { create: input.items.map((item, idx) => ({ product_id: item.product_id, quantity: item.quantity, quantity_pieces: item.quantity_pieces ?? 0, unit_price: item.unit_price, tax_pct: item.tax_pct, position: idx })) },
       },
       include: { items: { orderBy: { position: 'asc' } } },
     });
@@ -171,19 +215,20 @@ export async function createOrder(input: { store_id: string; salesperson_id: str
     });
 
     const refillDays = refillDaysFor(store.refill_frequency, store.custom_days);
+    const now = today();
     await tx.store.update({
       where: { id: input.store_id },
       data: {
         outstanding_balance: { increment: grandTotal },
-        last_purchase_date: TODAY,
-        next_refill_date: new Date(TODAY.getTime() + refillDays * 86400000),
+        last_purchase_date: now,
+        next_refill_date: new Date(now.getTime() + refillDays * 86400000),
       },
     });
 
     return { order, invoice };
   });
 
-  await logAudit({ action: 'ORDER_CREATE', entity_type: 'Order', entity_id: result.order.id, user_id: actorId, details: `Created & delivered order ID ${result.order.id} for ${store.name}. Total: Rs${grandTotal.toFixed(2)}` });
+  await logAudit({ action: 'ORDER_CREATE', entity_type: 'Order', entity_id: result.order.id, user_id: actorId, details: `Created & delivered order ID ${result.order.id} for ${store.name}. Total: Rs. ${grandTotal.toFixed(2)}` });
 
   return { order: serializeOrder(result.order), invoice: serializeInvoice(result.invoice) };
 }
@@ -229,31 +274,41 @@ export async function settleOrder(orderId: string, input: { method: string; amou
   });
 
   if (result.payment) {
-    await logAudit({ action: 'PAYMENT_RECEIVE', entity_type: 'Store', entity_id: order.store_id, user_id: actorId, details: `Collected payment of Rs${actualCollection.toFixed(2)} via ${input.method}` });
+    await logAudit({ action: 'PAYMENT_RECEIVE', entity_type: 'Store', entity_id: order.store_id, user_id: actorId, details: `Collected payment of Rs. ${actualCollection.toFixed(2)} via ${input.method}` });
   }
 
   return { invoice: serializeInvoice(result.invoice), actualCollection, paymentStatus };
 }
 
 // Mirrors handleConfirmDraftOrder(): moves a Draft order's items from
-// available -> reserved warehouse stock, guarding on sufficient available_qty.
+// available -> reserved warehouse stock, guarding on sufficient available stock.
 export async function confirmDraftOrder(orderId: string, actorId: string) {
   const order = await prisma.order.findUnique({ where: { id: orderId }, include: { items: { orderBy: { position: 'asc' } } } });
   if (!order) throw ApiError.notFound('Order not found');
 
+  const ppbMap = await piecesPerBoxMap(prisma, order.items.map(i => i.product_id));
+
   for (const item of order.items) {
+    const ppb = ppbMap.get(item.product_id) ?? 1;
     const inv = await prisma.warehouseInventory.findUnique({ where: { product_id: item.product_id } });
-    const product = await prisma.product.findUnique({ where: { id: item.product_id } });
-    if (!inv || inv.available_qty < item.quantity) {
-      throw ApiError.conflict(`Cannot confirm order: Insufficient available stock for ${product?.name ?? item.product_id}. Only ${inv?.available_qty ?? 0} units available, but ${item.quantity} are requested.`);
+    const current = inv ? readQtyField(inv, 'available_qty', 'available_pieces') : { boxes: 0, pieces: 0 };
+    const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+    if (compareQty(current, need, ppb) < 0) {
+      const product = await prisma.product.findUnique({ where: { id: item.product_id } });
+      throw ApiError.conflict(`Cannot confirm order: Insufficient available stock for ${product?.name ?? item.product_id}. Only ${formatQty(current)} available, but ${formatQty(need)} are requested.`);
     }
   }
 
   const updated = await prisma.$transaction(async tx => {
     for (const item of order.items) {
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+      const inv = await tx.warehouseInventory.findUniqueOrThrow({ where: { product_id: item.product_id } });
+      const nextAvail = subtractQty(readQtyField(inv, 'available_qty', 'available_pieces'), need, ppb);
+      const nextReserved = addQty(readQtyField(inv, 'reserved_qty', 'reserved_pieces'), need, ppb);
       await tx.warehouseInventory.update({
         where: { product_id: item.product_id },
-        data: { available_qty: { decrement: item.quantity }, reserved_qty: { increment: item.quantity } },
+        data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces },
       });
     }
     return tx.order.update({ where: { id: orderId }, data: { status: 'Confirmed' }, include: { items: { orderBy: { position: 'asc' } } } });
@@ -272,13 +327,15 @@ export async function deliverConfirmedOrder(orderId: string, actorId: string) {
   const store = await prisma.store.findUnique({ where: { id: order.store_id } });
   if (!store) throw ApiError.notFound('Store not found');
 
+  const ppbMap = await piecesPerBoxMap(prisma, order.items.map(i => i.product_id));
+
   const result = await prisma.$transaction(async tx => {
     for (const item of order.items) {
-      await tx.warehouseInventory.upsert({
-        where: { product_id: item.product_id },
-        update: { reserved_qty: { decrement: item.quantity } },
-        create: { product_id: item.product_id },
-      });
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+      const inv = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
+      const nextReserved = subtractQty(readQtyField(inv, 'reserved_qty', 'reserved_pieces'), need, ppb);
+      await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
     }
 
     const updatedOrder = await tx.order.update({ where: { id: orderId }, data: { status: 'Delivered' }, include: { items: { orderBy: { position: 'asc' } } } });
@@ -286,7 +343,7 @@ export async function deliverConfirmedOrder(orderId: string, actorId: string) {
     let invoice = await tx.invoice.findUnique({ where: { order_id: orderId } });
     let createdInvoice = false;
     if (!invoice) {
-      const itemsForTotals = order.items.map(i => ({ quantity: i.quantity, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) }));
+      const itemsForTotals = order.items.map(i => ({ quantity: i.quantity, quantity_pieces: i.quantity_pieces, pieces_per_box: ppbMap.get(i.product_id) ?? 1, unit_price: num(i.unit_price), tax_pct: num(i.tax_pct) }));
       const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(itemsForTotals);
       invoice = await tx.invoice.create({
         data: {
@@ -333,52 +390,73 @@ export async function editOrder(orderId: string, input: { items: OrderItemInput[
   const store = await prisma.store.findUnique({ where: { id: order.store_id } });
   if (!store) throw ApiError.notFound('Store not found');
 
-  // Net per-product warehouse delta across the old -> new item lists (positive
-  // = this edit needs MORE of that product than the order already holds,
-  // negative = it returns some). Netting old and new here means a product
-  // appearing on both sides never triggers a false "insufficient stock" dip.
-  const deltas = new Map<string, number>();
-  for (const item of order.items) deltas.set(item.product_id, (deltas.get(item.product_id) ?? 0) - item.quantity);
-  for (const item of input.items) deltas.set(item.product_id, (deltas.get(item.product_id) ?? 0) + item.quantity);
+  const productIds = new Set<string>();
+  for (const item of order.items) productIds.add(item.product_id);
+  for (const item of input.items) productIds.add(item.product_id);
+  const ppbMap = await piecesPerBoxMap(prisma, [...productIds]);
 
-  for (const [productId, delta] of deltas) {
+  // Net per-product warehouse delta (in total pieces) across the old -> new
+  // item lists (positive = this edit needs MORE of that product than the
+  // order already holds, negative = it returns some). Netting old and new
+  // here means a product appearing on both sides never triggers a false
+  // "insufficient stock" dip.
+  const deltaPieces = new Map<string, number>();
+  for (const item of order.items) {
+    const ppb = ppbMap.get(item.product_id) ?? 1;
+    deltaPieces.set(item.product_id, (deltaPieces.get(item.product_id) ?? 0) - toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, ppb));
+  }
+  for (const item of input.items) {
+    const ppb = ppbMap.get(item.product_id) ?? 1;
+    deltaPieces.set(item.product_id, (deltaPieces.get(item.product_id) ?? 0) + toTotalPieces(itemQty(item), ppb));
+  }
+
+  for (const [productId, delta] of deltaPieces) {
     if (delta <= 0) continue;
+    const ppb = ppbMap.get(productId) ?? 1;
     const wh = await prisma.warehouseInventory.findUnique({ where: { product_id: productId } });
-    if (!wh || wh.available_qty < delta) {
+    const availableTotal = wh ? toTotalPieces(readQtyField(wh, 'available_qty', 'available_pieces'), ppb) : 0;
+    if (availableTotal < delta) {
       const product = await prisma.product.findUnique({ where: { id: productId } });
-      throw ApiError.conflict(`Cannot apply this edit: insufficient warehouse stock for ${product?.name ?? productId}. Only ${wh?.available_qty ?? 0} additional unit(s) available, but ${delta} more are needed.`);
+      throw ApiError.conflict(`Cannot apply this edit: insufficient warehouse stock for ${product?.name ?? productId}. Only ${formatQty(fromTotalPieces(availableTotal, ppb))} additional available, but ${formatQty(fromTotalPieces(delta, ppb))} more are needed.`);
     }
   }
 
-  const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(input.items);
+  const ppbForTotals = input.items.map(i => ppbMap.get(i.product_id) ?? 1);
+  const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(
+    input.items.map((i, idx) => ({ quantity: i.quantity, quantity_pieces: i.quantity_pieces, pieces_per_box: ppbForTotals[idx], unit_price: i.unit_price, tax_pct: i.tax_pct }))
+  );
 
   const result = await prisma.$transaction(async tx => {
-    for (const [productId, delta] of deltas) {
+    for (const [productId, delta] of deltaPieces) {
       if (delta === 0) continue;
+      const ppb = ppbMap.get(productId) ?? 1;
+      const wh = await tx.warehouseInventory.upsert({ where: { product_id: productId }, update: {}, create: { product_id: productId } });
+
       if (order.status === 'Confirmed') {
         // Still just reserved (not yet delivered) - grow/shrink the
         // reservation, moving the difference to/from available stock.
-        await tx.warehouseInventory.upsert({
+        const nextAvailTotal = toTotalPieces(readQtyField(wh, 'available_qty', 'available_pieces'), ppb) - delta;
+        const nextReservedTotal = toTotalPieces(readQtyField(wh, 'reserved_qty', 'reserved_pieces'), ppb) + delta;
+        const nextAvail = fromTotalPieces(nextAvailTotal, ppb);
+        const nextReserved = fromTotalPieces(nextReservedTotal, ppb);
+        await tx.warehouseInventory.update({
           where: { product_id: productId },
-          update: { available_qty: { decrement: delta }, reserved_qty: { increment: delta } },
-          create: { product_id: productId, reserved_qty: Math.max(0, delta), available_qty: Math.max(0, -delta) },
+          data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces },
         });
       } else {
         // Delivered - stock already left tracking entirely; a positive delta
         // consumes more from available, a negative delta (reduced quantity)
         // returns it.
-        await tx.warehouseInventory.upsert({
-          where: { product_id: productId },
-          update: { available_qty: { decrement: delta } },
-          create: { product_id: productId, available_qty: Math.max(0, -delta) },
-        });
+        const nextAvailTotal = toTotalPieces(readQtyField(wh, 'available_qty', 'available_pieces'), ppb) - delta;
+        const nextAvail = fromTotalPieces(nextAvailTotal, ppb);
+        await tx.warehouseInventory.update({ where: { product_id: productId }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces } });
       }
     }
 
     await tx.orderItem.deleteMany({ where: { order_id: orderId } });
     const updatedOrder = await tx.order.update({
       where: { id: orderId },
-      data: { items: { create: input.items.map((item, idx) => ({ ...item, position: idx })) } },
+      data: { items: { create: input.items.map((item, idx) => ({ product_id: item.product_id, quantity: item.quantity, quantity_pieces: item.quantity_pieces ?? 0, unit_price: item.unit_price, tax_pct: item.tax_pct, position: idx })) } },
       include: { items: { orderBy: { position: 'asc' } } },
     });
 
@@ -442,7 +520,7 @@ export async function editOrder(orderId: string, input: { items: OrderItemInput[
 
   await logAudit({
     action: 'ORDER_EDIT', entity_type: 'Order', entity_id: orderId, user_id: actorId,
-    details: `Edited ${order.status.toLowerCase()} order ${orderId} for ${store.name}. Items and totals were recalculated${result.invoice ? ` (new invoice total: Rs${grandTotal.toFixed(2)})` : ''}, and warehouse stock was adjusted to match.`,
+    details: `Edited ${order.status.toLowerCase()} order ${orderId} for ${store.name}. Items and totals were recalculated${result.invoice ? ` (new invoice total: Rs. ${grandTotal.toFixed(2)})` : ''}, and warehouse stock was adjusted to match.`,
   });
 
   return { order: serializeOrder(result.order), invoice: result.invoice ? serializeInvoice(result.invoice) : undefined };
@@ -466,21 +544,20 @@ export async function deleteOrder(orderId: string, actorId: string) {
   if (!store) throw ApiError.notFound('Store not found');
 
   const invoice = await prisma.invoice.findUnique({ where: { order_id: orderId } });
+  const ppbMap = await piecesPerBoxMap(prisma, order.items.map(i => i.product_id));
 
   await prisma.$transaction(async tx => {
     for (const item of order.items) {
+      const ppb = ppbMap.get(item.product_id) ?? 1;
+      const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+      const wh = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
       if (order.status === 'Confirmed') {
-        await tx.warehouseInventory.upsert({
-          where: { product_id: item.product_id },
-          update: { available_qty: { increment: item.quantity }, reserved_qty: { decrement: item.quantity } },
-          create: { product_id: item.product_id, available_qty: item.quantity },
-        });
+        const nextAvail = addQty(readQtyField(wh, 'available_qty', 'available_pieces'), need, ppb);
+        const nextReserved = subtractQty(readQtyField(wh, 'reserved_qty', 'reserved_pieces'), need, ppb);
+        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
       } else {
-        await tx.warehouseInventory.upsert({
-          where: { product_id: item.product_id },
-          update: { available_qty: { increment: item.quantity } },
-          create: { product_id: item.product_id, available_qty: item.quantity },
-        });
+        const nextAvail = addQty(readQtyField(wh, 'available_qty', 'available_pieces'), need, ppb);
+        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces } });
       }
     }
 
@@ -518,14 +595,17 @@ export async function cancelOrder(orderId: string, actorId: string) {
   const order = await prisma.order.findUnique({ where: { id: orderId }, include: { items: { orderBy: { position: 'asc' } } } });
   if (!order) throw ApiError.notFound('Order not found');
 
+  const ppbMap = await piecesPerBoxMap(prisma, order.items.map(i => i.product_id));
+
   await prisma.$transaction(async tx => {
     if (order.status === 'Confirmed') {
       for (const item of order.items) {
-        await tx.warehouseInventory.upsert({
-          where: { product_id: item.product_id },
-          update: { available_qty: { increment: item.quantity }, reserved_qty: { decrement: item.quantity } },
-          create: { product_id: item.product_id, available_qty: item.quantity },
-        });
+        const ppb = ppbMap.get(item.product_id) ?? 1;
+        const need = { boxes: item.quantity, pieces: item.quantity_pieces };
+        const wh = await tx.warehouseInventory.upsert({ where: { product_id: item.product_id }, update: {}, create: { product_id: item.product_id } });
+        const nextAvail = addQty(readQtyField(wh, 'available_qty', 'available_pieces'), need, ppb);
+        const nextReserved = subtractQty(readQtyField(wh, 'reserved_qty', 'reserved_pieces'), need, ppb);
+        await tx.warehouseInventory.update({ where: { product_id: item.product_id }, data: { available_qty: nextAvail.boxes, available_pieces: nextAvail.pieces, reserved_qty: nextReserved.boxes, reserved_pieces: nextReserved.pieces } });
       }
     }
     await tx.order.update({ where: { id: orderId }, data: { status: 'Cancelled' } });

@@ -14,3 +14,8 @@ settingsRouter.get('/audit-logs', requireAuth, asyncHandler(settingsController.l
 // which features Admin has switched on for its own role.
 settingsRouter.get('/permissions', requireAuth, asyncHandler(settingsController.listPermissions));
 settingsRouter.patch('/permissions', requireAuth, requireRole('Admin'), asyncHandler(settingsController.updatePermission));
+// Read-only for any authenticated role — an operator needs their own
+// overrides to filter their own nav, same reasoning as /permissions above.
+settingsRouter.get('/user-permissions', requireAuth, asyncHandler(settingsController.listUserPermissions));
+settingsRouter.patch('/user-permissions/:id', requireAuth, requireRole('Admin'), asyncHandler(settingsController.updateUserPermissions));
+settingsRouter.delete('/user-permissions/:id', requireAuth, requireRole('Admin'), asyncHandler(settingsController.resetUserPermissions));

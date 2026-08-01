@@ -33,6 +33,7 @@ interface StoreInput {
   alt_phone?: string;
   address: string;
   area: string;
+  village?: string;
   city: string;
   state: string;
   pincode: string;
@@ -41,11 +42,18 @@ interface StoreInput {
   refill_frequency: string;
   custom_days?: number;
   ranking: 'Platinum' | 'Gold' | 'Silver' | 'Bronze';
+  partner_type: string;
 }
 
-// created_at anchor mirrors the frontend's hardcoded demo "today" (2026-06-27)
-// used throughout the rest of the app for relative date calculations.
-const TODAY = new Date('2026-06-27');
+// Must be computed fresh at the point of use, not once at module load - a
+// module-level `new Date()` would still freeze at server-start time and
+// silently drift stale exactly like the literal date this replaced (this
+// used to be `new Date('2026-06-27')`, a frozen demo anchor that made every
+// store's next_refill_date/last_purchase_date drift further wrong every day
+// past that literal date).
+function today(): Date {
+  return new Date();
+}
 
 // No DB-level unique constraint on Store - phone (every outlet's primary
 // contact number) and GST number (a real legal identifier when present) are
@@ -64,10 +72,19 @@ async function assertNoDuplicateStore(input: StoreInput, excludeId?: string) {
   }
 }
 
+// Validated against PartnerType.name rather than a DB foreign key (same
+// denormalized-string reasoning as Store.area/PartnerType itself) so an
+// invalid/typo'd type can't silently attach to a partner.
+async function assertValidPartnerType(partner_type: string) {
+  const exists = await prisma.partnerType.findFirst({ where: { name: { equals: partner_type } } });
+  if (!exists) throw ApiError.badRequest(`"${partner_type}" is not a recognized partner type.`);
+}
+
 export async function createStore(input: StoreInput, actorId: string) {
   await assertNoDuplicateStore(input);
+  await assertValidPartnerType(input.partner_type);
   const refillDays = refillDaysFor(input.refill_frequency, input.custom_days);
-  const nextRefillDate = new Date(TODAY.getTime() + refillDays * 86400000);
+  const nextRefillDate = new Date(today().getTime() + refillDays * 86400000);
 
   const store = await prisma.store.create({
     data: { ...input, outstanding_balance: 0, last_purchase_date: null, next_refill_date: nextRefillDate, status: 'Active' },
@@ -81,9 +98,10 @@ export async function updateStore(id: string, input: StoreInput, actorId: string
   if (!existing) throw ApiError.notFound('Store not found');
 
   await assertNoDuplicateStore(input, id);
+  await assertValidPartnerType(input.partner_type);
 
   const refillDays = refillDaysFor(input.refill_frequency, input.custom_days);
-  const baseDate = existing.last_purchase_date ?? TODAY;
+  const baseDate = existing.last_purchase_date ?? today();
   const nextRefillDate = new Date(baseDate.getTime() + refillDays * 86400000);
 
   const store = await prisma.store.update({ where: { id }, data: { ...input, next_refill_date: nextRefillDate } });
@@ -96,7 +114,7 @@ export async function setStatus(id: string, status: 'Active' | 'Inactive', actor
   if (!store) throw ApiError.notFound('Store not found');
 
   if (status === 'Inactive' && num(store.outstanding_balance) > 0) {
-    throw ApiError.conflict(`Cannot remove ${store.name}: it still has Rs${num(store.outstanding_balance).toFixed(2)} outstanding balance owed. Collect or write off the balance first so it isn't lost from your credit reports.`);
+    throw ApiError.conflict(`Cannot remove ${store.name}: it still has Rs. ${num(store.outstanding_balance).toFixed(2)} outstanding balance owed. Collect or write off the balance first so it isn't lost from your credit reports.`);
   }
 
   const updated = await prisma.store.update({ where: { id }, data: { status } });

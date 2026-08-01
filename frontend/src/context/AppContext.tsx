@@ -5,6 +5,7 @@ import { AppNotification, NotificationEntityType, User } from '../types';
 import { authApi, notificationsApi } from '../api/endpoints';
 import { getToken, setToken, setOnSessionInvalid } from '../api/client';
 import { connectRealtime, disconnectRealtime } from '../realtime';
+import { canSeeNotificationHub } from '../utils/permissions';
 
 interface PushAlert {
   id: string;
@@ -50,6 +51,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [pushAlert, setPushAlert] = useState<PushAlert | null>(null);
   const [initializing, setInitializing] = useState(true);
   const [dataLoading, setDataLoading] = useState(false);
+
+  // Mirrors currentUser/data for handleRemoteNotification below, which is
+  // handed to the socket ONCE per session (see connectRealtime/realtime.ts -
+  // it calls socket.on(...) a single time, it doesn't rebind on every
+  // render) - a useCallback dependency on currentUser/data would still leave
+  // that already-bound listener holding whatever stale closure existed at
+  // connect time. Refs sidestep that: always read the latest value at
+  // notification-arrival time regardless of when the callback was captured.
+  const currentUserRef = useRef<User | null>(null);
+  const dataRef = useRef<ERPData>(data);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+  useEffect(() => { dataRef.current = data; }, [data]);
 
   const refreshData = useCallback(async () => {
     const fresh = await loadAllData();
@@ -100,19 +113,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Another connected tab/device/user just created a notification (new order,
-  // stock update, etc.) — show the same instant toast + badge bump locally
-  // that the originating session already saw.
+  // stock update, etc.). The backend broadcasts every notification to every
+  // connected socket with no per-role targeting, so this fires for Admin,
+  // Warehouse and Salesperson sessions alike regardless of relevance - only
+  // pop the toast for an operator who can actually act on it (native Admin,
+  // or anyone individually granted the 'Notifications' screen), matching who
+  // the System Alert Hub itself is visible to. Everyone else has no
+  // notification list to open from this anyway, so surfacing someone else's
+  // stock/order/system alert as a toast is just noise (e.g. a Salesperson
+  // seeing an admin-only low-stock alert). Their OWN actions still toast
+  // normally via addNotification() below, which is unaffected by this gate.
   const handleRemoteNotification = useCallback((raw: unknown) => {
     const notification = raw as AppNotification;
     setDataState(prev => {
       if (prev.notifications.some(n => n.id === notification.id)) return prev;
       return { ...prev, notifications: [notification, ...prev.notifications] };
     });
-    setPushAlert({ id: notification.id, type: notification.type.toUpperCase().replace(/_/g, ' '), message: notification.message });
-    setTimeout(() => {
-      setPushAlert(prev => (prev?.id === notification.id ? null : prev));
-    }, 4000);
     notifyResourceChanged('notifications');
+
+    const user = currentUserRef.current;
+    const { rolePermissions, userPermissions } = dataRef.current;
+    if (user && canSeeNotificationHub(user, rolePermissions, userPermissions)) {
+      setPushAlert({ id: notification.id, type: notification.type.toUpperCase().replace(/_/g, ' '), message: notification.message });
+      setTimeout(() => {
+        setPushAlert(prev => (prev?.id === notification.id ? null : prev));
+      }, 4000);
+    }
   }, [notifyResourceChanged]);
 
   const onDataChanged = useCallback((resource: string) => {

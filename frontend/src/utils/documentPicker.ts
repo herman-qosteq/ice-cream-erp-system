@@ -1,7 +1,7 @@
 import { Platform } from 'react-native';
-import * as DocumentPicker from 'expo-document-picker';
-import { File, Paths } from 'expo-file-system';
-import * as Sharing from 'expo-sharing';
+// expo-document-picker/expo-file-system/expo-sharing are required lazily inside
+// each function below, after its Windows/macOS guard - a static top-level
+// import here would crash the whole bundle on Windows (see imagePicker.ts).
 
 export interface PickedFile {
   dataUri: string;
@@ -27,6 +27,9 @@ export async function pickBillFileAsDataUri(showAlert: (opts: any) => void): Pro
     showAlert('Attaching a bill file is currently available on mobile and web only. Support for this platform is planned.');
     return null;
   }
+
+  const DocumentPicker = require('expo-document-picker') as typeof import('expo-document-picker');
+  const { File } = require('expo-file-system') as typeof import('expo-file-system');
 
   try {
     const result = await DocumentPicker.getDocumentAsync({
@@ -66,10 +69,20 @@ export async function viewOrDownloadDataUriFile(dataUri: string, fileName: strin
   try {
     const base64 = dataUri.slice(dataUri.indexOf('base64,') + 'base64,'.length);
 
-    if (Platform.OS === 'windows' || Platform.OS === 'macos') {
+    if (Platform.OS === 'windows') {
+      const { saveFileOnWindows } = require('./windowsFileSave') as typeof import('./windowsFileSave');
+      const path = await saveFileOnWindows(base64, fileName);
+      showAlert(`File saved to ${path}`);
+      return;
+    }
+
+    if (Platform.OS === 'macos') {
       showAlert('Viewing this file is currently available on mobile and web only. Support for this platform is planned.');
       return;
     }
+
+    const { File, Paths } = require('expo-file-system') as typeof import('expo-file-system');
+    const Sharing = require('expo-sharing') as typeof import('expo-sharing');
 
     if (Platform.OS === 'web') {
       // Assigning the raw data: URI straight to <a href> hits a real Chromium

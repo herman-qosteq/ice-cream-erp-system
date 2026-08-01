@@ -75,6 +75,36 @@ enum CreditType {
   debit
 }
 
+enum AssetStatus {
+  Warehouse
+  Assigned
+  Maintenance
+  Returned
+  Lost
+  Inactive
+}
+
+// Shared by Asset.location_type and InventoryMovement's from/to fields. Asset
+// rows are never expected to legally hold location_type=Asset themselves -
+// enforced in application code (assets.service.ts), not the type system,
+// mirroring how Order.truck_id is optional but validated at the service layer.
+enum StockLocationType {
+  Warehouse
+  Truck
+  Partner
+  Asset
+}
+
+enum AssetEventType {
+  Assigned
+  Returned
+  MaintenanceStart
+  MaintenanceEnd
+  MarkedLost
+  Reactivated
+  Deactivated
+}
+
 enum NotificationType {
   low_stock
   out_of_stock
@@ -112,6 +142,7 @@ model User {
   pre_booking_orders PreBookingOrder[]
   payments_collected Payment[]
   store_visits       StoreVisit[]
+  user_permissions   UserPermission[]
 
   @@map("users")
 }
@@ -119,8 +150,13 @@ model User {
 model Truck {
   id             String   @id @default(uuid())
   vehicle_number String   @unique
-  driver_user_id String
-  driver         User     @relation(fields: [driver_user_id], references: [id])
+  // Nullable so deactivating a truck (trucks.service.ts setStatus 'Inactive'
+  // - the UI's "delete" action, a soft delete) can clear the assignment
+  // instead of leaving a decommissioned truck still pointing at a driver.
+  // Create/update still require a driver via zod (trucks.controller.ts) -
+  // this only ever goes null through the deactivate path.
+  driver_user_id String?
+  driver         User?    @relation(fields: [driver_user_id], references: [id])
   route          String
   area           String
   status         Status   @default(Active)
@@ -164,6 +200,11 @@ model Product {
   status                 Status    @default(Active)
   unit_value             Decimal   @db.Decimal(10, 2)
   unit_type              UnitType
+  /// How many individual pieces make up one box/case of this product (e.g.
+  /// a box of 12 cones -> 12). Used to validate the `_pieces` companion
+  /// field on every quantity column below (0 <= pieces < pieces_per_box)
+  /// and to render "N boxes, M pcs" throughout the app.
+  pieces_per_box         Int       @default(1)
   expiry_date            DateTime? @db.Date
   created_at             DateTime  @default(now())
   updated_at             DateTime  @updatedAt
@@ -177,6 +218,9 @@ model Product {
   pre_booking_items            PreBookingItem[]
   pre_booking_dispatched_items PreBookingDispatchedItem[]
   store_pricing_overrides      StorePricing[]
+  partner_inventory_entries    PartnerInventory[]
+  asset_inventory_entries      AssetInventory[]
+  inventory_movements          InventoryMovement[]
 
   @@map("products")
 }
@@ -208,7 +252,7 @@ model Supplier {
   created_at     DateTime @default(now())
   updated_at     DateTime @updatedAt
 
-  purchases              Purchase[]
+  purchases               Purchase[]
   purchase_order_requests PurchaseOrderRequest[]
 
   @@map("suppliers")
@@ -230,7 +274,7 @@ model Purchase {
   bill_file_name String?
   bill_file_type String?
 
-  items            PurchaseItem[]
+  items             PurchaseItem[]
   fulfilled_request PurchaseOrderRequest?
 
   @@index([date])
@@ -245,6 +289,10 @@ model PurchaseItem {
   product_id     String
   product        Product   @relation(fields: [product_id], references: [id])
   quantity       Int
+  /// Loose pieces received in addition to `quantity` whole boxes (0 <=
+  /// quantity_pieces < Product.pieces_per_box). See WarehouseInventory for
+  /// the box/pieces convention shared across every quantity field.
+  quantity_pieces Int      @default(0)
   purchase_price Decimal   @db.Decimal(10, 2)
   mfg_date       DateTime? @db.Date
   expiry_date    DateTime? @db.Date
@@ -287,6 +335,8 @@ model PurchaseOrderRequestItem {
   product_id String
   product    Product              @relation(fields: [product_id], references: [id])
   order_case Int
+  /// Loose pieces requested in addition to `order_case` whole boxes.
+  order_case_pieces Int           @default(0)
 
   @@map("purchase_order_request_items")
 }
@@ -295,24 +345,33 @@ model PurchaseOrderRequestItem {
 // Inventory (warehouse & trucks)
 // ---------------------------------------------------------------------------
 
+/// Every stock quantity in this schema is stored as a whole-box count plus a
+/// companion `_pieces` loose-piece count (0 <= pieces < Product.pieces_per_box,
+/// normalized/carried by backend/src/utils/pieceQty.ts on every write) so
+/// stock can be tracked and moved in partial boxes, not just whole cases.
 model WarehouseInventory {
-  product_id    String   @id
-  product       Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
-  available_qty Int      @default(0)
-  reserved_qty  Int      @default(0)
-  damaged_qty   Int      @default(0)
-  expired_qty   Int      @default(0)
-  updated_at    DateTime @updatedAt
+  product_id       String   @id
+  product          Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  available_qty    Int      @default(0)
+  available_pieces Int      @default(0)
+  reserved_qty     Int      @default(0)
+  reserved_pieces  Int      @default(0)
+  damaged_qty      Int      @default(0)
+  damaged_pieces   Int      @default(0)
+  expired_qty      Int      @default(0)
+  expired_pieces   Int      @default(0)
+  updated_at       DateTime @updatedAt
 
   @@map("warehouse_inventory")
 }
 
 model TruckInventory {
-  truck_id   String
-  truck      Truck   @relation(fields: [truck_id], references: [id], onDelete: Cascade)
-  product_id String
-  product    Product @relation(fields: [product_id], references: [id])
-  quantity   Int     @default(0)
+  truck_id        String
+  truck           Truck   @relation(fields: [truck_id], references: [id], onDelete: Cascade)
+  product_id      String
+  product         Product @relation(fields: [product_id], references: [id])
+  quantity        Int     @default(0)
+  quantity_pieces Int     @default(0)
 
   @@id([truck_id, product_id])
   @@map("truck_inventory")
@@ -334,6 +393,16 @@ model Area {
   @@map("areas")
 }
 
+// Manageable list offered on the Partner form's "Village" dropdown, same
+// pattern as Area above (Store.village is a denormalized string matched by
+// name, not a foreign key - see Store.village's own comment).
+model Village {
+  id   String @id @default(uuid())
+  name String @unique
+
+  @@map("villages")
+}
+
 model Store {
   id                  String    @id @default(uuid())
   name                String
@@ -342,6 +411,12 @@ model Store {
   alt_phone           String?
   address             String    @db.Text
   area                String
+  // Denormalized against Village.name, NOT a foreign key - same reasoning as
+  // `area` above (renaming/removing a village should never need to cascade
+  // through Store rows via FK). Nullable/optional since it's a new field -
+  // existing stores simply have no village until edited, unlike `area`
+  // which has always been required.
+  village             String?
   city                String
   state               String
   pincode             String
@@ -354,6 +429,11 @@ model Store {
   last_purchase_date  DateTime? @db.Date
   next_refill_date    DateTime? @db.Date
   ranking             Ranking   @default(Bronze)
+  /// Denormalized string matched against PartnerType.name, NOT a foreign key -
+  /// same reasoning as `area` above (renaming/removing a PartnerType should
+  /// never need to touch Store rows via FK cascade). Existing stores backfill
+  /// to 'Retail Shop' automatically via this default.
+  partner_type        String    @default("Retail Shop")
   status              Status    @default(Active)
   created_at          DateTime  @default(now())
   updated_at          DateTime  @updatedAt
@@ -364,6 +444,9 @@ model Store {
   credit_ledger      CreditLedger[]
   visits             StoreVisit[]
   pricing_overrides  StorePricing[]
+  assets             Asset[]
+  partner_inventory  PartnerInventory[]
+  asset_history      AssetAssignmentHistory[]
 
   @@map("stores")
 }
@@ -441,6 +524,7 @@ model OrderItem {
   product_id String
   product    Product @relation(fields: [product_id], references: [id])
   quantity   Int
+  quantity_pieces Int @default(0)
   unit_price Decimal @db.Decimal(10, 2)
   tax_pct    Decimal @db.Decimal(5, 2)
   /// Preserves the order items were added/edited in (bills must show this,
@@ -513,6 +597,7 @@ model PreBookingItem {
   product_id     String
   product        Product         @relation(fields: [product_id], references: [id])
   quantity       Int
+  quantity_pieces Int            @default(0)
   unit_price     Decimal         @db.Decimal(10, 2)
   tax_pct        Decimal         @db.Decimal(5, 2)
   /// Preserves the order items were added/edited in (bills must show this,
@@ -533,6 +618,7 @@ model PreBookingDispatchedItem {
   product_id     String
   product        Product         @relation(fields: [product_id], references: [id])
   quantity       Int
+  quantity_pieces Int            @default(0)
 
   @@map("pre_booking_dispatched_items")
 }
@@ -568,6 +654,154 @@ model CreditLedger {
   reference String
 
   @@map("credit_ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Partner types & asset (freezer box / fridge / cart) management
+// ---------------------------------------------------------------------------
+
+// Manageable list of partner-type labels offered on the Store form's
+// "Partner Type" dropdown - same pattern as Area (see Store.partner_type
+// comment above). 'Retail Shop' is the seeded default and cannot be deleted.
+model PartnerType {
+  id   String @id @default(uuid())
+  name String @unique
+
+  @@map("partner_types")
+}
+
+// Manageable list of asset-type labels (Freezer Box, Refrigerator, Deep
+// Freezer, Ice Cream Cart, ...) - same pattern as PartnerType/Area.
+model AssetType {
+  id   String @id @default(uuid())
+  name String @unique
+
+  @@map("asset_types")
+}
+
+// A physical unit of cold-chain hardware (freezer box, fridge, cart, ...)
+// FrostyFlow owns and places with partners. asset_type is a denormalized
+// string matched against AssetType.name, NOT a foreign key (same reasoning
+// as Store.partner_type/area).
+model Asset {
+  id                  String            @id @default(uuid())
+  name                String
+  code                String            @unique
+  asset_type          String
+  serial_number       String?
+  capacity            String?
+  status              AssetStatus       @default(Warehouse)
+  /// Where the physical unit currently sits. location_id is a soft reference
+  /// (like AuditLog.entity_id) - it alternately points at Truck.id or
+  /// Store.id depending on location_type, so it can't be a single hard FK;
+  /// resolved by app-layer lookup in assets.service.ts. Null when Warehouse.
+  location_type       StockLocationType @default(Warehouse)
+  location_id         String?
+  /// Kept in sync ONLY by assignAsset()/returnAsset() in assets.service.ts -
+  /// mirrors location_id when location_type=Partner, modeled as a real FK
+  /// (unlike location_id) so partner-facing reports/joins don't need a
+  /// manual resolve step. Cleared to null whenever the asset leaves a partner.
+  assigned_partner_id String?
+  assigned_partner    Store?            @relation(fields: [assigned_partner_id], references: [id])
+  assigned_date       DateTime?         @db.Date
+  last_service_date   DateTime?         @db.Date
+  notes               String?           @db.Text
+  created_at          DateTime          @default(now())
+  updated_at          DateTime          @updatedAt
+
+  history   AssetAssignmentHistory[]
+  inventory AssetInventory[]
+
+  @@index([status])
+  @@index([asset_type])
+  @@index([assigned_partner_id])
+  @@map("assets")
+}
+
+/// Structured, queryable ledger for the Asset Assignment History Report -
+/// not reconstructed from free-text AuditLog details. Every write here is
+/// paired with a logAudit() call so the existing Movement Logs screen also
+/// shows these actions (see assets.service.ts).
+model AssetAssignmentHistory {
+  id          String         @id @default(uuid())
+  asset_id    String
+  asset       Asset          @relation(fields: [asset_id], references: [id], onDelete: Cascade)
+  event_type  AssetEventType
+  partner_id  String?
+  partner     Store?         @relation(fields: [partner_id], references: [id])
+  from_status AssetStatus?
+  to_status   AssetStatus
+  date        DateTime       @default(now())
+  /// actor_id is an intentional soft reference (same reasoning as
+  /// AuditLog.user_id) - actor_name/actor_role are snapshotted at write time
+  /// so this row still displays correctly if the user is later removed.
+  actor_id    String
+  actor_name  String?
+  actor_role  String?
+  notes       String?        @db.Text
+
+  @@index([asset_id, date])
+  @@map("asset_assignment_history")
+}
+
+/// Live stock snapshot of what's currently placed with a partner outside of
+/// a formal priced Order (e.g. consignment stock) - mirrors TruckInventory.
+model PartnerInventory {
+  partner_id String
+  partner    Store    @relation(fields: [partner_id], references: [id], onDelete: Cascade)
+  product_id String
+  product    Product  @relation(fields: [product_id], references: [id])
+  quantity   Int      @default(0)
+  quantity_pieces Int @default(0)
+  updated_at DateTime @updatedAt
+
+  @@id([partner_id, product_id])
+  @@map("partner_inventory")
+}
+
+/// Live stock snapshot for an asset that opts into its own stock tracking
+/// (e.g. a Freezer Box) - mirrors TruckInventory.
+model AssetInventory {
+  asset_id   String
+  asset      Asset    @relation(fields: [asset_id], references: [id], onDelete: Cascade)
+  product_id String
+  product    Product  @relation(fields: [product_id], references: [id])
+  quantity   Int      @default(0)
+  quantity_pieces Int @default(0)
+  updated_at DateTime @updatedAt
+
+  @@id([asset_id, product_id])
+  @@map("asset_inventory")
+}
+
+/// Generalized inventory-movement ledger covering every from/to pair across
+/// Warehouse, Truck, Partner and Asset locations. Complements, does NOT
+/// replace, AuditLog - every movement here also gets a logAudit() row so the
+/// Movement Logs screen's entity_type dropdown stays the one place operators
+/// look for a human-readable trail; this table is the structured, queryable
+/// source for movement-specific reports. from/to_location_id are soft
+/// references (Truck.id / Store.id / Asset.id depending on the paired
+/// location_type) - null when the corresponding side is Warehouse.
+model InventoryMovement {
+  id                 String            @id @default(uuid())
+  from_location_type StockLocationType
+  from_location_id   String?
+  to_location_type   StockLocationType
+  to_location_id     String?
+  product_id         String
+  product            Product           @relation(fields: [product_id], references: [id])
+  quantity           Int
+  quantity_pieces    Int               @default(0)
+  reason             String?           @db.Text
+  actor_id           String
+  actor_name         String?
+  actor_role         String?
+  created_at         DateTime          @default(now())
+
+  @@index([created_at])
+  @@index([from_location_type, from_location_id])
+  @@index([to_location_type, to_location_id])
+  @@map("inventory_movements")
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +873,26 @@ model RolePermission {
 
   @@unique([role, feature])
   @@map("role_permissions")
+}
+
+/// Per-operator override of a role-default screen/tab or named feature flag
+/// (see RolePermission above). Unlike RolePermission, ABSENCE of a row here
+/// means "no override — inherit the role default," not "disabled" — presence
+/// of a row means this specific operator has an explicit override, and
+/// `enabled` is that override's value. `feature` is namespaced by role (e.g.
+/// "Admin:Orders") so that if an operator's role is later changed, old
+/// override rows are harmlessly orphaned instead of silently misapplying
+/// under the new role's screen set.
+model UserPermission {
+  id         String   @id @default(uuid())
+  user_id    String
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  feature    String
+  enabled    Boolean  @default(false)
+  updated_at DateTime @updatedAt
+
+  @@unique([user_id, feature])
+  @@map("user_permissions")
 }
 
 /// Server-side mirror of the client's offline write queue, kept only if the

@@ -1,6 +1,7 @@
 import { Order, Invoice, Store, Product, PreBookingOrder } from '../types';
 import { renderPdfDocument, renderInfoTable, renderSummaryLine, buildPdfFileName, stableRecordRef } from './pdfTemplate';
 import { computeInvoiceTotals } from './billing';
+import { formatQty, toTotalPieces, formatUnitRate } from './qty';
 
 /**
  * The Order Invoice — the original template every other PDF in the app now
@@ -10,11 +11,23 @@ import { computeInvoiceTotals } from './billing';
 export function buildOrderInvoicePdf(order: Order, invoice: Invoice, store: Store, products: Product[]): { html: string; fileName: string } {
   const rows = order.items.map((item, idx) => {
     const p = products.find(prod => prod.id === item.product_id);
-    // SKU code is internal-only, so it's never shown here - instead each line
-    // names the quantity and per-unit rate actually billed on this order, so
-    // the item is identifiable without cross-referencing the Qty/Rate columns.
-    const productName = p ? `${p.name} (${item.quantity} X Rs ${item.unit_price.toFixed(2)})` : `Product ${item.product_id}`;
-    return `<tr><td>${idx + 1}</td><td>${productName}</td><td style="text-align:right">${item.quantity}</td><td style="text-align:right">Rs ${item.unit_price.toFixed(2)}</td><td style="text-align:right">${item.tax_pct}%</td><td style="text-align:right">Rs ${(item.quantity * item.unit_price).toFixed(2)}</td></tr>`;
+    const piecesPerBox = p?.pieces_per_box ?? 1;
+    const qtyLabel = formatQty({ boxes: item.quantity, pieces: item.quantity_pieces });
+    // unit_price is always a per-piece rate (MRP is printed per individual
+    // sellable piece) - the billable amount is the total piece count (whole
+    // boxes worth, plus any loose pieces), not the raw box count.
+    const amount = toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, piecesPerBox) * item.unit_price;
+    // unit_price is a per-piece rate, so it can't be printed as-is next to a
+    // box-only (or mixed) quantity - that reads as if a whole box costs just
+    // one piece's price. formatUnitRate derives the rate that actually
+    // applies to what's shown.
+    const rateLabel = formatUnitRate({ boxes: item.quantity, pieces: item.quantity_pieces }, item.unit_price, piecesPerBox);
+    // SKU code is internal-only, so it's never shown here - just the plain
+    // product name. Qty/rate are their own dedicated columns already (right
+    // there in this same row), so repeating them in parentheses after the
+    // name was pure duplication.
+    const productName = p ? p.name : `Product ${item.product_id}`;
+    return `<tr><td>${idx + 1}</td><td>${productName}</td><td style="text-align:right">${qtyLabel}</td><td style="text-align:right">${rateLabel}</td><td style="text-align:right">${item.tax_pct}%</td><td style="text-align:right">Rs. ${amount.toFixed(2)}</td></tr>`;
   }).join('');
 
   const paidVal = invoice.paid_amount || 0;
@@ -40,13 +53,13 @@ export function buildOrderInvoicePdf(order: Order, invoice: Invoice, store: Stor
     <table><thead><tr><th>#</th><th>Item</th><th style="text-align:right">Qty</th><th style="text-align:right">Rate</th><th style="text-align:right">Tax</th><th style="text-align:right">Amount</th></tr></thead>
     <tbody>${rows}</tbody></table>
     <div class="box" style="text-align:right">
-      Taxable Subtotal: Rs ${invoice.total.toFixed(2)}<br/>
-      GST Total: Rs ${invoice.tax.toFixed(2)}<br/>
-      Total Amount (Before Round Off): Rs ${(invoice.total + invoice.tax).toFixed(2)}<br/>
-      Round Off: ${invoice.round_off && invoice.round_off > 0 ? '+' : ''}Rs ${(invoice.round_off || 0).toFixed(2)}<br/>
-      <strong>Net Amount Payable (Grand Total): Rs ${invoice.grand_total.toFixed(2)}</strong><br/>
-      Paid: Rs ${paidVal.toFixed(2)}<br/>
-      <strong>Balance Due: Rs ${balanceDue.toFixed(2)}</strong>
+      Taxable Subtotal: Rs. ${invoice.total.toFixed(2)}<br/>
+      GST Total: Rs. ${invoice.tax.toFixed(2)}<br/>
+      Total Amount (Before Round Off): Rs. ${(invoice.total + invoice.tax).toFixed(2)}<br/>
+      Round Off: ${invoice.round_off && invoice.round_off > 0 ? '+' : ''}Rs. ${(invoice.round_off || 0).toFixed(2)}<br/>
+      <strong>Net Amount Payable (Grand Total): Rs. ${invoice.grand_total.toFixed(2)}</strong><br/>
+      Paid: Rs. ${paidVal.toFixed(2)}<br/>
+      <strong>Balance Due: Rs. ${balanceDue.toFixed(2)}</strong>
     </div>
     <div class="box"><strong>PAYMENT STATUS: ${statusLabel}</strong><br/>Settled Via: ${invoice.payment_method || 'Credit (Pay Later)'}</div>`;
 
@@ -74,14 +87,28 @@ export function buildOrderInvoicePdf(order: Order, invoice: Invoice, store: Stor
 export function buildPreBookingBillPdf(booking: PreBookingOrder, store: Store, products: Product[]): { html: string; fileName: string } {
   const rows = booking.items.map((item, idx) => {
     const p = products.find(prod => prod.id === item.product_id);
-    // SKU code is internal-only, so it's never shown here - instead each line
-    // names the quantity and per-unit rate actually billed on this booking,
-    // so the item is identifiable without cross-referencing the Qty/Rate columns.
-    const productName = p ? `${p.name} (${item.quantity} X Rs ${item.unit_price.toFixed(2)})` : `Product ${item.product_id}`;
-    return `<tr><td>${idx + 1}</td><td>${productName}</td><td style="text-align:right">${item.quantity}</td><td style="text-align:right">Rs ${item.unit_price.toFixed(2)}</td><td style="text-align:right">${item.tax_pct}%</td><td style="text-align:right">Rs ${(item.quantity * item.unit_price).toFixed(2)}</td></tr>`;
+    const piecesPerBox = p?.pieces_per_box ?? 1;
+    const qtyLabel = formatQty({ boxes: item.quantity, pieces: item.quantity_pieces });
+    // unit_price is always a per-piece rate (MRP is printed per individual
+    // sellable piece) - the billable amount is the total piece count (whole
+    // boxes worth, plus any loose pieces), not the raw box count.
+    const amount = toTotalPieces({ boxes: item.quantity, pieces: item.quantity_pieces }, piecesPerBox) * item.unit_price;
+    // unit_price is a per-piece rate, so it can't be printed as-is next to a
+    // box-only (or mixed) quantity - that reads as if a whole box costs just
+    // one piece's price. formatUnitRate derives the rate that actually
+    // applies to what's shown.
+    const rateLabel = formatUnitRate({ boxes: item.quantity, pieces: item.quantity_pieces }, item.unit_price, piecesPerBox);
+    // SKU code is internal-only, so it's never shown here - just the plain
+    // product name. Qty/rate are their own dedicated columns already (right
+    // there in this same row), so repeating them in parentheses after the
+    // name was pure duplication.
+    const productName = p ? p.name : `Product ${item.product_id}`;
+    return `<tr><td>${idx + 1}</td><td>${productName}</td><td style="text-align:right">${qtyLabel}</td><td style="text-align:right">${rateLabel}</td><td style="text-align:right">${item.tax_pct}%</td><td style="text-align:right">Rs. ${amount.toFixed(2)}</td></tr>`;
   }).join('');
 
-  const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(booking.items);
+  const { total, tax, grand_total: grandTotal, round_off: roundOff } = computeInvoiceTotals(
+    booking.items.map(i => ({ ...i, pieces_per_box: products.find(p => p.id === i.product_id)?.pieces_per_box ?? 1 }))
+  );
 
   const statusNote = booking.status === 'Delivered'
     ? 'DELIVERED — this booking was fulfilled as a store order; the tax invoice for that delivery is available from Orders.'
@@ -107,11 +134,11 @@ export function buildPreBookingBillPdf(booking: PreBookingOrder, store: Store, p
     <table><thead><tr><th>#</th><th>Item</th><th style="text-align:right">Qty</th><th style="text-align:right">Rate</th><th style="text-align:right">Tax</th><th style="text-align:right">Amount</th></tr></thead>
     <tbody>${rows}</tbody></table>
     ${renderSummaryLine([
-      { label: 'Taxable Subtotal', value: `Rs ${total.toFixed(2)}` },
-      { label: 'GST Total', value: `Rs ${tax.toFixed(2)}` },
-      { label: 'Total (Before Round Off)', value: `Rs ${(total + tax).toFixed(2)}` },
-      { label: 'Round Off', value: `${roundOff > 0 ? '+' : ''}Rs ${roundOff.toFixed(2)}` },
-      { label: 'Net Amount (Grand Total)', value: `Rs ${grandTotal.toFixed(2)}`, accent: true },
+      { label: 'Taxable Subtotal', value: `Rs. ${total.toFixed(2)}` },
+      { label: 'GST Total', value: `Rs. ${tax.toFixed(2)}` },
+      { label: 'Total (Before Round Off)', value: `Rs. ${(total + tax).toFixed(2)}` },
+      { label: 'Round Off', value: `${roundOff > 0 ? '+' : ''}Rs. ${roundOff.toFixed(2)}` },
+      { label: 'Net Amount (Grand Total)', value: `Rs. ${grandTotal.toFixed(2)}`, accent: true },
     ])}
     <div class="box"><strong>${statusNote}</strong></div>`;
 

@@ -6,10 +6,11 @@ import { isPaginationRequested } from '../../utils/pagination';
 
 const itemSchema = z.object({
   product_id: z.string().min(1),
-  quantity: z.number().positive(),
+  quantity: z.number().int().min(0),
+  quantity_pieces: z.number().int().min(0).default(0),
   unit_price: z.number().nonnegative(),
   tax_pct: z.number().nonnegative(),
-});
+}).refine(i => i.quantity > 0 || i.quantity_pieces > 0, { message: 'Quantity must be greater than zero' });
 
 const createSchema = z.object({
   store_id: z.string().min(1, 'Please select a store for the pre-booking order.'),

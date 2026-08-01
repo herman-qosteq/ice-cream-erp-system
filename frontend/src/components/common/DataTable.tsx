@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Text, Pressable, ScrollView } from 'react-native';
+import EmptyState from './EmptyState';
 
 export interface DataTableColumn<T> {
   key: string;
@@ -37,15 +38,7 @@ interface DataTableProps<T> {
 // scrolls horizontally instead of crushing the text.
 export default function DataTable<T>({ columns, data, keyExtractor, emptyText, onRowPress }: DataTableProps<T>) {
   if (data.length === 0) {
-    // flex-1 so that inside a fixed-height <ScrollableSection> (whose
-    // ScrollView content container is flexGrow:1) this centers within the
-    // FULL fixed height instead of sitting as a short block pinned to the
-    // top with dead space visibly unaccounted-for underneath it.
-    return (
-      <View className="flex-1 items-center justify-center bg-white border border-slate-200 rounded-2xl py-8">
-        <Text className="text-center text-slate-400 italic text-xs">{emptyText || 'No records found.'}</Text>
-      </View>
-    );
+    return <EmptyState message={emptyText || 'No records found.'} />;
   }
 
   const totalWidth = columns.reduce((sum, c) => sum + c.width, 0);
@@ -70,7 +63,14 @@ export default function DataTable<T>({ columns, data, keyExtractor, emptyText, o
           <View className="flex-row bg-slate-50 border-b border-slate-200">
             {columns.map(col => (
               <View key={col.key} style={cellStyle(col.width, col.grow)} className="px-2.5 py-2 justify-center">
-                <Text className={`text-[9px] font-bold text-slate-400 uppercase ${alignClass(col.align)}`}>{col.label}</Text>
+                {/* numberOfLines=1 keeps every header a single line no matter
+                    how long its label is - an unclamped header wrapping to 2-3
+                    lines grows the whole header row and throws off vertical
+                    alignment with the (single-line) data rows below it. A
+                    label that's genuinely too long for its column's width
+                    should be shortened at the call site instead of relying on
+                    wrapping. */}
+                <Text numberOfLines={1} className={`text-[9px] font-bold text-slate-400 uppercase ${alignClass(col.align)}`}>{col.label}</Text>
               </View>
             ))}
           </View>

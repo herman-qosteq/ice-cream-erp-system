@@ -1,13 +1,12 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { View, Text, Pressable, ScrollView } from 'react-native';
-import { TrendingUp, DollarSign, Package, AlertTriangle, Calendar, Download, Trophy, Users, Award, Truck } from 'lucide-react-native';
+import { TrendingUp, DollarSign, Package, AlertTriangle, Calendar, Trophy, Users, Award, Truck, Boxes, Snowflake } from 'lucide-react-native';
 import { ERPData } from '../../storage';
-import { calculateDeliveredOrderProfit, getAveragePurchasePrice, getLatestPurchasePrice } from '../../data';
-import { exportHtmlReport } from '../../utils/reportExport';
-import { renderPdfDocument, renderSummaryLine, buildPdfFileName, freshReportRef } from '../../utils/pdfTemplate';
-import DateField from '../../components/common/DateField';
-import { isRetailPricingEnabled } from '../../utils/pricing';
-import { computeInvoiceTotals } from '../../utils/billing';
+import { Asset, BoxPieceQty } from '../../types';
+import { calculateDeliveredOrderProfit, getAveragePurchasePrice } from '../../data';
+import { computeInvoiceTotals, formatWholeRupees } from '../../utils/billing';
+import { assetsApi } from '../../api/endpoints';
+import { formatQty, isPositiveQty, toTotalPieces } from '../../utils/qty';
 
 interface AdminDashboardProps {
   data: ERPData;
@@ -15,24 +14,32 @@ interface AdminDashboardProps {
   showAlert: (opts: any) => void;
 }
 
-// Dashboard KPI/stock-value tiles show the nearest whole rupee (same
-// round-half-up rule as invoice Round Off) rather than paise precision -
-// these are summary figures, not bills, so decimals just add noise.
-const inr = (n: number) => `Rs ${Math.round(n).toLocaleString('en-IN')}`;
-
 export default function AdminDashboard({ data, setActiveScreen, showAlert }: AdminDashboardProps) {
-  const [activeReportTab, setActiveReportTab] = useState<'Daily' | 'Weekly' | 'Monthly' | 'Custom'>('Weekly');
-  // Defaults to the last 7 days ending today (not a fixed literal date) so the
-  // Custom tab starts out showing a range that actually contains recent data
-  // instead of whatever window happened to be "today" when this was written.
-  const [dateRange, setDateRange] = useState(() => {
-    const now = new Date();
-    const weekAgo = new Date(now);
-    weekAgo.setDate(weekAgo.getDate() - 6);
-    const toIsoDate = (d: Date) => d.toISOString().split('T')[0];
-    return { start: toIsoDate(weekAgo), end: toIsoDate(now) };
-  });
-  const retailEnabled = isRetailPricingEnabled(data.rolePermissions);
+  // Assets aren't part of the main ERPData blob (paginated separately, see
+  // AdminAssets.tsx) - the dashboard fetches its own lightweight summary
+  // just for the stat tiles/reports below.
+  const [assets, setAssets] = useState<Asset[]>([]);
+  useEffect(() => {
+    assetsApi.list().then(setAssets).catch(() => {});
+  }, []);
+
+  const partnerTypeCounts = data.partnerTypes.map(t => ({
+    name: t.name,
+    count: data.stores.filter(s => (s.partner_type || 'Retail Shop') === t.name).length,
+  }));
+
+  const assetStatusCounts = {
+    total: assets.length,
+    assigned: assets.filter(a => a.status === 'Assigned').length,
+    available: assets.filter(a => a.status === 'Warehouse' || a.status === 'Returned').length,
+    maintenance: assets.filter(a => a.status === 'Maintenance').length,
+    lost: assets.filter(a => a.status === 'Lost').length,
+  };
+
+  const truckStockUnits = data.truck_inventory.reduce((sum, ti) => sum + ti.quantity, 0);
+  const truckStockPieces = data.truck_inventory.reduce((sum, ti) => sum + ti.quantity_pieces, 0);
+  const warehouseStockUnits = data.warehouse_inventory.reduce((sum, inv) => sum + inv.available_qty, 0);
+  const warehouseStockPieces = data.warehouse_inventory.reduce((sum, inv) => sum + inv.available_pieces, 0);
 
   // Single source of truth for "how much revenue did this order generate" (tax
   // inclusive, matching the invoice actually billed to the store) — every KPI
@@ -50,37 +57,43 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
   const totalCollections = data.payments.reduce((acc, p) => acc + p.amount, 0);
   const pendingCollections = data.stores.reduce((acc, s) => acc + s.outstanding_balance, 0);
 
-  const getInventoryCostValue = (productId: string, quantity: number) => {
-    if (quantity <= 0) return 0;
+  const getInventoryCostValue = (productId: string, qty: BoxPieceQty) => {
+    if (!isPositiveQty(qty)) return 0;
     const product = data.products.find(p => p.id === productId);
-    const avgPurchasePrice = getAveragePurchasePrice(productId, data.purchases);
+    const avgPurchasePrice = getAveragePurchasePrice(productId, data.purchases, product?.pieces_per_box ?? 1);
     const fallbackPrice = product?.purchase_price ?? 0;
-    return quantity * (avgPurchasePrice || fallbackPrice);
+    const unitCost = avgPurchasePrice || fallbackPrice;
+    const piecesPerBox = product?.pieces_per_box ?? 1;
+    return qty.boxes * unitCost + (qty.pieces * unitCost / Math.max(1, piecesPerBox));
   };
 
-  const warehouseStockValue = data.warehouse_inventory.reduce((sum, inv) => sum + getInventoryCostValue(inv.product_id, inv.available_qty), 0);
+  const warehouseStockValue = data.warehouse_inventory.reduce((sum, inv) => sum + getInventoryCostValue(inv.product_id, { boxes: inv.available_qty, pieces: inv.available_pieces }), 0);
 
   let totalFleetStockValue = 0;
   data.truck_inventory.forEach(ti => {
-    if (ti.quantity > 0) totalFleetStockValue += getInventoryCostValue(ti.product_id, ti.quantity);
+    const qty = { boxes: ti.quantity, pieces: ti.quantity_pieces };
+    if (isPositiveQty(qty)) totalFleetStockValue += getInventoryCostValue(ti.product_id, qty);
   });
 
   // Stock already reserved for pre-bookings — still physically in the
   // warehouse (not yet dispatched), so it's excluded from warehouseStockValue
   // above (that figure is "available to sell right now"). Broken out
   // separately here so reserved value isn't just invisible.
-  const reservedStockValue = data.warehouse_inventory.reduce((sum, inv) => sum + getInventoryCostValue(inv.product_id, inv.reserved_qty), 0);
+  const reservedStockValue = data.warehouse_inventory.reduce((sum, inv) => sum + getInventoryCostValue(inv.product_id, { boxes: inv.reserved_qty, pieces: inv.reserved_pieces }), 0);
   const reservedProducts = data.warehouse_inventory
-    .filter(inv => inv.reserved_qty > 0)
+    .filter(inv => isPositiveQty({ boxes: inv.reserved_qty, pieces: inv.reserved_pieces }))
     .map(inv => {
       const product = data.products.find(p => p.id === inv.product_id);
+      const reservedQty: BoxPieceQty = { boxes: inv.reserved_qty, pieces: inv.reserved_pieces };
+      const effectiveQty = toTotalPieces(reservedQty, product?.pieces_per_box ?? 1);
+      const totalValue = getInventoryCostValue(inv.product_id, reservedQty);
       return {
         id: inv.product_id,
         name: product?.name || 'Unknown product',
         code: product?.code || '',
-        reservedQty: inv.reserved_qty,
-        unitCost: inv.reserved_qty > 0 ? getInventoryCostValue(inv.product_id, inv.reserved_qty) / inv.reserved_qty : 0,
-        value: getInventoryCostValue(inv.product_id, inv.reserved_qty),
+        reservedQty,
+        unitCost: effectiveQty > 0 ? totalValue / effectiveQty : 0,
+        value: totalValue,
       };
     })
     .sort((a, b) => b.value - a.value);
@@ -92,11 +105,11 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
     .filter(o => o.status === 'Delivered')
     .reduce((sum, order) => {
       const invoice = data.invoices.find(i => i.order_id === order.id);
-      return sum + calculateDeliveredOrderProfit(order, data.purchases, invoice);
+      return sum + calculateDeliveredOrderProfit(order, data.purchases, data.products, invoice);
     }, 0);
 
-  const today = new Date('2026-06-27');
-  const sevenDaysLater = new Date('2026-07-04');
+  const today = new Date();
+  const sevenDaysLater = new Date(today.getTime() + 7 * 86400000);
   const upcomingRefills = data.stores.filter(s => {
     if (!s.next_refill_date) return false;
     const refDate = new Date(s.next_refill_date);
@@ -110,241 +123,12 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
   }).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
 
   const productSales = data.products.map(p => {
-    const qty = data.orders.filter(o => o.status === 'Delivered').reduce((sum, o) => sum + o.items.filter(item => item.product_id === p.id).reduce((itemSum, item) => itemSum + item.quantity, 0), 0);
-    return { name: p.name, qty, category: p.category };
-  }).sort((a, b) => b.qty - a.qty).slice(0, 5);
-
-  const handleExport = async (reportName: string) => {
-    // Report period must be computed relative to the actual current date, not
-    // a fixed literal - a hardcoded window stops matching any order created
-    // after that literal date, which is what made this report export empty.
-    const now = new Date();
-    const toIsoDate = (d: Date) => d.toISOString().split('T')[0];
-    const daysAgo = (n: number) => {
-      const d = new Date(now);
-      d.setDate(d.getDate() - n);
-      return d;
-    };
-
-    const startStr = activeReportTab === 'Daily' ? toIsoDate(now)
-      : activeReportTab === 'Weekly' ? toIsoDate(daysAgo(6))
-      : activeReportTab === 'Monthly' ? toIsoDate(daysAgo(30))
-      : dateRange.start;
-    const endStr = activeReportTab === 'Custom' ? dateRange.end : toIsoDate(now);
-
-    const startDate = new Date(startStr);
-    const endDate = new Date(endStr);
-    endDate.setHours(23, 59, 59, 999);
-    const periodStr = `${startStr} to ${endStr}`;
-
-    let html = '';
-    let fileName = '';
-
-    if (reportName === 'Sales and Profit Report') {
-      const periodOrders = data.orders.filter(o => {
-        const oDate = new Date(o.created_at);
-        return oDate >= startDate && oDate <= endDate;
-      });
-      const periodPayments = data.payments.filter(p => {
-        const pDate = new Date(p.date);
-        return pDate >= startDate && pDate <= endDate;
-      });
-
-      let periodRevenue = 0, periodCOGS = 0, periodProfit = 0;
-      periodOrders.forEach(o => {
-        if (o.status === 'Delivered') {
-          periodRevenue += getOrderRevenue(o);
-          o.items.forEach(item => {
-            // Costed the same way as the dashboard's Total Profit card
-            // (latest actual purchase price, not the product's current
-            // catalog price) so the two never disagree after a price update.
-            const itemCost = getLatestPurchasePrice(item.product_id, data.purchases) * item.quantity;
-            periodCOGS += itemCost;
-          });
-          // Profit is recognized on a cash basis (see calculateDeliveredOrderProfit)
-          // - only the portion of this order's margin actually collected so
-          // far counts, so periodProfit intentionally does not equal
-          // periodRevenue - periodCOGS whenever orders are unpaid/partial.
-          const invoice = data.invoices.find(i => i.order_id === o.id);
-          periodProfit += calculateDeliveredOrderProfit(o, data.purchases, invoice);
-        }
-      });
-      const totalPaymentsCollected = periodPayments.reduce((sum, p) => sum + p.amount, 0);
-
-      const tableRows = periodOrders.map(o => {
-        const store = data.stores.find(s => s.id === o.store_id);
-        const totalQty = o.items.reduce((s, i) => s + i.quantity, 0);
-        let cost = 0;
-        o.items.forEach(i => {
-          cost += getLatestPurchasePrice(i.product_id, data.purchases) * i.quantity;
-        });
-        const rev = getOrderRevenue(o);
-        const invoice = data.invoices.find(i => i.order_id === o.id);
-        const profit = o.status === 'Delivered' ? calculateDeliveredOrderProfit(o, data.purchases, invoice) : 0;
-        return `<tr>
-            <td>${o.id}</td>
-            <td>${new Date(o.created_at).toLocaleDateString('en-IN')}</td>
-            <td>${store?.name || 'Unknown Store'}</td>
-            <td style="text-align:center">${totalQty}</td>
-            <td style="text-align:right">Rs ${rev.toFixed(2)}</td>
-            <td style="text-align:right">Rs ${cost.toFixed(2)}</td>
-            <td style="text-align:right"><strong>Rs ${profit.toFixed(2)}</strong></td>
-            <td style="text-align:center">${o.status}</td>
-          </tr>`;
-      }).join('');
-
-      html = renderPdfDocument({
-        title: 'SALES & PROFIT EXECUTIVE REPORT',
-        subtitle: `Period: ${activeReportTab} | Range: ${periodStr}`,
-        bodyHtml: `
-          ${renderSummaryLine([
-            { label: 'Delivered Revenue', value: `Rs ${periodRevenue.toFixed(2)}`, accent: true },
-            { label: 'Cost of Sales (COGS)', value: `Rs ${periodCOGS.toFixed(2)}` },
-            { label: 'Profit (Collected Only)', value: `Rs ${periodProfit.toFixed(2)}`, accent: true },
-            { label: 'Collected Payments', value: `Rs ${totalPaymentsCollected.toFixed(2)}` },
-          ])}
-          <div class="section-title">Logged Sales Orders in Period (${periodOrders.length})</div>
-          <table><thead><tr><th>Order ID</th><th>Date</th><th>Store Partner</th><th style="text-align:center">Qty</th><th style="text-align:right">Revenue</th><th style="text-align:right">Cost</th><th style="text-align:right">Profit (Collected)</th><th style="text-align:center">Status</th></tr></thead>
-          <tbody>${tableRows || '<tr><td colspan="8" style="text-align:center;padding:20px;color:#94a3b8">No orders logged in this period.</td></tr>'}</tbody></table>`,
-        footerNote: 'This is a computer-generated executive report and requires no physical signature.',
-      });
-      fileName = buildPdfFileName('Revenue_Report', freshReportRef('REV'));
-
-    } else if (reportName === 'Store Outstanding Report') {
-      const totalOutstanding = data.stores.reduce((sum, s) => sum + s.outstanding_balance, 0);
-      const exceededCount = data.stores.filter(s => s.outstanding_balance > s.credit_limit).length;
-
-      const storeRows = data.stores.map(s => {
-        const exceeded = s.outstanding_balance > s.credit_limit ? 'EXCEEDED' : s.outstanding_balance === s.credit_limit ? 'AT LIMIT' : 'OK';
-        return `<tr>
-            <td><strong>${s.name}</strong></td>
-            <td>${s.owner_name}<br/><span class="muted">Ph: ${s.phone}</span></td>
-            <td>${s.area}, ${s.city}</td>
-            <td style="text-align:right">Rs ${s.credit_limit.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td style="text-align:right"><strong>Rs ${s.outstanding_balance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong></td>
-            <td style="text-align:center">${exceeded}</td>
-            <td style="text-align:center">${s.last_purchase_date || 'N/A'}</td>
-            <td style="text-align:center">${s.next_refill_date || 'N/A'}</td>
-          </tr>`;
-      }).join('');
-
-      html = renderPdfDocument({
-        title: 'STORE OUTSTANDING CREDIT LEDGER',
-        subtitle: 'Live Risk Audit & Overdue Status Report',
-        bodyHtml: `
-          ${renderSummaryLine([
-            { label: 'Total Stores Tracked', value: `${data.stores.length} Outlets` },
-            { label: 'Accumulated Outstanding', value: `Rs ${totalOutstanding.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, accent: true },
-            { label: 'Exceeded Credit Limit', value: `${exceededCount} Stores` },
-          ])}
-          <div class="section-title">Outstanding Balance and Credit Utilization by Outlet</div>
-          <table><thead><tr><th>Store Name</th><th>Owner Contact</th><th>Area / City</th><th style="text-align:right">Credit Limit</th><th style="text-align:right">Outstanding</th><th style="text-align:center">Risk</th><th style="text-align:center">Last Purchase</th><th style="text-align:center">Next Refill</th></tr></thead>
-          <tbody>${storeRows || '<tr><td colspan="8" style="text-align:center;padding:20px;color:#94a3b8">No store records registered.</td></tr>'}</tbody></table>`,
-        footerNote: 'This is a computer-generated credit ledger and requires no physical signature.',
-      });
-      fileName = buildPdfFileName('Outstanding_Report', freshReportRef('OUT'));
-
-    } else if (reportName === 'Warehouse Stock Valuation') {
-      let totalStockItems = 0, totalPurchaseValuation = 0, totalPotentialSalesValuation = 0;
-      const getPurchaseValuation = (productId: string, currentQty: number, catalogPurchasePrice: number) => {
-        if (currentQty <= 0) return 0;
-        const avgPurchasePrice = getAveragePurchasePrice(productId, data.purchases);
-        return currentQty * (avgPurchasePrice || catalogPurchasePrice);
-      };
-
-      const productRows = data.products.map(p => {
-        const inventory = data.warehouse_inventory.find(inv => inv.product_id === p.id);
-        const qty = inventory?.available_qty || 0;
-        const purchaseVal = getPurchaseValuation(p.id, qty, p.purchase_price);
-        const salesVal = qty * p.selling_price;
-        const expectedProfit = salesVal - purchaseVal;
-        totalStockItems += qty;
-        totalPurchaseValuation += purchaseVal;
-        totalPotentialSalesValuation += salesVal;
-        return `<tr>
-            <td>${p.code}</td>
-            <td>${p.name}</td>
-            <td>${p.category}</td>
-            <td style="text-align:center"><strong>${qty}</strong></td>
-            <td style="text-align:right">Rs ${p.purchase_price.toFixed(2)}</td>
-            ${retailEnabled ? `<td style="text-align:right">Rs ${p.selling_price.toFixed(2)}</td>` : ''}
-            <td style="text-align:right">Rs ${purchaseVal.toFixed(2)}</td>
-            ${retailEnabled ? `<td style="text-align:right">Rs ${salesVal.toFixed(2)}</td>
-            <td style="text-align:right"><strong>Rs ${expectedProfit.toFixed(2)}</strong></td>` : ''}
-          </tr>`;
-      }).join('');
-
-      html = renderPdfDocument({
-        title: 'WAREHOUSE INVENTORY STOCK VALUATION',
-        subtitle: 'Live Audit Report',
-        bodyHtml: `
-          ${renderSummaryLine([
-            { label: 'Unique SKUs', value: String(data.products.length) },
-            { label: 'Total Items On-Hand', value: totalStockItems.toLocaleString('en-IN') },
-            { label: 'Wholesale Assets Cost', value: `Rs ${totalPurchaseValuation.toFixed(2)}`, accent: true },
-            ...(retailEnabled ? [{ label: 'Retail Potential Value', value: `Rs ${totalPotentialSalesValuation.toFixed(2)}`, accent: true }] : []),
-          ])}
-          <div class="section-title">Valuation Breakdown by Product</div>
-          <table><thead><tr><th>SKU</th><th>Product</th><th>Category</th><th style="text-align:center">Qty</th><th style="text-align:right">Wholesale</th>${retailEnabled ? '<th style="text-align:right">Selling</th>' : ''}<th style="text-align:right">Wholesale Val</th>${retailEnabled ? '<th style="text-align:right">Retail Val</th><th style="text-align:right">Margin</th>' : ''}</tr></thead>
-          <tbody>${productRows || `<tr><td colspan="${retailEnabled ? 9 : 6}" style="text-align:center;padding:20px;color:#94a3b8">No products registered.</td></tr>`}</tbody></table>`,
-        footerNote: 'This is a computer-generated stock valuation report and requires no physical signature.',
-      });
-      fileName = buildPdfFileName('Warehouse_Report', freshReportRef('WH'));
-
-    } else if (reportName === 'Truck Inventory Distribution') {
-      let totalQtyLoaded = 0, totalTruckValuation = 0, totalTruckRetailValuation = 0;
-      const itemsList: any[] = [];
-
-      data.trucks.forEach(t => {
-        const driver = data.users.find(u => u.id === t.driver_user_id);
-        const inventories = data.truck_inventory.filter(ti => ti.truck_id === t.id);
-        inventories.forEach(ti => {
-          const prod = data.products.find(p => p.id === ti.product_id);
-          if (prod && ti.quantity > 0) {
-            const costPrice = getAveragePurchasePrice(prod.id, data.purchases) || prod.purchase_price;
-            const costVal = ti.quantity * costPrice;
-            const retailVal = ti.quantity * prod.selling_price;
-            totalQtyLoaded += ti.quantity;
-            totalTruckValuation += costVal;
-            totalTruckRetailValuation += retailVal;
-            itemsList.push({ vehicleNumber: t.vehicle_number, driverName: driver?.name || 'Unassigned', area: t.area, skuCode: prod.code, prodName: prod.name, qty: ti.quantity, costPrice, sellingPrice: prod.selling_price, costVal, retailVal });
-          }
-        });
-      });
-
-      const tableRows = itemsList.map(item => `<tr>
-            <td>${item.vehicleNumber}</td>
-            <td>${item.driverName}</td>
-            <td>${item.area}</td>
-            <td>${item.skuCode}</td>
-            <td>${item.prodName}</td>
-            <td style="text-align:center"><strong>${item.qty} units</strong></td>
-            <td style="text-align:right">Rs ${item.costPrice.toFixed(2)}${retailEnabled ? ` / Rs ${item.sellingPrice.toFixed(2)}` : ''}</td>
-            <td style="text-align:right">Rs ${item.costVal.toFixed(2)}${retailEnabled ? ` (Cost)<br/>Rs ${item.retailVal.toFixed(2)} (Retail)` : ''}</td>
-          </tr>`).join('');
-
-      html = renderPdfDocument({
-        title: 'TRUCK TRANSIT INVENTORY DISTRIBUTION',
-        subtitle: 'Live Route Stock Loading Audit',
-        bodyHtml: `
-          ${renderSummaryLine([
-            { label: 'Fleet Size', value: `${data.trucks.length} Vehicles` },
-            { label: 'Total Cargo Units', value: `${totalQtyLoaded.toLocaleString('en-IN')} Units`, accent: true },
-            { label: 'Cargo Asset Cost', value: `Rs ${totalTruckValuation.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, accent: true },
-            ...(retailEnabled ? [{ label: 'Retail Sales Potential', value: `Rs ${totalTruckRetailValuation.toLocaleString('en-IN', { minimumFractionDigits: 2 })}` }] : []),
-          ])}
-          <div class="section-title">Loaded Transit Stock Breakdown by Vehicle</div>
-          <table><thead><tr><th>Vehicle</th><th>Driver</th><th>Route</th><th>SKU</th><th>Product</th><th style="text-align:center">Qty</th><th style="text-align:right">Price</th><th style="text-align:right">Value</th></tr></thead>
-          <tbody>${tableRows || '<tr><td colspan="8" style="text-align:center;padding:20px;color:#94a3b8">No truck inventory currently dispatched.</td></tr>'}</tbody></table>`,
-        footerNote: 'This is a computer-generated distribution audit and requires no physical signature.',
-      });
-      fileName = buildPdfFileName('Truck_Inventory', freshReportRef('TRK'));
-    }
-
-    if (html) {
-      await exportHtmlReport(html, fileName, showAlert);
-    }
-  };
+    const deliveredItems = data.orders.filter(o => o.status === 'Delivered').flatMap(o => o.items.filter(item => item.product_id === p.id));
+    const boxes = deliveredItems.reduce((sum, item) => sum + item.quantity, 0);
+    const pieces = deliveredItems.reduce((sum, item) => sum + item.quantity_pieces, 0);
+    const sortKey = toTotalPieces({ boxes, pieces }, p.pieces_per_box);
+    return { name: p.name, qty: { boxes, pieces }, sortKey, category: p.category };
+  }).sort((a, b) => b.sortKey - a.sortKey).slice(0, 5);
 
   return (
     <View className="gap-6">
@@ -352,19 +136,19 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
       <View className="flex-row flex-wrap gap-4">
         <View className="flex-1 min-w-[45%] lg:min-w-[22%] bg-white/70 border border-white/50 p-4 rounded-2xl border-l-4 border-l-blue-400">
           <Text className="text-[10px] uppercase font-bold tracking-wider text-slate-400">Total Revenue</Text>
-          <Text className="text-xl font-black mt-1 text-slate-800">{inr(totalRevenue)}</Text>
+          <Text className="text-xl font-black mt-1 text-slate-800">{formatWholeRupees(totalRevenue)}</Text>
           <Text className="text-[9px] text-slate-500 font-medium">Accumulated collected</Text>
         </View>
 
         <View className="flex-1 min-w-[45%] lg:min-w-[22%] bg-white/70 border border-white/50 p-4 rounded-2xl border-l-4 border-l-emerald-400">
           <Text className="text-[10px] uppercase font-bold tracking-wider text-slate-400">Total Profit</Text>
-          <Text className="text-xl font-black mt-1 text-slate-800">{inr(totalProfit)}</Text>
+          <Text className="text-xl font-black mt-1 text-slate-800">{formatWholeRupees(totalProfit)}</Text>
           <Text className="text-[9px] text-slate-500 font-medium">From collected payments only</Text>
         </View>
 
         <View className="flex-1 min-w-[45%] lg:min-w-[22%] bg-white/70 border border-white/50 p-4 rounded-2xl border-l-4 border-l-violet-400">
           <Text className="text-[10px] uppercase font-bold tracking-wider text-slate-400">Total Collections</Text>
-          <Text className="text-xl font-black mt-1 text-slate-800">{inr(totalCollections)}</Text>
+          <Text className="text-xl font-black mt-1 text-slate-800">{formatWholeRupees(totalCollections)}</Text>
           <Text className="text-[9px] text-slate-500 font-medium">Cash/UPI/Cards settled</Text>
         </View>
 
@@ -373,7 +157,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
           className="flex-1 min-w-[45%] lg:min-w-[22%] bg-white/70 border border-white/50 p-4 rounded-2xl border-l-4 border-l-pink-400 active:bg-white"
         >
           <Text className="text-[10px] uppercase font-bold tracking-wider text-slate-400">Pending Collections</Text>
-          <Text className="text-xl font-black mt-1 text-slate-800">{inr(pendingCollections)}</Text>
+          <Text className="text-xl font-black mt-1 text-slate-800">{formatWholeRupees(pendingCollections)}</Text>
           <Text className="text-[9px] text-slate-500 font-medium">Overdue customer credit</Text>
         </Pressable>
       </View>
@@ -387,7 +171,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
             </View>
             <View>
               <Text className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Warehouse Value</Text>
-              <Text className="text-lg font-bold text-slate-800">{inr(warehouseStockValue)}</Text>
+              <Text className="text-lg font-bold text-slate-800">{formatWholeRupees(warehouseStockValue)}</Text>
             </View>
           </View>
           <Pressable onPress={() => setActiveScreen('Warehouse')} className="bg-blue-500/10 py-1.5 px-3 rounded-lg border border-blue-200/50 active:bg-blue-500/20">
@@ -402,7 +186,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
             </View>
             <View>
               <Text className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Fleet Transit Value</Text>
-              <Text className="text-lg font-bold text-slate-800">{inr(totalFleetStockValue)}</Text>
+              <Text className="text-lg font-bold text-slate-800">{formatWholeRupees(totalFleetStockValue)}</Text>
             </View>
           </View>
           <Pressable onPress={() => setActiveScreen('Trucks')} className="bg-emerald-500/10 py-1.5 px-3 rounded-lg border border-emerald-200/50 active:bg-emerald-500/20">
@@ -417,12 +201,56 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
             </View>
             <View>
               <Text className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Reserved Stock Value</Text>
-              <Text className="text-lg font-bold text-slate-800">{inr(reservedStockValue)}</Text>
+              <Text className="text-lg font-bold text-slate-800">{formatWholeRupees(reservedStockValue)}</Text>
             </View>
           </View>
           <Pressable onPress={() => setActiveScreen('Warehouse')} className="bg-amber-500/10 py-1.5 px-3 rounded-lg border border-amber-200/50 active:bg-amber-500/20">
             <Text className="text-xs font-bold text-amber-700">Manage Stock</Text>
           </Pressable>
+        </View>
+      </View>
+
+      {/* PARTNER TYPE STATISTICS */}
+      <View className="bg-white/70 border border-white/50 rounded-2xl p-4">
+        <View className="flex-row items-center gap-1.5 mb-3">
+          <Users size={16} color="#4f46e5" />
+          <Text className="font-bold text-slate-800 text-sm">Partner Type Statistics</Text>
+        </View>
+        <View className="flex-row flex-wrap gap-2">
+          {partnerTypeCounts.map(pt => (
+            <View key={pt.name} className="flex-1 min-w-[45%] lg:min-w-[18%] bg-indigo-50/60 border border-indigo-100 p-3 rounded-xl">
+              <Text className="text-[9px] uppercase font-bold tracking-wider text-indigo-400">{pt.name}</Text>
+              <Text className="text-lg font-black text-indigo-700 mt-0.5">{pt.count}</Text>
+            </View>
+          ))}
+        </View>
+      </View>
+
+      {/* ASSET & INVENTORY STATISTICS */}
+      <View className="gap-4 md:flex-row md:flex-wrap">
+        <Pressable onPress={() => setActiveScreen('Assets')} className="md:flex-1 md:min-w-[320px] bg-white/70 border border-white/50 p-4 rounded-2xl active:bg-white">
+          <View className="flex-row items-center gap-1.5 mb-2">
+            <Boxes size={16} color="#4f46e5" />
+            <Text className="font-bold text-slate-800 text-sm">Asset Statistics</Text>
+          </View>
+          <View className="flex-row flex-wrap gap-2">
+            <View className="flex-1 min-w-[30%]"><Text className="text-[9px] text-slate-400 uppercase font-bold">Total</Text><Text className="text-base font-black text-slate-800">{assetStatusCounts.total}</Text></View>
+            <View className="flex-1 min-w-[30%]"><Text className="text-[9px] text-slate-400 uppercase font-bold">Assigned</Text><Text className="text-base font-black text-emerald-600">{assetStatusCounts.assigned}</Text></View>
+            <View className="flex-1 min-w-[30%]"><Text className="text-[9px] text-slate-400 uppercase font-bold">Available</Text><Text className="text-base font-black text-blue-600">{assetStatusCounts.available}</Text></View>
+            <View className="flex-1 min-w-[30%]"><Text className="text-[9px] text-slate-400 uppercase font-bold">Maintenance</Text><Text className="text-base font-black text-amber-600">{assetStatusCounts.maintenance}</Text></View>
+            <View className="flex-1 min-w-[30%]"><Text className="text-[9px] text-slate-400 uppercase font-bold">Lost</Text><Text className="text-base font-black text-rose-600">{assetStatusCounts.lost}</Text></View>
+          </View>
+        </Pressable>
+
+        <View className="md:flex-1 md:min-w-[320px] bg-white/70 border border-white/50 p-4 rounded-2xl">
+          <View className="flex-row items-center gap-1.5 mb-2">
+            <Snowflake size={16} color="#0ea5e9" />
+            <Text className="font-bold text-slate-800 text-sm">Inventory Statistics (Units)</Text>
+          </View>
+          <View className="flex-row flex-wrap gap-2">
+            <View className="flex-1 min-w-[30%]"><Text className="text-[9px] text-slate-400 uppercase font-bold">Warehouse</Text><Text className="text-base font-black text-slate-800">{formatQty({ boxes: warehouseStockUnits, pieces: warehouseStockPieces })}</Text></View>
+            <View className="flex-1 min-w-[30%]"><Text className="text-[9px] text-slate-400 uppercase font-bold">Truck</Text><Text className="text-base font-black text-emerald-600">{formatQty({ boxes: truckStockUnits, pieces: truckStockPieces })}</Text></View>
+          </View>
         </View>
       </View>
 
@@ -449,16 +277,16 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
                     <Text className="font-bold text-slate-800 text-[11px]" numberOfLines={1}>{p.name}</Text>
                     <Text className="text-[9px] text-slate-400 uppercase font-mono">{p.code}</Text>
                   </View>
-                  <Text className="text-[9px] bg-amber-100 text-amber-700 font-extrabold px-1.5 py-0.5 rounded">{p.reservedQty} units</Text>
+                  <Text className="text-[9px] bg-amber-100 text-amber-700 font-extrabold px-1.5 py-0.5 rounded">{formatQty(p.reservedQty)}</Text>
                 </View>
                 <View className="flex-row justify-between mt-2.5 pt-2 border-t border-amber-100">
                   <View>
                     <Text className="text-slate-400 text-[9px]">Unit Cost</Text>
-                    <Text className="font-semibold text-slate-600 text-[10px]">{inr(p.unitCost)}</Text>
+                    <Text className="font-semibold text-slate-600 text-[10px]">{formatWholeRupees(p.unitCost)}</Text>
                   </View>
                   <View className="items-end">
                     <Text className="text-slate-400 text-[9px]">Reserved Value</Text>
-                    <Text className="font-extrabold text-amber-700 text-[10px]">{inr(p.value)}</Text>
+                    <Text className="font-extrabold text-amber-700 text-[10px]">{formatWholeRupees(p.value)}</Text>
                   </View>
                 </View>
               </View>
@@ -527,7 +355,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
                     <Text className="text-[10px] font-extrabold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded self-start">{st.ranking} Partner</Text>
                   </View>
                 </View>
-                <Text className="font-bold text-slate-700 text-xs">{inr(st.revenue)}</Text>
+                <Text className="font-bold text-slate-700 text-xs">{formatWholeRupees(st.revenue)}</Text>
               </View>
             ))}
           </View>
@@ -548,7 +376,7 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
                     <Text className="text-[9px] text-slate-400 font-medium">{p.category}</Text>
                   </View>
                 </View>
-                <Text className="font-bold text-indigo-700 bg-indigo-50 border border-indigo-100/50 px-2 py-0.5 rounded-full text-[10px]">{p.qty} sold</Text>
+                <Text className="font-bold text-indigo-700 bg-indigo-50 border border-indigo-100/50 px-2 py-0.5 rounded-full text-[10px]">{formatQty(p.qty)} sold</Text>
               </View>
             ))}
           </View>
@@ -569,12 +397,14 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
         {data.trucks.map(t => {
           const driver = data.users.find(u => u.id === t.driver_user_id);
           const inventories = data.truck_inventory.filter(ti => ti.truck_id === t.id);
-          let totalQty = 0, totalVal = 0;
+          let totalQtyBoxes = 0, totalQtyPieces = 0, totalVal = 0;
           inventories.forEach(ti => {
             const prod = data.products.find(p => p.id === ti.product_id);
-            if (prod && ti.quantity > 0) {
-              totalQty += ti.quantity;
-              totalVal += getInventoryCostValue(ti.product_id, ti.quantity);
+            const qty = { boxes: ti.quantity, pieces: ti.quantity_pieces };
+            if (prod && isPositiveQty(qty)) {
+              totalQtyBoxes += ti.quantity;
+              totalQtyPieces += ti.quantity_pieces;
+              totalVal += getInventoryCostValue(ti.product_id, qty);
             }
           });
           return (
@@ -582,10 +412,10 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
               <View className="flex-1">
                 <Text className="font-bold text-slate-800 text-xs">{t.vehicle_number}</Text>
                 <Text className="text-[9px] text-slate-500 font-medium">{driver?.name || 'Unassigned'}</Text>
-                <Text className="text-emerald-600 font-bold text-[10px]">{inr(totalVal)}</Text>
+                <Text className="text-emerald-600 font-bold text-[10px]">{formatWholeRupees(totalVal)}</Text>
               </View>
               <Text className="w-20 text-slate-600 font-medium text-center text-xs">{t.area}</Text>
-              <Text className="w-14 font-semibold text-slate-700 text-right text-xs">{totalQty}</Text>
+              <Text className="w-14 font-semibold text-slate-700 text-right text-xs">{formatQty({ boxes: totalQtyBoxes, pieces: totalQtyPieces })}</Text>
             </View>
           );
         })}
@@ -609,78 +439,13 @@ export default function AdminDashboard({ data, setActiveScreen, showAlert }: Adm
             <View key={u.id} className="flex-row items-center justify-between py-2.5 border-b border-slate-50 last:border-0">
               <Text className="font-bold text-slate-800 text-xs">{u.name.split(' ')[0]}</Text>
               <Text className="text-slate-600 font-medium text-xs">{count} orders</Text>
-              <Text className="font-semibold text-slate-700 text-xs">{inr(revenue)}</Text>
-              <Text className="text-emerald-600 font-bold text-xs">{inr(collections)}</Text>
+              <Text className="font-semibold text-slate-700 text-xs">{formatWholeRupees(revenue)}</Text>
+              <Text className="text-emerald-600 font-bold text-xs">{formatWholeRupees(collections)}</Text>
             </View>
           );
         })}
       </View>
 
-      {/* REPORT EXPORT CENTER */}
-      <View className="bg-white/70 border border-white/50 rounded-2xl p-4 mb-4">
-        <View className="flex-row items-center justify-between mb-4">
-          <View>
-            <Text className="font-bold text-sm tracking-tight text-slate-800">ERP Executive Reports Hub</Text>
-            <Text className="text-[10px] text-slate-500 font-medium">Export financial & logistics logs instantly</Text>
-          </View>
-        </View>
-
-        <View className="flex-row bg-white/60 border border-white/50 p-0.5 rounded-lg mb-4 self-start">
-          {(['Daily', 'Weekly', 'Monthly', 'Custom'] as const).map(tab => (
-            <Pressable
-              key={tab}
-              onPress={() => setActiveReportTab(tab)}
-              className={`px-2 py-1 rounded ${activeReportTab === tab ? 'bg-indigo-600' : ''}`}
-            >
-              <Text className={`text-[10px] font-bold ${activeReportTab === tab ? 'text-white' : 'text-slate-500'}`}>{tab}</Text>
-            </Pressable>
-          ))}
-        </View>
-
-        {activeReportTab === 'Custom' && (
-          <View className="flex-row gap-2 bg-white/60 border border-white/50 p-2 rounded-xl mb-4">
-            <View className="flex-1">
-              <Text className="text-[9px] text-slate-500 font-bold mb-1 uppercase tracking-wider">Start Date</Text>
-              <DateField
-                value={dateRange.start}
-                onValueChange={v => setDateRange({ ...dateRange, start: v })}
-                title="Select Start Date"
-                className="bg-white border border-slate-200/60 rounded p-1.5 flex-row items-center justify-between"
-                textClassName="text-[11px] text-slate-700 flex-1"
-              />
-            </View>
-            <View className="flex-1">
-              <Text className="text-[9px] text-slate-500 font-bold mb-1 uppercase tracking-wider">End Date</Text>
-              <DateField
-                value={dateRange.end}
-                onValueChange={v => setDateRange({ ...dateRange, end: v })}
-                title="Select End Date"
-                className="bg-white border border-slate-200/60 rounded p-1.5 flex-row items-center justify-between"
-                textClassName="text-[11px] text-slate-700 flex-1"
-              />
-            </View>
-          </View>
-        )}
-
-        <View className="flex-row flex-wrap gap-2">
-          <Pressable onPress={() => handleExport('Sales and Profit Report')} className="flex-1 min-w-[45%] lg:min-w-[22%] flex-row items-center gap-1.5 bg-white/80 border border-white/60 py-2.5 px-2.5 rounded-xl">
-            <Download size={14} color="#ec4899" />
-            <Text className="font-semibold text-slate-700 text-[11px]">Revenue/Profit PDF</Text>
-          </Pressable>
-          <Pressable onPress={() => handleExport('Store Outstanding Report')} className="flex-1 min-w-[45%] lg:min-w-[22%] flex-row items-center gap-1.5 bg-white/80 border border-white/60 py-2.5 px-2.5 rounded-xl">
-            <Download size={14} color="#3b82f6" />
-            <Text className="font-semibold text-slate-700 text-[11px]">Outstanding Credit PDF</Text>
-          </Pressable>
-          <Pressable onPress={() => handleExport('Warehouse Stock Valuation')} className="flex-1 min-w-[45%] lg:min-w-[22%] flex-row items-center gap-1.5 bg-white/80 border border-white/60 py-2.5 px-2.5 rounded-xl">
-            <Download size={14} color="#f59e0b" />
-            <Text className="font-semibold text-slate-700 text-[11px]">Warehouse Stock PDF</Text>
-          </Pressable>
-          <Pressable onPress={() => handleExport('Truck Inventory Distribution')} className="flex-1 min-w-[45%] lg:min-w-[22%] flex-row items-center gap-1.5 bg-white/80 border border-white/60 py-2.5 px-2.5 rounded-xl">
-            <Download size={14} color="#10b981" />
-            <Text className="font-semibold text-slate-700 text-[11px]">Truck Inventory PDF</Text>
-          </Pressable>
-        </View>
-      </View>
     </View>
   );
 }

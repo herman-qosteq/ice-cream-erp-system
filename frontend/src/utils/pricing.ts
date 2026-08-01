@@ -1,18 +1,14 @@
-import { Product, StorePricing, RolePermission } from '../types';
+import type { Product, StorePricing } from '../types';
 
 export type PricingMode = 'wholesale' | 'retail';
 
-// Admin-toggleable, app-wide (not role-scoped) feature flag: off by default,
-// hiding the entire Retail/Selling price tier everywhere (pricing forms,
-// order/pre-booking pricing-mode toggles, product cards, reports) until an
-// Admin turns it on from Role Permissions. Reuses the RolePermission table
-// with a fixed 'Admin' role as the row owner purely for storage - readers
-// ignore the role and just check the feature key.
+// Per-role feature flag key (Manage Permissions -> Feature Flags), on by
+// default for Admin and off by default for Salesperson/Warehouse - see
+// PERMISSION_REGISTRY in config/permissionsRegistry.ts and
+// isRetailPricingEnabled() in utils/permissions.ts (the actual resolver;
+// kept out of this file to avoid a circular import with permissionsRegistry.ts,
+// which itself imports this constant).
 export const RETAIL_PRICING_FEATURE = 'retail_pricing_enabled';
-
-export function isRetailPricingEnabled(rolePermissions: RolePermission[]): boolean {
-  return rolePermissions.some(rp => rp.feature === RETAIL_PRICING_FEATURE && rp.enabled);
-}
 
 export function priceFromDiscount(mrp: number, discountPct: number): number {
   return Math.max(0, mrp * (1 - discountPct / 100));
@@ -27,6 +23,19 @@ export function discountFromPrice(mrp: number, price: number): number {
   if (mrp <= 0) return 0;
   const pct = (1 - price / mrp) * 100;
   return Math.round(Math.max(0, Math.min(100, pct)) * 100) / 100;
+}
+
+// Box MRP is never its own source of truth - it's pieces_per_box copies of
+// the per-piece MRP. These two helpers keep a "Box MRP" input two-way
+// synced with the existing "MRP (Piece Price)" input, the same way
+// priceFromDiscount()/discountFromPrice() keep MRP and discount % synced.
+export function boxMrpFromMrp(mrp: number, piecesPerBox: number): number {
+  return Math.round(mrp * Math.max(1, piecesPerBox) * 100) / 100;
+}
+
+export function mrpFromBoxMrp(boxMrp: number, piecesPerBox: number): number {
+  const pieces = Math.max(1, piecesPerBox);
+  return Math.round((boxMrp / pieces) * 100) / 100;
 }
 
 export function findStorePricingOverride(storePricing: StorePricing[], storeId: string, productId: string): StorePricing | undefined {

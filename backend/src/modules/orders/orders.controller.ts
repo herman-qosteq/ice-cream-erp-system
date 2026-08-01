@@ -4,16 +4,19 @@ import * as ordersService from './orders.service';
 import { ApiError } from '../../utils/ApiError';
 import { isPaginationRequested } from '../../utils/pagination';
 
+const orderItemSchema = z.object({
+  product_id: z.string().min(1),
+  quantity: z.number().int().min(0),
+  quantity_pieces: z.number().int().min(0).default(0),
+  unit_price: z.number().nonnegative(),
+  tax_pct: z.number().nonnegative(),
+}).refine(i => i.quantity > 0 || i.quantity_pieces > 0, { message: 'Quantity must be greater than zero' });
+
 const orderSchema = z.object({
   store_id: z.string().min(1),
   salesperson_id: z.string().min(1),
   truck_id: z.string().min(1).optional(),
-  items: z.array(z.object({
-    product_id: z.string().min(1),
-    quantity: z.number().positive(),
-    unit_price: z.number().nonnegative(),
-    tax_pct: z.number().nonnegative(),
-  })).min(1, 'Please add at least one ice cream item to create an order.'),
+  items: z.array(orderItemSchema).min(1, 'Please add at least one ice cream item to create an order.'),
 });
 
 const settleSchema = z.object({
@@ -22,12 +25,7 @@ const settleSchema = z.object({
 });
 
 const editOrderSchema = z.object({
-  items: z.array(z.object({
-    product_id: z.string().min(1),
-    quantity: z.number().positive(),
-    unit_price: z.number().nonnegative(),
-    tax_pct: z.number().nonnegative(),
-  })).min(1, 'An order must have at least one item.'),
+  items: z.array(orderItemSchema).min(1, 'An order must have at least one item.'),
 });
 
 function parseOr400<S extends z.ZodTypeAny>(schema: S, body: unknown): z.infer<S> {

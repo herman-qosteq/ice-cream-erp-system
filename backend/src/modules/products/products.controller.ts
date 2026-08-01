@@ -18,6 +18,7 @@ const productSchema = z.object({
   status: z.enum(['Active', 'Inactive']).default('Active'),
   unit_value: z.number().nonnegative(),
   unit_type: z.enum(['ml', 'L', 'g', 'kg', 'pcs']),
+  pieces_per_box: z.number().int().positive().default(1),
 });
 
 const priceSchema = z.object({

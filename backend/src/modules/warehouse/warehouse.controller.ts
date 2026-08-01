@@ -2,21 +2,22 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import * as warehouseService from './warehouse.service';
 import { ApiError } from '../../utils/ApiError';
+import { qtySchema, positiveQtySchema } from '../../utils/pieceQtySchema';
 
 const adjustSchema = z.object({
   product_id: z.string().min(1),
   type: z.enum(['available_qty', 'reserved_qty', 'damaged_qty', 'expired_qty']),
   direction: z.enum(['add', 'subtract']),
-  qty: z.number().positive(),
+  qty: positiveQtySchema,
   reason: z.string().default(''),
 });
 
 const correctSchema = z.object({
   product_id: z.string().min(1),
-  available_qty: z.number().min(0),
-  reserved_qty: z.number().min(0),
-  damaged_qty: z.number().min(0),
-  expired_qty: z.number().min(0),
+  available_qty: qtySchema,
+  reserved_qty: qtySchema,
+  damaged_qty: qtySchema,
+  expired_qty: qtySchema,
   comment: z.string().default(''),
 });
 

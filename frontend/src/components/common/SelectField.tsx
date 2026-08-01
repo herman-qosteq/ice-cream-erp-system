@@ -1,6 +1,12 @@
 import React, { useState } from 'react';
-import { View, Text, Pressable, Modal, FlatList, TextInput } from 'react-native';
+import { View, Text, Pressable, Modal, FlatList, TextInput, Platform } from 'react-native';
 import { ChevronDown, Check, X, Search } from 'lucide-react-native';
+
+// The mobile bottom-sheet treatment below (full-screen scrim + panel pinned
+// to the bottom edge, sized as a % of screen height) reads fine on a phone
+// but looks wrong in a large desktop window on Windows - so Windows alone
+// gets a centered, fixed-size dialog instead. Mobile/web are untouched.
+const isWindows = Platform.OS === 'windows';
 
 export interface SelectOption {
   label: string;
@@ -49,8 +55,12 @@ export default function SelectField({ value, onValueChange, options, title, clas
       </Pressable>
 
       <Modal visible={open} transparent animationType="fade" onRequestClose={close}>
-        <Pressable className="flex-1 bg-slate-900/50 justify-end" onPress={close}>
-          <Pressable className={`bg-white rounded-t-3xl ${isSearchable ? 'h-[70%]' : 'max-h-[70%]'}`} onPress={(e) => e.stopPropagation()}>
+        <Pressable className={`flex-1 bg-slate-900/50 ${isWindows ? 'items-center justify-center' : 'justify-end'}`} onPress={close}>
+          <Pressable
+            className={isWindows ? 'bg-white rounded-2xl w-[420px]' : `bg-white rounded-t-3xl ${isSearchable ? 'h-[70%]' : 'max-h-[70%]'}`}
+            style={isWindows ? { maxHeight: 500 } : undefined}
+            onPress={(e) => e.stopPropagation()}
+          >
             <View className="flex-row items-center justify-between p-4 border-b border-slate-100">
               <Text className="font-extrabold text-slate-800 text-sm">{title ?? 'Select an option'}</Text>
               <Pressable onPress={close} hitSlop={8}>

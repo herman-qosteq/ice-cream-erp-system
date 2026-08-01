@@ -1,6 +1,6 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
-import { parsePageParams, parseDateRangeParams, buildPagedResult } from '../../utils/pagination';
+import { parsePageParams, parseDateRangeParams, buildPagedResult, containsInsensitive } from '../../utils/pagination';
 
 export async function listNotifications() {
   return prisma.appNotification.findMany({ orderBy: { created_at: 'desc' } });
@@ -10,6 +10,10 @@ function buildNotificationsWhere(query: Record<string, unknown>): Prisma.AppNoti
   const { from, to } = parseDateRangeParams(query);
   const and: Prisma.AppNotificationWhereInput[] = [];
   if (from || to) and.push({ created_at: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } });
+
+  const search = typeof query.search === 'string' ? query.search.trim() : '';
+  if (search) and.push({ message: containsInsensitive(search) });
+
   return and.length ? { AND: and } : {};
 }
 

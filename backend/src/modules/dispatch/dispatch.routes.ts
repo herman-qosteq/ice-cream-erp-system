@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { asyncHandler } from '../../middleware/asyncHandler';
-import { requireAuth, requireRole } from '../../middleware/auth';
+import { requireAuth, requireAnyScreenAccess } from '../../middleware/auth';
+import { WAREHOUSE_CLUSTER_SCREENS } from '../../lib/permissions';
 import * as dispatchController from './dispatch.controller';
 
 export const dispatchRouter = Router();
@@ -11,8 +12,11 @@ dispatchRouter.use(requireAuth);
 dispatchRouter.get('/trucks/inventory', asyncHandler(dispatchController.listAllTruckInventory));
 dispatchRouter.get('/trucks/:truckId/inventory', asyncHandler(dispatchController.listTruckInventory));
 
-// Only Admin/Warehouse actually load/return/transfer cargo (matches AdminWarehouse.tsx being the only caller).
-dispatchRouter.post('/load', requireRole('Admin', 'Warehouse'), asyncHandler(dispatchController.load));
-dispatchRouter.post('/trucks/:truckId/return', requireRole('Admin', 'Warehouse'), asyncHandler(dispatchController.returnStock));
-dispatchRouter.post('/trucks/:truckId/return-all', requireRole('Admin', 'Warehouse'), asyncHandler(dispatchController.returnAll));
-dispatchRouter.post('/transfer', requireRole('Admin', 'Warehouse'), asyncHandler(dispatchController.transfer));
+// Native Admin/Warehouse (individually revocable per operator), plus any
+// operator individually granted one of the screens AdminWarehouse.tsx
+// renders (matches it being the only caller).
+const requireWarehouseAccess = requireAnyScreenAccess(...WAREHOUSE_CLUSTER_SCREENS);
+dispatchRouter.post('/load', requireWarehouseAccess, asyncHandler(dispatchController.load));
+dispatchRouter.post('/trucks/:truckId/return', requireWarehouseAccess, asyncHandler(dispatchController.returnStock));
+dispatchRouter.post('/trucks/:truckId/return-all', requireWarehouseAccess, asyncHandler(dispatchController.returnAll));
+dispatchRouter.post('/transfer', requireWarehouseAccess, asyncHandler(dispatchController.transfer));

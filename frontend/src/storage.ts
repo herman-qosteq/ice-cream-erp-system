@@ -1,12 +1,13 @@
 import AsyncStorage from './utils/asyncStorage';
 import {
   User, Product, Supplier, Store, Truck, WarehouseInventory, TruckInventory,
-  Order, Invoice, Payment, AppNotification, SyncQueueItem, CreditLedger, Purchase, PurchaseOrderRequest, PreBookingOrder, Category, Area, StorePricing, RolePermission
+  Order, Invoice, Payment, AppNotification, SyncQueueItem, CreditLedger, Purchase, PurchaseOrderRequest, PreBookingOrder, Category, Area, Village, StorePricing, RolePermission, UserPermission,
+  PartnerType, AssetType,
 } from './types';
 import {
-  authApi, usersApi, categoriesApi, areasApi, storePricingApi, productsApi, suppliersApi, storesApi, trucksApi,
+  authApi, usersApi, categoriesApi, areasApi, villagesApi, storePricingApi, productsApi, suppliersApi, storesApi, trucksApi,
   warehouseApi, dispatchApi, ordersApi, paymentsApi, notificationsApi, purchasesApi, purchaseOrderRequestsApi,
-  preBookingsApi, settingsApi,
+  preBookingsApi, settingsApi, partnerTypesApi, assetTypesApi,
 } from './api/endpoints';
 
 export interface ERPAuditLog {
@@ -36,6 +37,9 @@ export interface ERPData {
   products: Product[];
   categories: Category[];
   areas: Area[];
+  villages: Village[];
+  partnerTypes: PartnerType[];
+  assetTypes: AssetType[];
   storePricing: StorePricing[];
   suppliers: Supplier[];
   stores: Store[];
@@ -58,15 +62,16 @@ export interface ERPData {
   };
   auditLogs: ERPAuditLog[];
   rolePermissions: RolePermission[];
+  userPermissions: UserPermission[];
 }
 
 // Empty placeholder shown before login (no session yet, nothing to fetch).
 export function emptyErpData(): ERPData {
   return {
-    users: [], products: [], categories: [], areas: [], storePricing: [], suppliers: [], stores: [], trucks: [],
+    users: [], products: [], categories: [], areas: [], villages: [], partnerTypes: [], assetTypes: [], storePricing: [], suppliers: [], stores: [], trucks: [],
     warehouse_inventory: [], truck_inventory: [], orders: [], invoices: [], payments: [],
     notifications: [], purchases: [], purchaseOrderRequests: [], visits: [], preBookingOrders: [], syncQueue: [],
-    isOffline: false, qrCodeSettings: { image_url: '', is_enabled: true }, auditLogs: [], rolePermissions: [],
+    isOffline: false, qrCodeSettings: { image_url: '', is_enabled: true }, auditLogs: [], rolePermissions: [], userPermissions: [],
   };
 }
 
@@ -77,14 +82,17 @@ export async function loadAllData(): Promise<ERPData> {
   const syncQueue = (await AsyncStorage.getItem('erp_sync_queue')) as string | null;
 
   const [
-    users, products, categories, areas, storePricing, suppliers, stores, trucks, warehouse_inventory,
+    users, products, categories, areas, villages, partnerTypes, assetTypes, storePricing, suppliers, stores, trucks, warehouse_inventory,
     truck_inventory, orders, invoices, payments, notifications,
-    purchases, purchaseOrderRequests, visits, preBookingOrders, qrCodeSettings, auditLogs, rolePermissions,
+    purchases, purchaseOrderRequests, visits, preBookingOrders, qrCodeSettings, auditLogs, rolePermissions, userPermissions,
   ] = await Promise.all([
     usersApi.list(),
     productsApi.list(),
     categoriesApi.list(),
     areasApi.list(),
+    villagesApi.list(),
+    partnerTypesApi.list(),
+    assetTypesApi.list(),
     storePricingApi.list(),
     suppliersApi.list(),
     storesApi.list(),
@@ -102,14 +110,15 @@ export async function loadAllData(): Promise<ERPData> {
     settingsApi.getQr(),
     settingsApi.listAuditLogs(),
     settingsApi.listPermissions(),
+    settingsApi.listUserPermissions(),
   ]);
 
   return {
-    users, products, categories, areas, storePricing, suppliers, stores, trucks, warehouse_inventory,
+    users, products, categories, areas, villages, partnerTypes, assetTypes, storePricing, suppliers, stores, trucks, warehouse_inventory,
     truck_inventory, orders, invoices, payments, notifications,
     purchases, purchaseOrderRequests, visits, preBookingOrders,
     syncQueue: syncQueue ? JSON.parse(syncQueue) : [],
-    isOffline: isOfflineVal, qrCodeSettings, auditLogs, rolePermissions,
+    isOffline: isOfflineVal, qrCodeSettings, auditLogs, rolePermissions, userPermissions,
   };
 }
 

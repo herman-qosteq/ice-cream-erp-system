@@ -1,18 +1,23 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, Pressable, ScrollView } from 'react-native';
-import { Search, Plus, Edit, DollarSign, History, Trash2, AlertTriangle, Tag, Check, X, RotateCcw } from 'lucide-react-native';
+import React, { useState, useEffect, useMemo } from 'react';
+import { View, Text, TextInput, Pressable, ScrollView, Settings } from 'react-native';
+import { Search, Plus, Edit, DollarSign, History, Trash2, AlertTriangle, Tag, Check, X, RotateCcw, Settings2 } from 'lucide-react-native';
 import { ERPData, resolveActor } from '../../storage';
-import { Product, AppNotification, NotificationEntityType } from '../../types';
+import { Product, AppNotification, NotificationEntityType, Category } from '../../types';
 import ConfirmModal from '../../components/common/ConfirmModal';
 import ProductImage from '../../components/common/ProductImage';
 import DataTable, { DataTableColumn } from '../../components/common/DataTable';
 import FilterBar from '../../components/common/FilterBar';
+import ViewToggle from '../../components/common/ViewToggle';
+import EmptyState from '../../components/common/EmptyState';
+import AutocompleteInput from '../../components/common/AutocompleteInput';
 import { pickImageAsDataUri } from '../../utils/imagePicker';
 import { useAppContext } from '../../context/AppContext';
 import { useViewMode } from '../../context/ViewModeContext';
 import { useResetScrollOnChange } from '../../context/ScrollResetContext';
+import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 import { categoriesApi, productsApi } from '../../api/endpoints';
-import { isRetailPricingEnabled, discountFromPrice } from '../../utils/pricing';
+import { discountFromPrice, boxMrpFromMrp, mrpFromBoxMrp } from '../../utils/pricing';
+import { isRetailPricingEnabled } from '../../utils/permissions';
 
 const UNIT_OPTIONS: Product['unit_type'][] = ['ml', 'L', 'g', 'kg', 'pcs'];
 
@@ -62,10 +67,12 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     mrp: 2.0, purchase_discount_pct: 50, wholesale_discount_pct: 37.5, retail_discount_pct: 0, tax_pct: 12, status: 'Active' as 'Active' | 'Inactive',
     purchase_price: priceFromDiscount(2.0, 50), wholesale_price: priceFromDiscount(2.0, 37.5), retail_price: priceFromDiscount(2.0, 0),
     unit_value: 1, unit_type: 'pcs' as Product['unit_type'],
+    pieces_per_box: 1,
+    box_mrp: boxMrpFromMrp(2.0, 1),
     image_url: ''
   });
 
-  const [priceUpdateForm, setPriceUpdateForm] = useState({ mrp: 0, purchase_discount_pct: 0, wholesale_discount_pct: 0, retail_discount_pct: 0, purchase_price: 0, wholesale_price: 0, retail_price: 0 });
+  const [priceUpdateForm, setPriceUpdateForm] = useState({ mrp: 0, box_mrp: 0, purchase_discount_pct: 0, wholesale_discount_pct: 0, retail_discount_pct: 0, purchase_price: 0, wholesale_price: 0, retail_price: 0 });
 
   // Discount percentages above 100 would make priceFromDiscount go negative,
   // so typed input is clamped to 100 and the admin is told why.
@@ -83,12 +90,36 @@ export default function AdminProducts({ data, setData, addNotification, currentU
   // % recomputes just that price; editing a price recomputes just that %
   // (via discountFromPrice). Price fields hold the raw typed number (no
   // forced rounding) so typing isn't fought by the round-trip through %.
+  //
+  // Box MRP is kept two-way synced with MRP (Piece Price) the same way,
+  // using pieces_per_box as the conversion factor: editing MRP recomputes
+  // Box MRP (mrp * pieces_per_box), editing Box MRP recomputes MRP
+  // (box_mrp / pieces_per_box) plus the three discount-derived prices, and
+  // editing Pieces per Box recomputes Box MRP from the unchanged MRP.
   const updateProductFormMrp = (mrp: number) => {
     setProductForm(prev => ({
       ...prev, mrp,
+      box_mrp: boxMrpFromMrp(mrp, prev.pieces_per_box),
       purchase_price: parseFloat(priceFromDiscount(mrp, prev.purchase_discount_pct).toFixed(2)),
       wholesale_price: parseFloat(priceFromDiscount(mrp, prev.wholesale_discount_pct).toFixed(2)),
       retail_price: parseFloat(priceFromDiscount(mrp, prev.retail_discount_pct).toFixed(2)),
+    }));
+  };
+  const updateProductFormBoxMrp = (boxMrp: number) => {
+    setProductForm(prev => {
+      const mrp = mrpFromBoxMrp(boxMrp, prev.pieces_per_box);
+      return {
+        ...prev, mrp, box_mrp: boxMrp,
+        purchase_price: parseFloat(priceFromDiscount(mrp, prev.purchase_discount_pct).toFixed(2)),
+        wholesale_price: parseFloat(priceFromDiscount(mrp, prev.wholesale_discount_pct).toFixed(2)),
+        retail_price: parseFloat(priceFromDiscount(mrp, prev.retail_discount_pct).toFixed(2)),
+      };
+    });
+  };
+  const updateProductFormPiecesPerBox = (piecesPerBox: number) => {
+    setProductForm(prev => ({
+      ...prev, pieces_per_box: piecesPerBox,
+      box_mrp: boxMrpFromMrp(prev.mrp, piecesPerBox || 1),
     }));
   };
   const updateProductFormPct = (field: 'purchase' | 'wholesale' | 'retail', pct: number) => {
@@ -106,9 +137,24 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     }));
   };
 
+  // Price Update / "Pricing" screen mirrors the same MRP <-> Box MRP sync,
+  // using the selected product's (fixed, non-editable here) pieces_per_box
+  // as the conversion factor.
   const updatePriceUpdateFormMrp = (mrp: number) => {
+    const piecesPerBox = selectedProduct?.pieces_per_box || 1;
     setPriceUpdateForm(prev => ({
       ...prev, mrp,
+      box_mrp: boxMrpFromMrp(mrp, piecesPerBox),
+      purchase_price: parseFloat(priceFromDiscount(mrp, prev.purchase_discount_pct).toFixed(2)),
+      wholesale_price: parseFloat(priceFromDiscount(mrp, prev.wholesale_discount_pct).toFixed(2)),
+      retail_price: parseFloat(priceFromDiscount(mrp, prev.retail_discount_pct).toFixed(2)),
+    }));
+  };
+  const updatePriceUpdateFormBoxMrp = (boxMrp: number) => {
+    const piecesPerBox = selectedProduct?.pieces_per_box || 1;
+    const mrp = mrpFromBoxMrp(boxMrp, piecesPerBox);
+    setPriceUpdateForm(prev => ({
+      ...prev, mrp, box_mrp: boxMrp,
       purchase_price: parseFloat(priceFromDiscount(mrp, prev.purchase_discount_pct).toFixed(2)),
       wholesale_price: parseFloat(priceFromDiscount(mrp, prev.wholesale_discount_pct).toFixed(2)),
       retail_price: parseFloat(priceFromDiscount(mrp, prev.retail_discount_pct).toFixed(2)),
@@ -132,14 +178,23 @@ export default function AdminProducts({ data, setData, addNotification, currentU
   const categories = ['All', ...data.categories.filter(c => c.status === 'Active').map(c => c.name)];
   const deletedProductsCount = data.products.filter(p => p.status === 'Inactive').length;
   const inactiveCategoriesCount = data.categories.filter(c => c.status === 'Inactive').length;
-  const retailEnabled = isRetailPricingEnabled(data.rolePermissions);
+  const retailEnabled = isRetailPricingEnabled(currentUser, data.rolePermissions, data.userPermissions);
 
-  const filteredProducts = data.products.filter(p => {
-    const matchesSearch = p.name.toLowerCase().includes(productSearch.toLowerCase()) || p.code.toLowerCase().includes(productSearch.toLowerCase());
+  // Debounced so a fast typist (or someone holding backspace) doesn't
+  // re-filter and re-render the whole catalog list on every keystroke - the
+  // search box itself (productSearch) still updates instantly, only the
+  // list below lags a beat behind.
+  const debouncedProductSearch = useDebouncedValue(productSearch, 150);
+  const filteredProducts = useMemo(() => data.products.filter(p => {
+    const matchesSearch = p.name.toLowerCase().includes(debouncedProductSearch.toLowerCase()) || p.code.toLowerCase().includes(debouncedProductSearch.toLowerCase());
     const matchesCat = categoryFilter === 'All' || p.category === categoryFilter;
     const matchesTab = catalogTab === 'deleted' ? p.status === 'Inactive' : p.status === 'Active';
     return matchesSearch && matchesCat && matchesTab;
-  });
+  }), [data.products, debouncedProductSearch, categoryFilter, catalogTab]);
+  // Suggestion pool for the search box's autocomplete panel - active
+  // products only (matches what's actually findable in the current tab),
+  // deduped by AutocompleteInput/filterSuggestions itself.
+  const productSearchSuggestions = useMemo(() => data.products.filter(p => p.status === 'Active').map(p => p.name), [data.products]);
 
   const handleOpenAddProduct = () => {
     setProductForm({
@@ -147,6 +202,8 @@ export default function AdminProducts({ data, setData, addNotification, currentU
       mrp: 2.00, purchase_discount_pct: 50, wholesale_discount_pct: 37.5, retail_discount_pct: 0, tax_pct: 12, status: 'Active',
       purchase_price: priceFromDiscount(2.00, 50), wholesale_price: priceFromDiscount(2.00, 37.5), retail_price: priceFromDiscount(2.00, 0),
       unit_value: 1, unit_type: 'pcs',
+      pieces_per_box: 1,
+      box_mrp: boxMrpFromMrp(2.00, 1),
       image_url: ''
     });
     setActiveForm('add_product');
@@ -159,6 +216,8 @@ export default function AdminProducts({ data, setData, addNotification, currentU
       mrp: p.mrp, purchase_discount_pct: p.purchase_discount_pct, wholesale_discount_pct: p.wholesale_discount_pct, retail_discount_pct: p.retail_discount_pct, tax_pct: p.tax_pct, status: p.status,
       purchase_price: p.purchase_price, wholesale_price: p.wholesale_price, retail_price: p.selling_price,
       unit_value: p.unit_value, unit_type: p.unit_type,
+      pieces_per_box: p.pieces_per_box || 1,
+      box_mrp: boxMrpFromMrp(p.mrp, p.pieces_per_box || 1),
       image_url: p.image_url
     });
     setActiveForm('edit_product');
@@ -237,9 +296,15 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     }
 
     const isNew = activeForm === 'add_product';
-    // purchase_price/wholesale_price/retail_price are local display/editing
-    // convenience only - the API stores discount %'s, not prices.
-    const { purchase_price, wholesale_price, retail_price, ...payload } = productForm;
+    // purchase_price/wholesale_price/retail_price/box_mrp are local
+    // display/editing convenience only - the API stores mrp (piece price)
+    // and discount %'s; box_mrp is always re-derived server-side from
+    // mrp * pieces_per_box (see serializeProduct()).
+    const { purchase_price, wholesale_price, retail_price, box_mrp, ...payload } = productForm;
+    // Pieces per Box only ever displays blank mid-edit (see the field above) -
+    // clamp back to the minimum of 1 here rather than on every keystroke, so
+    // clearing the field to retype a new value isn't fought by the input.
+    payload.pieces_per_box = Math.max(1, Math.floor(payload.pieces_per_box) || 1);
 
     try {
       if (isNew) {
@@ -297,7 +362,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
   const handleOpenPriceUpdate = (p: Product) => {
     setSelectedProduct(p);
     setPriceUpdateForm({
-      mrp: p.mrp, purchase_discount_pct: p.purchase_discount_pct, wholesale_discount_pct: p.wholesale_discount_pct, retail_discount_pct: p.retail_discount_pct,
+      mrp: p.mrp, box_mrp: boxMrpFromMrp(p.mrp, p.pieces_per_box || 1), purchase_discount_pct: p.purchase_discount_pct, wholesale_discount_pct: p.wholesale_discount_pct, retail_discount_pct: p.retail_discount_pct,
       purchase_price: p.purchase_price, wholesale_price: p.wholesale_price, retail_price: p.selling_price,
     });
     setActiveForm('price_history');
@@ -322,7 +387,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
         retail_discount_pct: Number(priceUpdateForm.retail_discount_pct),
       });
       await refreshData();
-      addNotification('product_update', `${selectedProduct.name} price changed: MRP Rs${oldMrp.toFixed(2)} to Rs${newMrp.toFixed(2)} (purchase Rs${oldPurchase.toFixed(2)} to Rs${newPurchase.toFixed(2)}, wholesale Rs${oldWholesale.toFixed(2)} to Rs${newWholesale.toFixed(2)}, selling Rs${oldSelling.toFixed(2)} to Rs${newSelling.toFixed(2)}).`, 'product', selectedProduct.id);
+      addNotification('product_update', `${selectedProduct.name} price changed: MRP Rs. ${oldMrp.toFixed(2)} to Rs. ${newMrp.toFixed(2)} (purchase Rs. ${oldPurchase.toFixed(2)} to Rs. ${newPurchase.toFixed(2)}, wholesale Rs. ${oldWholesale.toFixed(2)} to Rs. ${newWholesale.toFixed(2)}, selling Rs. ${oldSelling.toFixed(2)} to Rs. ${newSelling.toFixed(2)}).`, 'product', selectedProduct.id);
       showAlert('Active prices updated successfully and logged in audit history.');
       setActiveForm('list');
     } catch (e: any) {
@@ -336,14 +401,15 @@ export default function AdminProducts({ data, setData, addNotification, currentU
     <View className="gap-4">
       {activeForm === 'list' && (
         <View className="gap-3">
-          <View className="flex-row items-center gap-2">
+          <View className="flex-row items-center gap-2 z-20">
             <View className="flex-1 lg:max-w-sm relative justify-center">
               <View className="absolute left-3 z-10">
                 <Search size={16} color="#94a3b8" />
               </View>
-              <TextInput
+              <AutocompleteInput
                 value={productSearch}
                 onChangeText={setProductSearch}
+                suggestions={productSearchSuggestions}
                 placeholder="Search code or flavor..."
                 placeholderTextColor="#94a3b8"
                 className="w-full bg-white border border-slate-200 pl-9 pr-4 py-2.5 text-xs rounded-xl"
@@ -352,7 +418,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             {activeScreen !== 'Pricing' && (
               <>
                 <Pressable onPress={handleOpenManageCategories} className="bg-slate-800 px-3 py-2.5 rounded-xl flex-row items-center gap-1.5 active:bg-slate-900">
-                  <Tag size={16} color="#fff" />
+                  <Settings2 size={16} color="#fff" />
                   <Text className="text-white font-bold text-xs">Categories</Text>
                 </Pressable>
                 <Pressable onPress={handleOpenAddProduct} className="bg-rose-500 p-2.5 rounded-xl active:bg-rose-600">
@@ -489,15 +555,36 @@ export default function AdminProducts({ data, setData, addNotification, currentU
               </View>
             </View>
 
+            <View>
+              <Text className="font-bold text-slate-500 mb-1 text-xs">Pieces per Box</Text>
+              <TextInput
+                keyboardType="number-pad"
+                value={productForm.pieces_per_box === 0 ? '' : String(productForm.pieces_per_box)}
+                onChangeText={v => updateProductFormPiecesPerBox(Number(v.replace(/[^0-9]/g, '')) || 0)}
+                className={inputClass}
+                placeholder="e.g. 12"
+                placeholderTextColor="#94a3b8"
+              />
+              <Text className="text-[9px] text-slate-400 mt-1">How many individual pieces are in one box/case of this product (e.g. 12). Minimum 1.</Text>
+            </View>
+
             <View className="flex-row gap-2">
               <View className="flex-1">
-                <Text className="font-bold text-slate-500 mb-1 text-xs">MRP (Rs)</Text>
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Piece MRP</Text>
                 <TextInput keyboardType="decimal-pad" value={productForm.mrp === 0 ? '' : String(productForm.mrp)} onChangeText={v => updateProductFormMrp(Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
               </View>
+              <View className="flex-1">
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Box MRP</Text>
+                <TextInput keyboardType="decimal-pad" value={productForm.box_mrp === 0 ? '' : String(productForm.box_mrp)} onChangeText={v => updateProductFormBoxMrp(Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
+                <Text className="text-[9px] text-slate-400 mt-1">= Piece MRP x Pieces per Box</Text>
+              </View>
+            </View>
+            <View className="flex-row gap-2">
               <View className="flex-1">
                 <Text className="font-bold text-slate-500 mb-1 text-xs">GST/Tax %</Text>
                 <TextInput keyboardType="decimal-pad" value={productForm.tax_pct === 0 ? '' : String(productForm.tax_pct)} onChangeText={v => setProductForm({ ...productForm, tax_pct: Number(v) || 0 })} placeholder="0" placeholderTextColor="#94a3b8" className={inputClass} />
               </View>
+              <View className="flex-1" />
             </View>
             <View className="flex-row gap-2">
               <View className="flex-1">
@@ -565,9 +652,15 @@ export default function AdminProducts({ data, setData, addNotification, currentU
 
           <View className="bg-slate-50 p-3 rounded-xl border border-slate-100 gap-3">
             <Text className="font-bold text-slate-800 text-xs">Active Current Price Parameters (Instant Update)</Text>
-            <View className="flex-1">
-              <Text className="font-bold text-slate-500 mb-1 text-xs">MRP (Rs)</Text>
-              <TextInput keyboardType="decimal-pad" value={priceUpdateForm.mrp === 0 ? '' : String(priceUpdateForm.mrp)} onChangeText={v => updatePriceUpdateFormMrp(Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-slate-800 text-xs" />
+            <View className="flex-row gap-3">
+              <View className="flex-1">
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Piece MRP</Text>
+                <TextInput keyboardType="decimal-pad" value={priceUpdateForm.mrp === 0 ? '' : String(priceUpdateForm.mrp)} onChangeText={v => updatePriceUpdateFormMrp(Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-slate-800 text-xs" />
+              </View>
+              <View className="flex-1">
+                <Text className="font-bold text-slate-500 mb-1 text-xs">Box MRP</Text>
+                <TextInput keyboardType="decimal-pad" value={priceUpdateForm.box_mrp === 0 ? '' : String(priceUpdateForm.box_mrp)} onChangeText={v => updatePriceUpdateFormBoxMrp(Number(v) || 0)} placeholder="0" placeholderTextColor="#94a3b8" className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold text-slate-800 text-xs" />
+              </View>
             </View>
             <View className="flex-row gap-3">
               <View className="flex-1">
@@ -666,52 +759,100 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             </Pressable>
           </View>
 
-          <View className="gap-2 md:flex-row md:flex-wrap">
-            {visibleCategories.map(cat => {
-              const productCount = data.products.filter(p => p.category === cat.name).length;
-              const isEditing = editingCategoryId === cat.id;
-              return (
-                <View key={cat.id} className="w-full md:w-[48%] xl:w-[32%] flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl p-2.5">
-                  {isEditing ? (
-                    <>
-                      <TextInput
-                        value={editingCategoryName}
-                        onChangeText={setEditingCategoryName}
-                        autoFocus
-                        className="flex-1 bg-white border border-indigo-200 rounded-lg p-1.5 text-xs text-slate-800"
-                      />
-                      <Pressable onPress={handleSaveEditCategory} className="p-1.5 bg-emerald-50 rounded-lg active:bg-emerald-100">
-                        <Check size={16} color="#059669" />
-                      </Pressable>
-                      <Pressable onPress={() => setEditingCategoryId(null)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
-                        <X size={16} color="#64748b" />
-                      </Pressable>
-                    </>
-                  ) : (
-                    <>
-                      <View className="flex-1">
-                        <Text className="font-bold text-slate-800 text-xs">{cat.name}</Text>
-                        <Text className="text-[9px] text-slate-400">{productCount} product{productCount === 1 ? '' : 's'}</Text>
-                      </View>
-                      {cat.status === 'Active' && (
-                        <Pressable onPress={() => handleStartEditCategory(cat.id, cat.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
-                          <Edit size={14} color="#475569" />
-                        </Pressable>
-                      )}
-                      <Pressable onPress={() => handleToggleCategoryStatus(cat)} className={`p-1.5 rounded-lg ${cat.status === 'Active' ? 'bg-rose-50 active:bg-rose-100' : 'bg-emerald-50 active:bg-emerald-100'}`}>
-                        {cat.status === 'Active' ? <Trash2 size={14} color="#e11d48" /> : <RotateCcw size={14} color="#059669" />}
-                      </Pressable>
-                    </>
-                  )}
-                </View>
-              );
-            })}
-            {visibleCategories.length === 0 && (
-              <Text className="text-[10px] text-slate-400 italic py-2 text-center">
-                {categoryListTab === 'inactive' ? 'No inactive categories.' : 'No categories yet. Add one above.'}
-              </Text>
-            )}
+          <View className="flex-row items-center justify-between">
+            <Text className="text-[10px] font-bold text-slate-400 uppercase">{visibleCategories.length} Categor{visibleCategories.length === 1 ? 'y' : 'ies'}</Text>
+            <ViewToggle />
           </View>
+
+          {viewMode === 'table' ? (
+            <DataTable
+              data={visibleCategories}
+              keyExtractor={cat => cat.id}
+              emptyText={categoryListTab === 'inactive' ? 'No inactive categories.' : 'No categories yet. Add one above.'}
+              columns={[
+                {
+                  key: 'name', label: 'Category', width: 200,
+                  render: (cat: Category) => editingCategoryId === cat.id ? (
+                    <TextInput value={editingCategoryName} onChangeText={setEditingCategoryName} autoFocus className="bg-white border border-indigo-200 rounded-lg p-1.5 text-xs text-slate-800" />
+                  ) : (
+                    <Text className="font-bold text-slate-800 text-xs" numberOfLines={1}>{cat.name}</Text>
+                  ),
+                },
+                {
+                  key: 'products', label: 'Products', width: 90, align: 'center' as const, grow: false,
+                  render: (cat: Category) => <Text className="text-[10px] text-slate-500 text-center">{data.products.filter(p => p.category === cat.name).length}</Text>,
+                },
+                {
+                  key: 'actions', label: 'Actions', width: 100, grow: false,
+                  render: (cat: Category) => {
+                    if (editingCategoryId === cat.id) {
+                      return (
+                        <View className="flex-row gap-1.5">
+                          <Pressable onPress={handleSaveEditCategory} className="p-1.5 bg-emerald-50 rounded-lg active:bg-emerald-100"><Check size={14} color="#059669" /></Pressable>
+                          <Pressable onPress={() => setEditingCategoryId(null)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200"><X size={14} color="#64748b" /></Pressable>
+                        </View>
+                      );
+                    }
+                    return (
+                      <View className="flex-row gap-1.5">
+                        {cat.status === 'Active' && (
+                          <Pressable onPress={() => handleStartEditCategory(cat.id, cat.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200"><Edit size={14} color="#475569" /></Pressable>
+                        )}
+                        <Pressable onPress={() => handleToggleCategoryStatus(cat)} className={`p-1.5 rounded-lg ${cat.status === 'Active' ? 'bg-rose-50 active:bg-rose-100' : 'bg-emerald-50 active:bg-emerald-100'}`}>
+                          {cat.status === 'Active' ? <Trash2 size={14} color="#e11d48" /> : <RotateCcw size={14} color="#059669" />}
+                        </Pressable>
+                      </View>
+                    );
+                  },
+                },
+              ] as DataTableColumn<Category>[]}
+            />
+          ) : (
+            <View className={`gap-2 md:flex-row md:flex-wrap ${visibleCategories.length === 0 ? 'flex-1' : ''}`}>
+              {visibleCategories.map(cat => {
+                const productCount = data.products.filter(p => p.category === cat.name).length;
+                const isEditing = editingCategoryId === cat.id;
+                return (
+                  <View key={cat.id} className="w-full md:w-[48%] xl:w-[32%] flex-row items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+                    {isEditing ? (
+                      <>
+                        <TextInput
+                          value={editingCategoryName}
+                          onChangeText={setEditingCategoryName}
+                          autoFocus
+                          className="flex-1 bg-white border border-indigo-200 rounded-lg p-1.5 text-xs text-slate-800"
+                        />
+                        <Pressable onPress={handleSaveEditCategory} className="p-1.5 bg-emerald-50 rounded-lg active:bg-emerald-100">
+                          <Check size={16} color="#059669" />
+                        </Pressable>
+                        <Pressable onPress={() => setEditingCategoryId(null)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                          <X size={16} color="#64748b" />
+                        </Pressable>
+                      </>
+                    ) : (
+                      <>
+                        <View className="flex-1">
+                          <Text className="font-bold text-slate-800 text-xs">{cat.name}</Text>
+                          <Text className="text-[9px] text-slate-400">{productCount} product{productCount === 1 ? '' : 's'}</Text>
+                        </View>
+                        {cat.status === 'Active' && (
+                          <Pressable onPress={() => handleStartEditCategory(cat.id, cat.name)} className="p-1.5 bg-slate-100 rounded-lg active:bg-slate-200">
+                            <Edit size={14} color="#475569" />
+                          </Pressable>
+                        )}
+                        <Pressable onPress={() => handleToggleCategoryStatus(cat)} className={`p-1.5 rounded-lg ${cat.status === 'Active' ? 'bg-rose-50 active:bg-rose-100' : 'bg-emerald-50 active:bg-emerald-100'}`}>
+                          {cat.status === 'Active' ? <Trash2 size={14} color="#e11d48" /> : <RotateCcw size={14} color="#059669" />}
+                        </Pressable>
+                      </>
+                    )}
+                  </View>
+                );
+              })}
+              {visibleCategories.length === 0 && (
+                <EmptyState message={categoryListTab === 'inactive' ? 'No inactive categories.' : 'No categories yet. Add one above.'} />
+              )}
+            </View>
+          )}
         </View>
         );
       })() : viewMode === 'table' ? (
@@ -738,10 +879,19 @@ export default function AdminProducts({ data, setData, addNotification, currentU
             { key: 'category', label: 'Category', width: 110, render: (p: Product) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{p.category}</Text> },
             { key: 'brand', label: 'Brand', width: 110, render: (p: Product) => <Text className="text-[10px] text-slate-600" numberOfLines={1}>{p.brand}</Text> },
             { key: 'unit', label: 'Unit', width: 70, render: (p: Product) => <Text className="text-[10px] text-slate-600">{p.unit_value}{p.unit_type}</Text> },
-            { key: 'mrp', label: 'MRP', width: 80, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-bold text-slate-700 text-right">Rs{p.mrp.toFixed(2)}</Text> },
-            { key: 'purchase', label: 'Purchase', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-semibold text-slate-600 text-right">Rs{p.purchase_price.toFixed(2)}</Text> },
-            { key: 'wholesale', label: 'Wholesale', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-semibold text-emerald-600 text-right">Rs{p.wholesale_price.toFixed(2)}</Text> },
-            ...(retailEnabled ? [{ key: 'selling', label: 'Selling', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-extrabold text-rose-500 text-right">Rs{p.selling_price.toFixed(2)}</Text> }] : []),
+            { key: 'pieces_per_box', label: 'Box/Pcs', width: 100, align: 'center' as const, render: (p: Product) => <Text className="text-[10px] text-slate-600 text-center">1 box ({p.pieces_per_box}pcs)</Text> },
+            {
+              key: 'mrp', label: 'Box/Pc MRP', width: 100, align: 'right' as const,
+              render: (p: Product) => (
+                <View className="items-end">
+                  <Text className="text-[10px] font-bold text-slate-700">Box Rs. {p.box_mrp.toFixed(2)}</Text>
+                  <Text className="text-[9px] text-slate-400">Pc Rs. {p.mrp.toFixed(2)}</Text>
+                </View>
+              ),
+            },
+            { key: 'purchase', label: 'Purchase', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-semibold text-slate-600 text-right">Rs. {p.purchase_price.toFixed(2)}</Text> },
+            { key: 'wholesale', label: 'Wholesale', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-semibold text-emerald-600 text-right">Rs. {p.wholesale_price.toFixed(2)}</Text> },
+            ...(retailEnabled ? [{ key: 'selling', label: 'Selling', width: 90, align: 'right' as const, render: (p: Product) => <Text className="text-[10px] font-extrabold text-rose-500 text-right">Rs. {p.selling_price.toFixed(2)}</Text> }] : []),
             {
               key: 'stock', label: 'Stock', width: 100,
               render: (p: Product) => {
@@ -786,7 +936,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
           ]) as DataTableColumn<Product>[]}
         />
       ) : (
-        <View className="gap-3 md:flex-row md:flex-wrap">
+        <View className={`gap-3 md:flex-row md:flex-wrap ${filteredProducts.length === 0 ? 'flex-1' : ''}`}>
           {filteredProducts.map(p => {
             const wh = data.warehouse_inventory.find(i => i.product_id === p.id);
             const qty = wh ? wh.available_qty : 0;
@@ -806,30 +956,30 @@ export default function AdminProducts({ data, setData, addNotification, currentU
                     </View>
                   </View>
 
-                  <Text className="text-[10px] text-slate-400" numberOfLines={1}>{p.brand} - {p.category} - {p.unit_value}{p.unit_type}</Text>
+                  <Text className="text-[10px] text-slate-400" numberOfLines={1}>{p.brand} - {p.category} - {p.unit_value}{p.unit_type} - {p.pieces_per_box} pcs/box</Text>
 
                   <View className="pt-1.5 border-t border-slate-50 gap-1.5">
                  
                     <View className="flex-row justify-between">
                       <View className="flex-1 items-start">
                         <Text className="text-slate-400 text-[9px]" numberOfLines={1}>Purchase</Text>
-                        <Text className="font-semibold text-slate-600 text-[10px]" numberOfLines={1}>Rs {p.purchase_price.toFixed(2)}</Text>
+                        <Text className="font-semibold text-slate-600 text-[10px]" numberOfLines={1}>Rs. {p.purchase_price.toFixed(2)}</Text>
                       </View>
                       <View className={`flex-1 ${retailEnabled ? 'items-center' : 'items-end'}`}>
                         <Text className="text-slate-400 text-[9px]" numberOfLines={1}>Wholesale</Text>
-                        <Text className="font-semibold text-emerald-600 text-[10px]" numberOfLines={1}>Rs {p.wholesale_price.toFixed(2)}</Text>
+                        <Text className="font-semibold text-emerald-600 text-[10px]" numberOfLines={1}>Rs. {p.wholesale_price.toFixed(2)}</Text>
                       </View>
                       {retailEnabled && (
                         <View className="flex-1 items-end">
                           <Text className="text-slate-400 text-[9px]" numberOfLines={1}>Selling</Text>
-                          <Text className="font-extrabold text-rose-500 text-[10px]" numberOfLines={1}>Rs {p.selling_price.toFixed(2)}</Text>
+                          <Text className="font-extrabold text-rose-500 text-[10px]" numberOfLines={1}>Rs. {p.selling_price.toFixed(2)}</Text>
                         </View>
                       )}
                     </View>
 
                     <View className="flex-row items-center justify-between gap-1.5">
                          <View className="flex-row items-center justify-between gap-2">
-                      <Text className="text-[9px] font-bold text-slate-500 flex-shrink-0">MRP Rs{p.mrp.toFixed(2)}</Text>
+                      <Text className="text-[9px] font-bold text-slate-500 flex-shrink-0">Pc MRP Rs. {p.mrp.toFixed(2)} (Box Rs. {p.box_mrp.toFixed(2)})</Text>
                       {isOut ? (
                         <Text className="text-[8px] bg-red-100 text-red-600 font-extrabold px-1.5 py-0.5 rounded-md uppercase flex-shrink-0">Out of Stock (OOS)</Text>
                       ) : isLow ? (
@@ -869,11 +1019,7 @@ export default function AdminProducts({ data, setData, addNotification, currentU
           })}
 
           {filteredProducts.length === 0 && (
-            <View className="py-8 items-center bg-white rounded-2xl border border-slate-100">
-              <Text className="text-xs text-slate-400">
-                {catalogTab === 'deleted' ? 'No deleted products. Anything you remove from the catalog will show up here for restoring.' : 'No ice cream products found matching the filters.'}
-              </Text>
-            </View>
+            <EmptyState message={catalogTab === 'deleted' ? 'No deleted products. Anything you remove from the catalog will show up here for restoring.' : 'No ice cream products found matching the filters.'} />
           )}
         </View>
       )}

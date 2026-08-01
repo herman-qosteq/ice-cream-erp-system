@@ -3,6 +3,7 @@ import { prisma } from '../../lib/prisma';
 import { logAudit } from '../../lib/audit';
 import { num, dateOnly } from '../../utils/serialize';
 import { ApiError } from '../../utils/ApiError';
+import { formatQty } from '../../utils/pieceQty';
 
 const productInclude = { category: true, scheduled_prices: true } satisfies Prisma.ProductInclude;
 type ProductWithCategory = Prisma.ProductGetPayload<{ include: typeof productInclude }>;
@@ -38,10 +39,14 @@ function serializeProduct(p: ProductWithCategory) {
     purchase_price: priceFromDiscount(mrp, purchase_discount_pct),
     wholesale_price: priceFromDiscount(mrp, wholesale_discount_pct),
     selling_price: priceFromDiscount(mrp, retail_discount_pct),
+    // Box MRP is never independently stored - it's pieces_per_box copies of
+    // the per-piece mrp, so it's always derived here and can't drift.
+    box_mrp: parseFloat((mrp * p.pieces_per_box).toFixed(2)),
     tax_pct: num(p.tax_pct),
     status: p.status,
     unit_value: num(p.unit_value),
     unit_type: p.unit_type,
+    pieces_per_box: p.pieces_per_box,
     expiry_date: dateOnly(p.expiry_date),
     scheduled_prices: p.scheduled_prices.map(sp => ({
       id: sp.id,
@@ -79,6 +84,7 @@ interface ProductInput {
   status: 'Active' | 'Inactive';
   unit_value: number;
   unit_type: 'ml' | 'L' | 'g' | 'kg' | 'pcs';
+  pieces_per_box: number;
 }
 
 export async function createProduct(input: ProductInput, actorId: string) {
@@ -121,7 +127,7 @@ export async function updatePrice(id: string, pricing: { mrp: number; purchase_d
   const newPurchase = priceFromDiscount(pricing.mrp, pricing.purchase_discount_pct);
   const newWholesale = priceFromDiscount(pricing.mrp, pricing.wholesale_discount_pct);
   const newSelling = priceFromDiscount(pricing.mrp, pricing.retail_discount_pct);
-  const details = `Immediate Price Update: MRP changed from Rs${existing.mrp} to Rs${pricing.mrp}. Purchase Price changed from Rs${oldPurchase} to Rs${newPurchase}, Wholesale Price from Rs${oldWholesale} to Rs${newWholesale}, Selling Price from Rs${oldSelling} to Rs${newSelling}`;
+  const details = `Immediate Price Update: MRP changed from Rs. ${num(existing.mrp).toFixed(2)} to Rs. ${num(pricing.mrp).toFixed(2)}. Purchase Price changed from Rs. ${oldPurchase.toFixed(2)} to Rs. ${newPurchase.toFixed(2)}, Wholesale Price from Rs. ${oldWholesale.toFixed(2)} to Rs. ${newWholesale.toFixed(2)}, Selling Price from Rs. ${oldSelling.toFixed(2)} to Rs. ${newSelling.toFixed(2)}`;
   await logAudit({ action: 'PRICE_UPDATE', entity_type: 'Product', entity_id: id, user_id: actorId, details });
   return serializeProduct(product);
 }
@@ -132,11 +138,11 @@ export async function setStatus(id: string, status: 'Active' | 'Inactive', actor
 
   if (status === 'Inactive') {
     const wh = await prisma.warehouseInventory.findUnique({ where: { product_id: id } });
-    const warehouseUnits = wh ? wh.available_qty + wh.reserved_qty + wh.damaged_qty + wh.expired_qty : 0;
-    const truckUnits = await prisma.truckInventory.aggregate({ where: { product_id: id }, _sum: { quantity: true } });
-    const truckQty = truckUnits._sum.quantity ?? 0;
-    if (warehouseUnits + truckQty > 0) {
-      throw ApiError.conflict(`Cannot remove ${product.name}: it still has ${warehouseUnits} unit(s) in the warehouse and ${truckQty} unit(s) on trucks. Clear or transfer that stock first so it isn't lost from your inventory reports.`);
+    const warehouseQty = { boxes: wh ? wh.available_qty + wh.reserved_qty + wh.damaged_qty + wh.expired_qty : 0, pieces: wh ? wh.available_pieces + wh.reserved_pieces + wh.damaged_pieces + wh.expired_pieces : 0 };
+    const truckAgg = await prisma.truckInventory.aggregate({ where: { product_id: id }, _sum: { quantity: true, quantity_pieces: true } });
+    const truckQty = { boxes: truckAgg._sum.quantity ?? 0, pieces: truckAgg._sum.quantity_pieces ?? 0 };
+    if (warehouseQty.boxes > 0 || warehouseQty.pieces > 0 || truckQty.boxes > 0 || truckQty.pieces > 0) {
+      throw ApiError.conflict(`Cannot remove ${product.name}: it still has ${formatQty(warehouseQty)} in the warehouse and ${formatQty(truckQty)} on trucks. Clear or transfer that stock first so it isn't lost from your inventory reports.`);
     }
   }
 

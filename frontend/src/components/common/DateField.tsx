@@ -1,6 +1,10 @@
 import React, { useState } from 'react';
-import { View, Text, Pressable, Modal } from 'react-native';
+import { View, Text, Pressable, Modal, Platform } from 'react-native';
 import { Calendar, ChevronLeft, ChevronRight, X } from 'lucide-react-native';
+
+// See SelectField.tsx - same mobile-bottom-sheet-looks-wrong-on-desktop fix,
+// Windows only.
+const isWindows = Platform.OS === 'windows';
 
 interface DateFieldProps {
   value: string;
@@ -98,8 +102,8 @@ export default function DateField({ value, onValueChange, title, placeholder, cl
       </Pressable>
 
       <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
-        <Pressable className="flex-1 bg-slate-900/50 justify-end" onPress={() => setOpen(false)}>
-          <Pressable className="bg-white rounded-t-3xl" onPress={(e) => e.stopPropagation()}>
+        <Pressable className={`flex-1 bg-slate-900/50 ${isWindows ? 'items-center justify-center' : 'justify-end'}`} onPress={() => setOpen(false)}>
+          <Pressable className={isWindows ? 'bg-white rounded-2xl w-[360px]' : 'bg-white rounded-t-3xl'} onPress={(e) => e.stopPropagation()}>
             <View className="flex-row items-center justify-between p-4 border-b border-slate-100">
               <Text className="font-extrabold text-slate-800 text-sm">{title ?? 'Select a date'}</Text>
               <Pressable onPress={() => setOpen(false)} hitSlop={8}>

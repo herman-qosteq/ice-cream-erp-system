@@ -1,8 +1,12 @@
 import React, { useState } from 'react';
-import { View, Text, Pressable, Modal } from 'react-native';
+import { View, Text, Pressable, Modal, Platform } from 'react-native';
 import { Calendar, ChevronDown, Check, X, ChevronLeft } from 'lucide-react-native';
 import DateField from './DateField';
 import { DateFilterMode } from '../../utils/dateFilter';
+
+// See SelectField.tsx - same mobile-bottom-sheet-looks-wrong-on-desktop fix,
+// Windows only.
+const isWindows = Platform.OS === 'windows';
 
 interface DateRangeFilterFieldProps {
   mode: DateFilterMode;
@@ -81,8 +85,8 @@ export default function DateRangeFilterField({ mode, onModeChange, customFrom, c
       </Pressable>
 
       <Modal visible={open} transparent animationType="fade" onRequestClose={close}>
-        <Pressable className="flex-1 bg-slate-900/50 justify-end" onPress={close}>
-          <Pressable className="bg-white rounded-t-3xl" onPress={(e) => e.stopPropagation()}>
+        <Pressable className={`flex-1 bg-slate-900/50 ${isWindows ? 'items-center justify-center' : 'justify-end'}`} onPress={close}>
+          <Pressable className={isWindows ? 'bg-white rounded-2xl w-[360px]' : 'bg-white rounded-t-3xl'} onPress={(e) => e.stopPropagation()}>
             <View className="flex-row items-center justify-between p-4 border-b border-slate-100">
               <View className="flex-row items-center gap-2">
                 {showCustomStep && (

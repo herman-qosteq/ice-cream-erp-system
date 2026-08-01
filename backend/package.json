@@ -14,7 +14,10 @@
     "db:seed": "prisma db seed",
     "build": "tsc -p .",
     "start": "node dist/server.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "test:smoke": "node --require ts-node/register/transpile-only --test src/app.smoke.test.ts",
+    "test:smoke:api": "node --require ts-node/register/transpile-only --test src/api.smoke.test.ts",
+    "test:smoke:all": "node --require ts-node/register/transpile-only --test src/app.smoke.test.ts src/api.smoke.test.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.20.0",

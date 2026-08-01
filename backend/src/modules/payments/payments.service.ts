@@ -33,6 +33,11 @@ function buildPaymentsWhere(query: Record<string, unknown>): Prisma.PaymentWhere
     });
   }
 
+  // partner_type is never denormalized onto Payment - always read via the
+  // existing store_id join, same as the store name/owner_name search above.
+  const partnerType = typeof query.partnerType === 'string' && query.partnerType !== 'All' ? query.partnerType : '';
+  if (partnerType) and.push({ store: { partner_type: partnerType } });
+
   return and.length ? { AND: and } : {};
 }
 
@@ -113,6 +118,6 @@ export async function recordPayment(input: { store_id: string; invoice_id?: stri
     return firstPayment!;
   });
 
-  await logAudit({ action: 'PAYMENT_RECEIVE', entity_type: 'Store', entity_id: input.store_id, user_id: actorId, details: `Received payment of Rs${actualCollection.toFixed(2)} via ${input.method} from ${store.name}` });
+  await logAudit({ action: 'PAYMENT_RECEIVE', entity_type: 'Store', entity_id: input.store_id, user_id: actorId, details: `Received payment of Rs. ${actualCollection.toFixed(2)} via ${input.method} from ${store.name}` });
   return { payment: serializePayment(result), actualCollection };
 }

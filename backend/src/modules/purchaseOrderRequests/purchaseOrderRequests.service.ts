@@ -5,12 +5,13 @@ import { ApiError } from '../../utils/ApiError';
 interface RequestItemInput {
   product_id: string;
   order_case: number;
+  order_case_pieces?: number;
 }
 
 function serializeRequest(r: {
   id: string; order_ref: string; supplier_id: string; status: string; created_at: Date;
   fulfilled_purchase_id: string | null;
-  items: { product_id: string; order_case: number }[];
+  items: { product_id: string; order_case: number; order_case_pieces: number }[];
 }) {
   return {
     id: r.id,
@@ -19,7 +20,7 @@ function serializeRequest(r: {
     status: r.status,
     created_at: r.created_at,
     fulfilled_purchase_id: r.fulfilled_purchase_id ?? undefined,
-    items: r.items.map(i => ({ product_id: i.product_id, order_case: i.order_case })),
+    items: r.items.map(i => ({ product_id: i.product_id, order_case: i.order_case, order_case_pieces: i.order_case_pieces })),
   };
 }
 
@@ -36,7 +37,7 @@ export async function createPurchaseOrderRequest(input: { order_ref: string; sup
     data: {
       order_ref: input.order_ref,
       supplier_id: input.supplier_id,
-      items: { create: input.items.map(i => ({ product_id: i.product_id, order_case: i.order_case })) },
+      items: { create: input.items.map(i => ({ product_id: i.product_id, order_case: i.order_case, order_case_pieces: i.order_case_pieces ?? 0 })) },
     },
     include: { items: true },
   });
@@ -67,7 +68,7 @@ export async function updatePurchaseOrderRequest(
       where: { id },
       data: {
         supplier_id: input.supplier_id,
-        items: { create: input.items.map(i => ({ product_id: i.product_id, order_case: i.order_case })) },
+        items: { create: input.items.map(i => ({ product_id: i.product_id, order_case: i.order_case, order_case_pieces: i.order_case_pieces ?? 0 })) },
       },
       include: { items: true },
     });

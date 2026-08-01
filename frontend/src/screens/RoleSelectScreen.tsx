@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, Pressable, Image, ScrollView, KeyboardAvoidingView, Platform } from 'react-native';
 import { LogIn, Lock, Phone, Eye, EyeOff } from 'lucide-react-native';
 import { User } from '../types';
+import BrandLogo from '../components/common/BrandLogo';
 
 interface RoleSelectProps {
   login: (identifier: string, password: string) => Promise<{ ok: boolean; error?: string }>;
@@ -52,7 +53,7 @@ export default function RoleSelectScreen({ login, setCurrentUser }: RoleSelectPr
         {/* Top Brand Logo */}
         <View className="items-center mt-4 md:mt-0">
           <View className="w-20 h-20 bg-white rounded-full items-center justify-center relative border border-white/50 mb-4 md:shadow-sm">
-            <Text className="text-4xl">🍦</Text>
+            <BrandLogo className="text-4xl" size={56} />
             <View className="absolute -bottom-1 -right-1 bg-blue-100 px-2 py-0.5 rounded-full border border-white shadow-sm">
               <Text className="text-blue-700 font-bold text-[9px]">ERP</Text>
             </View>

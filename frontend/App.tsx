@@ -1,7 +1,7 @@
 import './global.css';
 import React, { useState } from 'react';
 import { View, Text, Pressable, StatusBar } from 'react-native';
-import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import GestureHandlerRootView from './src/utils/GestureRootView';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { LogOut, X, Bell } from 'lucide-react-native';
 import { AppProvider, useAppContext } from './src/context/AppContext';

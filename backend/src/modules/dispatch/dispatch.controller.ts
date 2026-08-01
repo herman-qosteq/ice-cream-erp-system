@@ -2,12 +2,13 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import * as dispatchService from './dispatch.service';
 import { ApiError } from '../../utils/ApiError';
+import { positiveQtySchema } from '../../utils/pieceQtySchema';
 
 const loadSchema = z.object({
   truck_id: z.string().min(1),
   items: z.array(z.object({
     product_id: z.string().min(1),
-    qty: z.number().positive(),
+    qty: positiveQtySchema,
     source: z.enum(['available_qty', 'reserved_qty']),
     pre_booking_id: z.string().optional(),
   })).min(1),
@@ -15,13 +16,13 @@ const loadSchema = z.object({
 
 const returnSchema = z.object({
   product_id: z.string().min(1),
-  qty: z.number().positive(),
+  qty: positiveQtySchema,
 });
 
 const transferSchema = z.object({
   from_truck_id: z.string().min(1),
   to_truck_id: z.string().min(1),
-  items: z.array(z.object({ product_id: z.string().min(1), qty: z.number().positive() })).min(1),
+  items: z.array(z.object({ product_id: z.string().min(1), qty: positiveQtySchema })).min(1),
 });
 
 function parseOr400<S extends z.ZodTypeAny>(schema: S, body: unknown): z.infer<S> {

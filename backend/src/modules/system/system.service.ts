@@ -5,7 +5,7 @@ import { logAudit } from '../../lib/audit';
 // without deleting the WarehouseInventory rows themselves.
 export async function clearWarehouseStock(actorId: string) {
   await prisma.warehouseInventory.updateMany({
-    data: { available_qty: 0, reserved_qty: 0, damaged_qty: 0, expired_qty: 0 },
+    data: { available_qty: 0, available_pieces: 0, reserved_qty: 0, reserved_pieces: 0, damaged_qty: 0, damaged_pieces: 0, expired_qty: 0, expired_pieces: 0 },
   });
   await logAudit({
     action: 'STOCK_RESET_ZERO', entity_type: 'Warehouse', entity_id: 'all', user_id: actorId,
@@ -34,11 +34,20 @@ export async function factoryReset(actorId: string) {
     await tx.purchase.deleteMany();
     await tx.creditLedger.deleteMany();
     await tx.storeVisit.deleteMany();
+    // Asset/partner inventory + movement history + assignment history all
+    // reference Store (assigned_partner_id/partner_id) and/or Asset - must be
+    // cleared before store/asset deletion below. PartnerType/AssetType are
+    // preserved (lookup/catalog data, same tier as Area/Product/Category).
+    await tx.assetAssignmentHistory.deleteMany();
+    await tx.assetInventory.deleteMany();
+    await tx.partnerInventory.deleteMany();
+    await tx.inventoryMovement.deleteMany();
+    await tx.asset.deleteMany();
     await tx.store.deleteMany();
     await tx.supplier.deleteMany();
     await tx.appNotification.deleteMany();
     await tx.truckInventory.deleteMany();
-    await tx.warehouseInventory.updateMany({ data: { available_qty: 0, reserved_qty: 0, damaged_qty: 0, expired_qty: 0 } });
+    await tx.warehouseInventory.updateMany({ data: { available_qty: 0, available_pieces: 0, reserved_qty: 0, reserved_pieces: 0, damaged_qty: 0, damaged_pieces: 0, expired_qty: 0, expired_pieces: 0 } });
     await tx.auditLog.deleteMany();
     await tx.auditLog.create({
       data: {
