@@ -860,6 +860,21 @@ model QrCodeSettings {
   @@map("qr_code_settings")
 }
 
+/// Singleton (id always 1, same pattern as QrCodeSettings above) holding the
+/// company name/GSTIN/phone/email printed on every PDF and Excel export this
+/// app generates - editable from Settings > Business Details instead of
+/// being hardcoded, so a real registered GSTIN/contact can replace the
+/// placeholder without a code change.
+model CompanyProfile {
+  id    Int    @id @default(1)
+  name  String
+  gstin String
+  phone String
+  email String
+
+  @@map("company_profile")
+}
+
 /// Admin-toggleable feature flags scoped to a role, e.g. letting Admin grant
 /// the Salesperson role access to the GST/non-GST order toggle. Absence of a
 /// row for a given (role, feature) pair means "disabled" — rows only need to

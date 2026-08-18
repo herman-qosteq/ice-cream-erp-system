@@ -266,4 +266,6 @@ export const settingsApi = {
   setUserPermissions: (userId: string, permissions: { feature: string; enabled: boolean }[]) =>
     api.patch<any>(`/settings/user-permissions/${userId}`, { permissions }),
   resetUserPermissions: (userId: string) => api.delete<any>(`/settings/user-permissions/${userId}`),
+  getCompanyProfile: () => api.get<{ name: string; gstin: string; phone: string; email: string }>('/settings/company-profile'),
+  updateCompanyProfile: (input: { name?: string; gstin?: string; phone?: string; email?: string }) => api.patch<any>('/settings/company-profile', input),
 };

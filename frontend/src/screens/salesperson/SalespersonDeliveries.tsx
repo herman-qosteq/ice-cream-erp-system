@@ -86,7 +86,7 @@ export default function SalespersonDeliveries({ data, setData, addNotification, 
     const store = data.stores.find(s => s.id === booking.store_id);
     if (!store) { showAlert('Unable to find the partner store for this pre-booking.'); return; }
     const previewWindow = openWebPreviewWindow();
-    const { html, fileName } = buildPreBookingBillPdf(booking, store, data.products);
+    const { html, fileName } = buildPreBookingBillPdf(booking, store, data.products, data.qrCodeSettings);
     await exportHtmlReport(html, fileName, showAlert, previewWindow);
   };
 

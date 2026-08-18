@@ -32,7 +32,7 @@ export type AdminScreen =
   | 'Warehouse' | 'Trucks' | 'TruckInventory' | 'MovementAudit'
   | 'Stores' | 'Orders' | 'Deliveries' | 'Invoices' | 'Payments' | 'QRCodePayment' | 'Credit' | 'Refill' | 'Inactive'
   | 'Assets'
-  | 'Users' | 'Notifications';
+  | 'Users' | 'Notifications' | 'BusinessSettings';
 
 export type SalespersonScreen = 'home' | 'inventory' | 'stores' | 'deliveries' | 'visits';
 
@@ -199,7 +199,10 @@ export const PERMISSION_REGISTRY: Record<PermissionRole, PermissionModule[]> = {
     {
       id: 'system-security',
       title: 'System & Security',
-      items: [{ key: 'Users', kind: 'screen', label: 'Operator Accounts' }],
+      items: [
+        { key: 'Users', kind: 'screen', label: 'Operator Accounts' },
+        { key: 'BusinessSettings', kind: 'screen', label: 'Business Settings' },
+      ],
     },
     {
       id: 'order-overrides',

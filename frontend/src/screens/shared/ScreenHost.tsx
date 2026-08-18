@@ -14,9 +14,12 @@ import SalespersonDeliveries from '../salesperson/SalespersonDeliveries';
 import SalespersonVisits from '../salesperson/SalespersonVisits';
 
 // Every registry key across all three roles that has a real, mountable
-// component - i.e. everything except Admin's 'Users'/'Notifications' (never
-// cross-granted, see permissionsRegistry.ts and ManagePermissionsModal.tsx).
-export type HostableScreen = Exclude<AdminScreen, 'Users' | 'Notifications'> | SalespersonScreen;
+// component - i.e. everything except Admin's 'Users'/'Notifications'/
+// 'BusinessSettings' (never cross-granted, see permissionsRegistry.ts and
+// ManagePermissionsModal.tsx - BusinessSettings holds the company's legal
+// GSTIN/contact identity, administrative in the same spirit as Users/
+// Notifications rather than a field-ops screen worth cross-granting).
+export type HostableScreen = Exclude<AdminScreen, 'Users' | 'Notifications' | 'BusinessSettings'> | SalespersonScreen;
 
 interface ScreenHostProps {
   screen: HostableScreen;

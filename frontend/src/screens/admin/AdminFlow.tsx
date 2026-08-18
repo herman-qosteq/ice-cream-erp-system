@@ -17,6 +17,7 @@ import AdminWarehouse from './AdminWarehouse';
 import AdminSales from './AdminSales';
 import AdminUsers from './AdminUsers';
 import AdminNotifications from './AdminNotifications';
+import AdminSettings from './AdminSettings';
 import { useScrollReset, useResetScrollOnChange } from '../../context/ScrollResetContext';
 import { formatBadgeCount } from '../../utils/format';
 
@@ -62,6 +63,7 @@ const screenTitles: Record<string, string> = {
   Inactive: 'Inactive Partners',
   Assets: 'Assets & Freezer Boxes',
   Users: 'Operator Management',
+  BusinessSettings: 'Business Settings',
 };
 
 export default function AdminFlow({ data, setData, addNotification, currentUser, setCurrentUser, showAlert }: AdminFlowProps) {
@@ -225,7 +227,10 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
     {
       title: 'System & Security',
       icon: <FileSpreadsheet size={14} color="#a855f7" />,
-      items: [{ label: 'Operator Accounts', screen: 'Users' as AdminScreen }],
+      items: [
+        { label: 'Operator Accounts', screen: 'Users' as AdminScreen },
+        { label: 'Business Settings', screen: 'BusinessSettings' as AdminScreen },
+      ],
     },
   ];
 
@@ -416,6 +421,9 @@ export default function AdminFlow({ data, setData, addNotification, currentUser,
                 setData={setData}
                 onNotificationNavigate={handleNotificationNavigate}
               />
+            )}
+            {!activeForeignScreen && activeScreen === 'BusinessSettings' && (
+              <AdminSettings data={data} setData={setData} showAlert={showAlert} />
             )}
           </View>
         </ScrollView>

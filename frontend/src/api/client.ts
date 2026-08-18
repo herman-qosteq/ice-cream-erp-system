@@ -12,10 +12,10 @@ const TOKEN_KEY = '@frostyflow_token';
   // : 'http://localhost:4000/api';
 
 // production
-const DEFAULT_BASE_URL = "https://api.maybentraders.in/api";
+// const DEFAULT_BASE_URL = "https://api.maybentraders.in/api";
 
 // dev
-// const DEFAULT_BASE_URL = "http://localhost:4000/api";
+const DEFAULT_BASE_URL = "http://localhost:4000/api";
 // const DEFAULT_BASE_URL = "https://fool-quartet-boastful.ngrok-free.dev/api";
 
 export const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || DEFAULT_BASE_URL;

@@ -128,7 +128,7 @@ export default function SalespersonSales({ data, setData, addNotification, curre
 
   const downloadInvoicePDF = async (order: Order, invoice: Invoice, store: Store) => {
     const previewWindow = openWebPreviewWindow();
-    const { html, fileName } = buildOrderInvoicePdf(order, invoice, store, data.products);
+    const { html, fileName } = buildOrderInvoicePdf(order, invoice, store, data.products, data.qrCodeSettings);
     await exportHtmlReport(html, fileName, showAlert, previewWindow);
   };
 

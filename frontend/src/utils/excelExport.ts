@@ -8,7 +8,7 @@ import * as XLSX from 'xlsx-js-style';
 // expo-file-system/expo-sharing are required lazily inside exportExcelWorkbook,
 // after its Windows/macOS guard - a static top-level import here would crash
 // the whole bundle on Windows (see imagePicker.ts).
-import { BRAND_NAME, BRAND_SUPPORT_PHONE } from './pdfTemplate';
+import { getBrandName, getBrandPhone } from './pdfTemplate';
 
 export interface PurchaseOrderItem {
   category: string;
@@ -38,14 +38,15 @@ export function buildPurchaseOrderWorkbook(items: PurchaseOrderItem[], orderRef:
   const orderDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
   const ws: XLSX.WorkSheet = {};
 
-  setCell(ws, 0, 0, BRAND_NAME, { font: { bold: true, sz: 18 } });
+  const brandName = getBrandName();
+  setCell(ws, 0, 0, brandName, { font: { bold: true, sz: 18 } });
 
   const infoRows: [string, string][] = [
     ['Order Ref:', orderRef],
     ['Order Date:', orderDate],
-    ['Ordered By:', BRAND_NAME.replace(/\b\w/g, c => c.toUpperCase())],
-    ['Contact:', BRAND_SUPPORT_PHONE],
-    ['Delivery Location:', `${BRAND_NAME.replace(/\b\w/g, c => c.toUpperCase())} Warehouse`],
+    ['Ordered By:', brandName.replace(/\b\w/g, c => c.toUpperCase())],
+    ['Contact:', getBrandPhone()],
+    ['Delivery Location:', `${brandName.replace(/\b\w/g, c => c.toUpperCase())} Warehouse`],
   ];
   infoRows.forEach(([label, value], i) => {
     const row = 2 + i;

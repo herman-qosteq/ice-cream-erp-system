@@ -9,6 +9,7 @@ import {
   warehouseApi, dispatchApi, ordersApi, paymentsApi, notificationsApi, purchasesApi, purchaseOrderRequestsApi,
   preBookingsApi, settingsApi, partnerTypesApi, assetTypesApi,
 } from './api/endpoints';
+import { configureBrandProfile } from './utils/pdfTemplate';
 
 export interface ERPAuditLog {
   id: string;
@@ -60,6 +61,12 @@ export interface ERPData {
     image_url: string;
     is_enabled: boolean;
   };
+  companyProfile: {
+    name: string;
+    gstin: string;
+    phone: string;
+    email: string;
+  };
   auditLogs: ERPAuditLog[];
   rolePermissions: RolePermission[];
   userPermissions: UserPermission[];
@@ -71,7 +78,9 @@ export function emptyErpData(): ERPData {
     users: [], products: [], categories: [], areas: [], villages: [], partnerTypes: [], assetTypes: [], storePricing: [], suppliers: [], stores: [], trucks: [],
     warehouse_inventory: [], truck_inventory: [], orders: [], invoices: [], payments: [],
     notifications: [], purchases: [], purchaseOrderRequests: [], visits: [], preBookingOrders: [], syncQueue: [],
-    isOffline: false, qrCodeSettings: { image_url: '', is_enabled: true }, auditLogs: [], rolePermissions: [], userPermissions: [],
+    isOffline: false, qrCodeSettings: { image_url: '', is_enabled: true },
+    companyProfile: { name: 'Mayben traders', gstin: '27AAAAA1111A1Z1', phone: '+91 73736 74757', email: 'support@maybentraders.in' },
+    auditLogs: [], rolePermissions: [], userPermissions: [],
   };
 }
 
@@ -84,7 +93,7 @@ export async function loadAllData(): Promise<ERPData> {
   const [
     users, products, categories, areas, villages, partnerTypes, assetTypes, storePricing, suppliers, stores, trucks, warehouse_inventory,
     truck_inventory, orders, invoices, payments, notifications,
-    purchases, purchaseOrderRequests, visits, preBookingOrders, qrCodeSettings, auditLogs, rolePermissions, userPermissions,
+    purchases, purchaseOrderRequests, visits, preBookingOrders, qrCodeSettings, companyProfile, auditLogs, rolePermissions, userPermissions,
   ] = await Promise.all([
     usersApi.list(),
     productsApi.list(),
@@ -108,17 +117,25 @@ export async function loadAllData(): Promise<ERPData> {
     storesApi.listVisits(),
     preBookingsApi.list(),
     settingsApi.getQr(),
+    settingsApi.getCompanyProfile(),
     settingsApi.listAuditLogs(),
     settingsApi.listPermissions(),
     settingsApi.listUserPermissions(),
   ]);
+
+  // Keeps pdfTemplate.ts's brand getters (used by every PDF/Excel export,
+  // none of which carry a companyProfile parameter of their own) in sync
+  // with the backend on every load - see configureBrandProfile's own
+  // comment for why this indirection exists instead of threading the value
+  // through every builder function's signature.
+  configureBrandProfile(companyProfile);
 
   return {
     users, products, categories, areas, villages, partnerTypes, assetTypes, storePricing, suppliers, stores, trucks, warehouse_inventory,
     truck_inventory, orders, invoices, payments, notifications,
     purchases, purchaseOrderRequests, visits, preBookingOrders,
     syncQueue: syncQueue ? JSON.parse(syncQueue) : [],
-    isOffline: isOfflineVal, qrCodeSettings, auditLogs, rolePermissions, userPermissions,
+    isOffline: isOfflineVal, qrCodeSettings, companyProfile, auditLogs, rolePermissions, userPermissions,
   };
 }
 

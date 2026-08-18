@@ -11,8 +11,7 @@ import BoxPieceInput from '../../components/common/BoxPieceInput';
 import { formatQty, isPositiveQty, compareQty, readQtyField, addQty, toTotalPieces, formatUnitRate } from '../../utils/qty';
 import { exportHtmlReport, openWebPreviewWindow } from '../../utils/reportExport';
 import { buildOrderInvoicePdf, buildPreBookingBillPdf } from '../../utils/orderInvoicePdf';
-import { renderPdfDocument, renderInfoTable, renderSummaryLine, buildPdfFileName, buildAttachmentFileName, stableRecordRef, freshReportRef } from '../../utils/pdfTemplate';
-import { pickImageAsDataUri } from '../../utils/imagePicker';
+import { renderPdfDocument, renderInfoTable, renderPartyBox, renderKv, renderSummaryLine, buildPdfFileName, buildAttachmentFileName, stableRecordRef, freshReportRef } from '../../utils/pdfTemplate';
 import { viewOrDownloadDataUriFile, pickBillFileAsDataUri } from '../../utils/documentPicker';
 import { useAppContext } from '../../context/AppContext';
 import { useViewMode } from '../../context/ViewModeContext';
@@ -25,7 +24,7 @@ import DateRangeFilterField from '../../components/common/DateRangeFilterField';
 import ScrollableSection from '../../components/common/ScrollableSection';
 import PaginationFooter from '../../components/common/PaginationFooter';
 import AutocompleteInput from '../../components/common/AutocompleteInput';
-import { suppliersApi, storesApi, preBookingsApi, ordersApi, paymentsApi, settingsApi, areasApi, villagesApi, partnerTypesApi, storePricingApi, purchasesApi, assetsApi } from '../../api/endpoints';
+import { suppliersApi, storesApi, preBookingsApi, ordersApi, paymentsApi, areasApi, villagesApi, partnerTypesApi, storePricingApi, purchasesApi, assetsApi } from '../../api/endpoints';
 import { getEffectiveProductPrice, getEffectiveDiscountPct, priceFromDiscount, discountFromPrice, findStorePricingOverride } from '../../utils/pricing';
 import { hasAdminOverride, isGstToggleEnabled, isRetailPricingEnabled } from '../../utils/permissions';
 import {
@@ -625,16 +624,18 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     const receivedDate = new Date(purchase.date).toLocaleDateString('en-IN', { year: 'numeric', month: 'long', day: 'numeric' });
 
     const infoTable = renderInfoTable(
-      `<strong>RECEIVED FROM (SUPPLIER)</strong><br/>
-       ${supplier.name}<br/>Contact: ${supplier.contact_person || 'N/A'}<br/>
-       Phone: ${supplier.phone}<br/>
-       Email: ${supplier.email || 'N/A'}<br/>
-       Address: ${supplier.address || 'N/A'}`,
-      `<strong>GRN ID:</strong> ${purchase.id}<br/>
-       <strong>Supplier Invoice No:</strong> ${purchase.invoice_number}<br/>
-       <strong>Date Received:</strong> ${receivedDate}<br/>
-       <strong>Received Into:</strong> FrostyFlow Central Warehouse<br/>
-       <strong>Received By:</strong> Warehouse Operations Team`
+      renderPartyBox('Received From (Supplier)',
+        renderKv('Supplier', supplier.name, true) +
+        renderKv('Contact Person', supplier.contact_person || 'N/A') +
+        renderKv('Phone', supplier.phone) +
+        renderKv('Email', supplier.email || 'N/A') +
+        renderKv('Address', supplier.address || 'N/A')),
+      renderPartyBox('Receipt Details',
+        renderKv('GRN ID', purchase.id, true) +
+        renderKv('Supplier Invoice No', purchase.invoice_number) +
+        renderKv('Date Received', receivedDate) +
+        renderKv('Received Into', 'FrostyFlow Central Warehouse') +
+        renderKv('Received By', 'Warehouse Operations Team'))
     );
 
     const tableRows = purchase.items.map(item => {
@@ -1921,7 +1922,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
 
   const downloadInvoicePDF = async (order: Order, invoice: Invoice, store: Store) => {
     const previewWindow = openWebPreviewWindow();
-    const { html, fileName } = buildOrderInvoicePdf(order, invoice, store, data.products);
+    const { html, fileName } = buildOrderInvoicePdf(order, invoice, store, data.products, data.qrCodeSettings);
     await exportHtmlReport(html, fileName, showAlert, previewWindow);
   };
 
@@ -1929,7 +1930,7 @@ export default function AdminSales({ data, setData, addNotification, currentUser
     const store = data.stores.find(s => s.id === booking.store_id);
     if (!store) { showAlert('Unable to find the partner store for this pre-booking.'); return; }
     const previewWindow = openWebPreviewWindow();
-    const { html, fileName } = buildPreBookingBillPdf(booking, store, data.products);
+    const { html, fileName } = buildPreBookingBillPdf(booking, store, data.products, data.qrCodeSettings);
     await exportHtmlReport(html, fileName, showAlert, previewWindow);
   };
 
@@ -1959,31 +1960,6 @@ export default function AdminSales({ data, setData, addNotification, currentUser
       if (!s.last_purchase_date) return true;
       return new Date(s.last_purchase_date) < limitDate;
     });
-  };
-
-  const [qrSettings, setQrSettings] = useState(data.qrCodeSettings);
-  const handleUploadQRImage = async () => {
-    const uri = await pickImageAsDataUri(showAlert);
-    if (!uri) return;
-    try {
-      const updated = await settingsApi.updateQr({ image_url: uri });
-      setQrSettings(updated);
-      await refreshData();
-      showAlert('Custom QR code image uploaded successfully.');
-    } catch (e: any) {
-      showAlert(e.message ?? 'Unable to upload QR code image.');
-    }
-  };
-
-  const handleToggleQR = async () => {
-    try {
-      const updated = await settingsApi.updateQr({ is_enabled: !qrSettings.is_enabled });
-      setQrSettings(updated);
-      await refreshData();
-      showAlert(`UPI QR Code payments toggled: ${updated.is_enabled ? 'ENABLED' : 'DISABLED'}`);
-    } catch (e: any) {
-      showAlert(e.message ?? 'Unable to update QR settings.');
-    }
   };
 
   const storeOptions = data.stores.filter(s => s.status === 'Active').map(s => ({ label: `${s.name} (${s.owner_name})`, value: s.id }));
@@ -4347,22 +4323,6 @@ export default function AdminSales({ data, setData, addNotification, currentUser
               <View className="flex-row items-center justify-between border-b border-slate-100 pb-2">
                 <Text className="font-bold text-slate-800 text-xs">UPI & Cash Payments Collection</Text>
                 <Pressable onPress={() => setActiveForm('add_payment')} className="py-1 px-2.5 bg-emerald-50 border border-emerald-100 rounded-lg active:bg-emerald-100"><Text className="text-emerald-600 font-extrabold text-[9px]">+ Add Payment Collection</Text></Pressable>
-              </View>
-              <View className="bg-slate-50 p-3 rounded-2xl border border-slate-200">
-                <View className="flex-row items-center justify-between">
-                  <View><Text className="font-extrabold text-slate-700 text-xs">UPI QR Payments Integration</Text><Text className="text-[9px] text-slate-400">Scan-and-pay receiver setting</Text></View>
-                  <Pressable onPress={handleToggleQR} className={`py-1 px-2 rounded-lg ${qrSettings.is_enabled ? 'bg-emerald-500' : 'bg-slate-200'}`}>
-                    <Text className={`text-[9px] font-black ${qrSettings.is_enabled ? 'text-white' : 'text-slate-500'}`}>{qrSettings.is_enabled ? 'ENABLED' : 'DISABLED'}</Text>
-                  </Pressable>
-                </View>
-                {qrSettings.is_enabled && (
-                  <View className="mt-3 flex-row items-center gap-3">
-                    <Image source={{ uri: qrSettings.image_url }} className="w-12 h-12 rounded border border-slate-200" />
-                    <View>
-                      <Pressable onPress={handleUploadQRImage} className="py-1 px-2.5 bg-white border border-slate-200 rounded active:bg-slate-50"><Text className="text-[9px] font-bold text-slate-700">Upload QR Code Image</Text></Pressable>
-                    </View>
-                  </View>
-                )}
               </View>
               <FilterBar searchValue={paymentSearch} onSearchChange={setPaymentSearch} searchPlaceholder="Search by store or owner name...">
                 <SelectField

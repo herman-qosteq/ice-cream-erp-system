@@ -7,6 +7,11 @@ export const settingsRouter = Router();
 
 settingsRouter.get('/qr-code', requireAuth, asyncHandler(settingsController.getQr));
 settingsRouter.patch('/qr-code', requireAuth, requireRole('Admin'), asyncHandler(settingsController.updateQr));
+// Read-only for any authenticated role — every PDF/Excel export this app
+// generates (invoices, reports, GRNs) prints this company name/GSTIN/phone/
+// email regardless of who's exporting it.
+settingsRouter.get('/company-profile', requireAuth, asyncHandler(settingsController.getCompanyProfile));
+settingsRouter.patch('/company-profile', requireAuth, requireRole('Admin'), asyncHandler(settingsController.updateCompanyProfile));
 // Read-only for any authenticated role — it's part of the shared app-data
 // blob (e.g. Warehouse's own "Movement Logs" tab reads this too).
 settingsRouter.get('/audit-logs', requireAuth, asyncHandler(settingsController.listAuditLogs));

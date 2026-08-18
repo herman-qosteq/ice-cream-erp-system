@@ -24,6 +24,7 @@ import { preBookingsRouter } from './modules/prebookings/prebookings.routes';
 import { notificationsRouter } from './modules/notifications/notifications.routes';
 import { settingsRouter } from './modules/settings/settings.routes';
 import { systemRouter } from './modules/system/system.routes';
+import { pdfRouter } from './modules/pdf/pdf.routes';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { broadcastExcept } from './realtime';
 
@@ -79,6 +80,7 @@ app.use('/api/prebookings', preBookingsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/system', systemRouter);
+app.use('/api/pdf', pdfRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

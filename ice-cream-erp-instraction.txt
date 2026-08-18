@@ -1,0 +1,102 @@
+Godady:
+itsramg
+5477@pikveji
+
+
+aaPanel
+srvadmin
+MaybenTraders@1
+
+phpMyadmin
+mayben_traders_icecream_erp
+MaybenTraders1
+
+
+web
+npx expo export --platform web
+
+android
+cd android
+.\gradlew assembleRelease
+
+
+windows
+npx react-native init-windows --overwrite
+npx react-native autolink-windows
+npx react-native init-windows --help
+
+
+// clone team
+ngrok http --url=fool-quartet-boastful.ngrok-free.dev 3001
+
+
+
+Updat new Backend Nodejs
+pm2 list
+pm2 stop icecream-erp
+pm2 list
+upload new zip
+npm install
+npx prisma generate
+npx prisma migrate deploy
+npm run build
+pm2 restart icecream-erp
+
+
+Export local mysql 
+open mysql workbench srvadmin
+server -> data export -> select databse (maybentraders)
+export self contain file -> select the folder
+click export btn
+
+
+
+Delete all the table except the users query:
+
+SET FOREIGN_KEY_CHECKS = 0;
+TRUNCATE TABLE areas;
+TRUNCATE TABLE audit_logs;
+TRUNCATE TABLE categories;
+TRUNCATE TABLE credit_ledger;
+TRUNCATE TABLE invoices;
+TRUNCATE TABLE notifications;
+TRUNCATE TABLE orders;
+TRUNCATE TABLE order_items;
+TRUNCATE TABLE payments;
+TRUNCATE TABLE pre_booking_dispatched_items;
+TRUNCATE TABLE pre_booking_items;
+TRUNCATE TABLE pre_booking_orders;
+TRUNCATE TABLE products;
+TRUNCATE TABLE purchases;
+TRUNCATE TABLE purchase_items;
+TRUNCATE TABLE purchase_order_requests;
+TRUNCATE TABLE purchase_order_request_items;
+TRUNCATE TABLE qr_code_settings;
+TRUNCATE TABLE role_permissions;
+TRUNCATE TABLE scheduled_prices;
+TRUNCATE TABLE stores;
+TRUNCATE TABLE store_pricing;
+TRUNCATE TABLE store_visits;
+TRUNCATE TABLE suppliers;
+TRUNCATE TABLE sync_queue;
+TRUNCATE TABLE trucks;
+TRUNCATE TABLE truck_inventory;
+TRUNCATE TABLE warehouse_inventory;
+SET FOREIGN_KEY_CHECKS = 1;
+
+
+Delete except mayben query:
+
+SET FOREIGN_KEY_CHECKS = 0;
+-- Keep only the admin user
+DELETE FROM users
+WHERE id <> 'u1';
+SET FOREIGN_KEY_CHECKS = 1;
+
+
+
+
+
+
+
+4mux5u

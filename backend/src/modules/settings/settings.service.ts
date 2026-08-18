@@ -17,6 +17,30 @@ export async function updateQrCodeSettings(input: { image_url?: string; is_enabl
   });
 }
 
+// Defaults here match the placeholder values that used to be hardcoded in
+// frontend/src/utils/pdfTemplate.ts before this became editable - a business
+// that hasn't opened Settings > Business Details yet still gets the same
+// values as before, not a blank invoice header.
+const DEFAULT_COMPANY_PROFILE = {
+  name: 'Mayben traders',
+  gstin: '27AAAAA1111A1Z1',
+  phone: '+91 73736 74757',
+  email: 'support@maybentraders.in',
+};
+
+export async function getCompanyProfile() {
+  const profile = await prisma.companyProfile.findUnique({ where: { id: 1 } });
+  return profile ?? { id: 1, ...DEFAULT_COMPANY_PROFILE };
+}
+
+export async function updateCompanyProfile(input: { name?: string; gstin?: string; phone?: string; email?: string }) {
+  return prisma.companyProfile.upsert({
+    where: { id: 1 },
+    update: input,
+    create: { id: 1, ...DEFAULT_COMPANY_PROFILE, ...input },
+  });
+}
+
 export async function listAuditLogs() {
   return prisma.auditLog.findMany({ orderBy: { timestamp: 'desc' } });
 }

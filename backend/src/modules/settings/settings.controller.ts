@@ -5,6 +5,12 @@ import { ApiError } from '../../utils/ApiError';
 import { isPaginationRequested } from '../../utils/pagination';
 
 const qrSchema = z.object({ image_url: z.string().optional(), is_enabled: z.boolean().optional() });
+const companyProfileSchema = z.object({
+  name: z.string().min(1).optional(),
+  gstin: z.string().min(1).optional(),
+  phone: z.string().min(1).optional(),
+  email: z.string().min(1).optional(),
+});
 const permissionSchema = z.object({
   role: z.enum(['Admin', 'Salesperson', 'Warehouse']),
   feature: z.string().min(1),
@@ -22,6 +28,16 @@ export async function updateQr(req: Request, res: Response) {
   const parsed = qrSchema.safeParse(req.body);
   if (!parsed.success) throw ApiError.badRequest(parsed.error.errors[0]?.message ?? 'Invalid request');
   res.json(await settingsService.updateQrCodeSettings(parsed.data));
+}
+
+export async function getCompanyProfile(req: Request, res: Response) {
+  res.json(await settingsService.getCompanyProfile());
+}
+
+export async function updateCompanyProfile(req: Request, res: Response) {
+  const parsed = companyProfileSchema.safeParse(req.body);
+  if (!parsed.success) throw ApiError.badRequest(parsed.error.errors[0]?.message ?? 'Invalid request');
+  res.json(await settingsService.updateCompanyProfile(parsed.data));
 }
 
 export async function listAuditLogs(req: Request, res: Response) {
